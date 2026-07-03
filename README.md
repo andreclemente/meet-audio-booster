@@ -1,4 +1,4 @@
-# Audio Booster for Google Meet
+# Google Meet Audio Booster 
 
 Increase or decrease the volume of individual participants in Google Meet.
 
