@@ -1,10 +1,36 @@
-## Meet Audio Booster adds local per-participant volume controls to Google Meet.
+# Meet Audio Booster
 
-Features:
-- Boost quiet participants
-- Mute or reduce loud participants
-- Compact floating panel
-- Drag the panel anywhere on the Meet screen
-- Saves volume settings locally for next time
+Increase or decrease the volume of individual participants in Google Meet.
 
-The extension only runs on meet.google.com. It does not collect, transmit, sell, or share any user data.
+## Features
+
+- 🎚️ Per-participant volume controls
+- 🔊 Boost quiet participants
+- 🔇 Mute individual participants
+- 💾 Remembers volume levels
+- 📍 Draggable floating panel
+- 🪶 Lightweight
+- 🔒 No telemetry
+- 🔐 No data leaves your computer
+
+## Installation
+
+### Chrome Web Store
+
+Coming soon.
+
+### Developer mode
+
+1. Download the repository.
+2. Open chrome://extensions.
+3. Enable Developer mode.
+4. Load unpacked.
+5. Select the project folder.
+
+## Privacy
+
+Meet Audio Booster does not collect, transmit, or store personal data outside your browser.
+
+Only local preferences (participant volume levels and panel position) are stored.
+
+See the full Privacy Policy.
