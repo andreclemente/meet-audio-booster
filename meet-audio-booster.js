@@ -16,12 +16,7 @@
 
   function loadSettings() {
     try {
-      return (
-        JSON.parse(localStorage.getItem(STORAGE_KEY)) || {
-          gains: {},
-          position: null
-        }
-      )
+      return JSON.parse(localStorage.getItem(STORAGE_KEY)) || { gains: {}, position: null }
     } catch {
       return { gains: {}, position: null }
     }
@@ -32,14 +27,26 @@
   }
 
   function getRemoteNames() {
-    return [
-      ...new Set(
-        [...document.querySelectorAll('button[aria-label^="Mute "]')]
-          .map((btn) => btn.getAttribute('aria-label'))
-          .map((label) => label?.match(/^Mute (.+)'s microphone$/)?.[1])
-          .filter(Boolean)
-      )
-    ]
+    const names = []
+
+    document.querySelectorAll('button[aria-label]').forEach((btn) => {
+      const label = btn.getAttribute('aria-label') || ''
+
+      const match =
+        label.match(/^Mute (.+)'s microphone$/) ||
+        label.match(/^More options for (.+)$/) ||
+        label.match(/^Pin (.+) to your main screen$/)
+
+      if (!match) return
+
+      const name = match[1].replace(/\s+\(.*?\)$/, '').trim()
+
+      if (name && !name.includes('presentation') && !names.includes(name)) {
+        names.push(name)
+      }
+    })
+
+    return names
   }
 
   function applyGain(item, value) {
@@ -89,11 +96,15 @@
   function syncNames() {
     const names = getRemoteNames()
 
-    state.gains.forEach((item, index) => {
-      if (!item.name && names[index]) {
-        item.name = names[index]
+    names.forEach((name, index) => {
+      const item = state.gains[index]
 
-        const saved = state.settings.gains?.[item.name]
+      if (!item) return
+
+      if (!item.name) {
+        item.name = name
+
+        const saved = state.settings.gains?.[name]
 
         if (typeof saved === 'number') {
           applyGain(item, saved)
@@ -217,7 +228,26 @@
 
     makeDraggable(panel, header)
 
-    const visibleGains = state.gains.filter((item) => item.name)
+    const remoteNames = getRemoteNames()
+
+    const visibleRows = remoteNames.map((participantName, index) => {
+      const item =
+        state.gains.find((gain) => gain.name === participantName) ||
+        state.gains[index] ||
+        null
+
+      if (item && !item.name) {
+        item.name = participantName
+
+        const saved = state.settings.gains?.[participantName]
+
+        if (typeof saved === 'number') {
+          applyGain(item, saved)
+        }
+      }
+
+      return { participantName, item }
+    })
 
     const list = document.createElement('div')
 
@@ -227,19 +257,22 @@
       paddingRight: '4px'
     })
 
-    if (!visibleGains.length) {
+    if (!visibleRows.length) {
       const empty = document.createElement('div')
       empty.textContent = 'Waiting for remote audio...'
       empty.style.opacity = '0.75'
       list.appendChild(empty)
     }
 
-    visibleGains.forEach((item) => {
+    visibleRows.forEach(({ participantName, item }) => {
+      const hasAudioControl = Boolean(item)
+
       const row = document.createElement('div')
 
       Object.assign(row.style, {
         padding: '7px 0',
-        borderTop: '1px solid #3c4043'
+        borderTop: '1px solid #3c4043',
+        opacity: hasAudioControl ? '1' : '0.55'
       })
 
       const top = document.createElement('div')
@@ -253,15 +286,17 @@
       })
 
       const name = document.createElement('div')
-      name.textContent = item.name
+      name.textContent = participantName
       name.style.fontWeight = '600'
       name.style.overflow = 'hidden'
       name.style.textOverflow = 'ellipsis'
       name.style.whiteSpace = 'nowrap'
 
       const value = document.createElement('div')
-      value.textContent = `${Math.round(item.value * 100)}%`
-      value.style.opacity = '0.8'
+      value.textContent = hasAudioControl
+        ? `${Math.round(item.value * 100)}%`
+        : 'inactive'
+      value.style.opacity = hasAudioControl ? '0.8' : '0.5'
       value.style.minWidth = '46px'
       value.style.textAlign = 'right'
 
@@ -273,14 +308,19 @@
       slider.min = '0'
       slider.max = '6'
       slider.step = '0.05'
-      slider.value = item.value
+      slider.value = hasAudioControl ? item.value : '1'
+      slider.disabled = !hasAudioControl
 
       Object.assign(slider.style, {
-        width: '100%'
+        width: '100%',
+        opacity: hasAudioControl ? '1' : '0.4'
       })
 
       slider.oninput = () => {
+        if (!item) return
+
         const next = Number(slider.value)
+
         applyGain(item, next)
         value.textContent = `${Math.round(next * 100)}%`
       }
@@ -296,34 +336,42 @@
 
       buttons.appendChild(
         makeButton('Mute', () => {
+          if (!item) return
+
           slider.value = '0'
           applyGain(item, 0)
           value.textContent = '0%'
-        })
+        }, !hasAudioControl)
       )
 
       buttons.appendChild(
         makeButton('50%', () => {
+          if (!item) return
+
           slider.value = '0.5'
           applyGain(item, 0.5)
           value.textContent = '50%'
-        })
+        }, !hasAudioControl)
       )
 
       buttons.appendChild(
         makeButton('100%', () => {
+          if (!item) return
+
           slider.value = '1'
           applyGain(item, 1)
           value.textContent = '100%'
-        })
+        }, !hasAudioControl)
       )
 
       buttons.appendChild(
         makeButton('250%', () => {
+          if (!item) return
+
           slider.value = '2.5'
           applyGain(item, 2.5)
           value.textContent = '250%'
-        })
+        }, !hasAudioControl)
       )
 
       row.appendChild(top)
@@ -347,7 +395,10 @@
 
     footer.appendChild(
       makeButton('Reset', () => {
-        visibleGains.forEach((item) => applyGain(item, 1))
+        visibleRows.forEach(({ item }) => {
+          if (item) applyGain(item, 1)
+        })
+
         renderPanel()
       })
     )
@@ -358,11 +409,20 @@
     state.panel = panel
   }
 
-  function makeButton(text, onClick) {
+  function makeButton(text, onClick, disabled = false) {
     const btn = document.createElement('button')
     btn.textContent = text
+    btn.disabled = disabled
+
     Object.assign(btn.style, buttonStyle())
+
+    if (disabled) {
+      btn.style.opacity = '0.45'
+      btn.style.cursor = 'not-allowed'
+    }
+
     btn.onclick = onClick
+
     return btn
   }
 
