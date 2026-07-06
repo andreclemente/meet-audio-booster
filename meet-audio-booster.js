@@ -3,11 +3,12 @@
 
   window.__meetAudioBoosterInstalled = true
 
-  const STORAGE_KEY = '__meet_audio_booster_settings_v2'
+  const STORAGE_KEY = '__meet_audio_booster_settings_v3'
 
   const state = {
     gains: [],
     settings: loadSettings(),
+    participants: new Set(),
     panel: null,
     renderTimer: null
   }
@@ -16,37 +17,115 @@
 
   function loadSettings() {
     try {
-      return JSON.parse(localStorage.getItem(STORAGE_KEY)) || { gains: {}, position: null }
+      return JSON.parse(localStorage.getItem(STORAGE_KEY)) || {
+        gains: {},
+        position: null,
+        participants: []
+      }
     } catch {
-      return { gains: {}, position: null }
+      return { gains: {}, position: null, participants: [] }
     }
   }
 
   function saveSettings() {
+    state.settings.participants = [...state.participants]
     localStorage.setItem(STORAGE_KEY, JSON.stringify(state.settings))
   }
 
-  function getRemoteNames() {
-    const names = []
+  ;(state.settings.participants || []).forEach((name) => {
+    state.participants.add(name)
+  })
 
-    document.querySelectorAll('button[aria-label]').forEach((btn) => {
-      const label = btn.getAttribute('aria-label') || ''
+  function cleanName(name) {
+    return name
+      ?.replace(/\s+\(.*?\)$/, '')
+      .replace(/\s+/g, ' ')
+      .trim()
+  }
 
-      const match =
-        label.match(/^Mute (.+)'s microphone$/) ||
-        label.match(/^More options for (.+)$/) ||
-        label.match(/^Pin (.+) to your main screen$/)
+  function isValidParticipantName(name) {
+    if (!name) return false
 
-      if (!match) return
+    const ignored = [
+      'People',
+      'Chat',
+      'Meeting details',
+      'Audio settings',
+      'Video settings',
+      'More options',
+      'Host controls',
+      'Meeting tools',
+      'Send a reaction',
+      'Raise hand',
+      'Leave call',
+      'Present now'
+    ]
 
-      const name = match[1].replace(/\s+\(.*?\)$/, '').trim()
+    return (
+      name.length >= 2 &&
+      name.length <= 80 &&
+      !ignored.includes(name) &&
+      !name.includes('presentation') &&
+      !name.includes('microphone') &&
+      !name.includes('camera') &&
+      !name.includes('screen')
+    )
+  }
 
-      if (name && !name.includes('presentation') && !names.includes(name)) {
-        names.push(name)
-      }
+  function scrapeParticipantNames() {
+    const names = new Set(state.participants)
+
+    document.querySelectorAll('button[aria-label], div[aria-label], span[aria-label]').forEach((el) => {
+      const label = el.getAttribute('aria-label') || ''
+
+      const matches = [
+        label.match(/^Mute (.+)'s microphone$/),
+        label.match(/^More options for (.+)$/),
+        label.match(/^Pin (.+) to your main screen$/),
+        label.match(/^Unpin (.+?)'s presentation from your main screen$/)
+      ]
+
+      matches.forEach((match) => {
+        const name = cleanName(match?.[1])
+        if (isValidParticipantName(name)) names.add(name)
+      })
     })
 
-    return names
+    document.querySelectorAll('[data-participant-id], [role="listitem"], [role="gridcell"]').forEach((el) => {
+      const text = cleanName(el.textContent)
+
+      if (!text) return
+
+      text
+        .split('\n')
+        .map(cleanName)
+        .filter(isValidParticipantName)
+        .forEach((name) => names.add(name))
+    })
+
+    state.participants = names
+    saveSettings()
+
+    return [...names]
+  }
+
+  function clickPeopleButton() {
+    const button = [...document.querySelectorAll('button[aria-label]')].find((btn) => {
+      const label = btn.getAttribute('aria-label') || ''
+      return (
+        label === 'People' ||
+        label.startsWith('People') ||
+        label.includes('Show everyone') ||
+        label.includes('participants')
+      )
+    })
+
+    button?.click()
+
+    setTimeout(() => {
+      scrapeParticipantNames()
+      renderPanel()
+    }, 800)
   }
 
   function applyGain(item, value) {
@@ -94,22 +173,19 @@
   }
 
   function syncNames() {
-    const names = getRemoteNames()
+    const names = scrapeParticipantNames()
 
     names.forEach((name, index) => {
+      const existing = state.gains.find((gain) => gain.name === name)
+      if (existing) return
+
       const item = state.gains[index]
+      if (!item || item.name) return
 
-      if (!item) return
+      item.name = name
 
-      if (!item.name) {
-        item.name = name
-
-        const saved = state.settings.gains?.[name]
-
-        if (typeof saved === 'number') {
-          applyGain(item, saved)
-        }
-      }
+      const saved = state.settings.gains?.[name]
+      if (typeof saved === 'number') applyGain(item, saved)
     })
   }
 
@@ -228,9 +304,9 @@
 
     makeDraggable(panel, header)
 
-    const remoteNames = getRemoteNames()
+    const participantNames = [...state.participants]
 
-    const visibleRows = remoteNames.map((participantName, index) => {
+    const visibleRows = participantNames.map((participantName, index) => {
       const item =
         state.gains.find((gain) => gain.name === participantName) ||
         state.gains[index] ||
@@ -240,10 +316,7 @@
         item.name = participantName
 
         const saved = state.settings.gains?.[participantName]
-
-        if (typeof saved === 'number') {
-          applyGain(item, saved)
-        }
+        if (typeof saved === 'number') applyGain(item, saved)
       }
 
       return { participantName, item }
@@ -259,7 +332,7 @@
 
     if (!visibleRows.length) {
       const empty = document.createElement('div')
-      empty.textContent = 'Waiting for remote audio...'
+      empty.textContent = 'Open People or click Load participants.'
       empty.style.opacity = '0.75'
       list.appendChild(empty)
     }
@@ -334,45 +407,33 @@
         flexWrap: 'wrap'
       })
 
-      buttons.appendChild(
-        makeButton('Mute', () => {
-          if (!item) return
+      buttons.appendChild(makeButton('Mute', () => {
+        if (!item) return
+        slider.value = '0'
+        applyGain(item, 0)
+        value.textContent = '0%'
+      }, !hasAudioControl))
 
-          slider.value = '0'
-          applyGain(item, 0)
-          value.textContent = '0%'
-        }, !hasAudioControl)
-      )
+      buttons.appendChild(makeButton('50%', () => {
+        if (!item) return
+        slider.value = '0.5'
+        applyGain(item, 0.5)
+        value.textContent = '50%'
+      }, !hasAudioControl))
 
-      buttons.appendChild(
-        makeButton('50%', () => {
-          if (!item) return
+      buttons.appendChild(makeButton('100%', () => {
+        if (!item) return
+        slider.value = '1'
+        applyGain(item, 1)
+        value.textContent = '100%'
+      }, !hasAudioControl))
 
-          slider.value = '0.5'
-          applyGain(item, 0.5)
-          value.textContent = '50%'
-        }, !hasAudioControl)
-      )
-
-      buttons.appendChild(
-        makeButton('100%', () => {
-          if (!item) return
-
-          slider.value = '1'
-          applyGain(item, 1)
-          value.textContent = '100%'
-        }, !hasAudioControl)
-      )
-
-      buttons.appendChild(
-        makeButton('250%', () => {
-          if (!item) return
-
-          slider.value = '2.5'
-          applyGain(item, 2.5)
-          value.textContent = '250%'
-        }, !hasAudioControl)
-      )
+      buttons.appendChild(makeButton('250%', () => {
+        if (!item) return
+        slider.value = '2.5'
+        applyGain(item, 2.5)
+        value.textContent = '250%'
+      }, !hasAudioControl))
 
       row.appendChild(top)
       row.appendChild(slider)
@@ -388,20 +449,21 @@
       display: 'flex',
       justifyContent: 'space-between',
       alignItems: 'center',
-      marginTop: '8px'
+      marginTop: '8px',
+      gap: '5px',
+      flexWrap: 'wrap'
     })
 
+    footer.appendChild(makeButton('Load participants', clickPeopleButton))
     footer.appendChild(makeButton('Refresh', renderPanel))
 
-    footer.appendChild(
-      makeButton('Reset', () => {
-        visibleRows.forEach(({ item }) => {
-          if (item) applyGain(item, 1)
-        })
-
-        renderPanel()
+    footer.appendChild(makeButton('Reset', () => {
+      visibleRows.forEach(({ item }) => {
+        if (item) applyGain(item, 1)
       })
-    )
+
+      renderPanel()
+    }))
 
     panel.appendChild(footer)
 
