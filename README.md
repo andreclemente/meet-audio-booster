@@ -1,6 +1,6 @@
-# Google Meet Audio Booster 
+# Meet Audio Booster 
 
-Increase or decrease the volume of individual participants in Google Meet.
+Increase or decrease the volume of individual participants in Google Meet and Jitsi Meet.
 
 ## Features
 
