@@ -1,33 +1,31 @@
 # Privacy Policy
 
-Last updated: 2026-07-03
+Last updated: 2026-07-22
 
-Meet Audio Booster does not collect, store, transmit, or sell any personal information.
+Meet Audio Booster does not collect, transmit, sell, or store personal information outside your browser.
 
 ## What the extension does
 
-Meet Audio Booster runs only on https://meet.google.com and allows you to adjust the playback volume of individual participants during Google Meet calls.
+The extension runs only on `https://meet.google.com/*` and `https://meet.jit.si/*`. It reads the meeting page's participant and audio state to provide local per-participant playback volume controls. It does not support arbitrary or self-hosted meeting sites.
 
-## Data storage
+## Local data
 
-The extension stores the following information locally in your browser:
+The following preferences are stored in browser `localStorage`:
 
 - Per-participant volume preferences
-- Panel position
+- Floating panel position
 
-This information never leaves your computer.
+Participant names or platform IDs may form local preference keys. This information remains on your computer and can be removed by clearing site data or uninstalling the extension.
 
 ## Data collection
 
 Meet Audio Booster:
 
-- Does not collect personal information.
-- Does not send data to any server.
-- Does not use analytics.
-- Does not use tracking.
-- Does not use cookies.
-- Does not share information with third parties.
+- Does not send data to a server
+- Does not use analytics, tracking, cookies, or advertising
+- Does not share information with third parties
+- Does not load remote code
 
 ## Permissions
 
-The extension requests access to `https://meet.google.com/*` only so it can modify the audio controls within Google Meet pages.
+Access to Google Meet and `meet.jit.si` lets the extension discover remote participants and adjust local audio playback. The `scripting` permission lets the toolbar action call the already-installed MAIN-world panel show API. No other host permissions are requested.
