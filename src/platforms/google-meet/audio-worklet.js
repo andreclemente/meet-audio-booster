@@ -39,8 +39,3 @@ export function createPooledSlot(gain, id) {
     neutral(immediate = true) { this.set(1, immediate) }
   }
 }
-
-export function transitionPooledSlots(slots, applyNext) {
-  slots.forEach(slot => slot.neutral(true))
-  queueMicrotask(applyNext)
-}

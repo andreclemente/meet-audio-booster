@@ -112,16 +112,3 @@ export function createMediaPipelineManager(context, { nextId = (() => { let id =
   function destroy() { for (const pipeline of [...pipelines]) remove(pipeline) }
   return { scan, destroy, get pipelines() { return pipelines } }
 }
-
-// Compatibility helper retained for focused tests and embedders.
-export function scanMediaElements(context, current = new Map(), root = document) {
-  const next = new Map()
-  for (const audio of root.querySelectorAll?.('audio') || []) {
-    const key = mediaStreamKey(audio.srcObject)
-    if (!key) continue
-    const pipeline = current.get(key) || createMediaElementPipeline(context, audio, key)
-    if (pipeline) next.set(key, pipeline)
-  }
-  for (const [key, pipeline] of current) if (!next.has(key)) pipeline.destroy()
-  return next
-}

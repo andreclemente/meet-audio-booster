@@ -65,15 +65,6 @@
   }
 
   // src/platforms/google-meet/router.js
-  var ROUTING_STATES = Object.freeze([
-    "idle",
-    "confirmed-speaker",
-    "transitioning",
-    "ambiguous",
-    "multiple-active-streams",
-    "stale-ui-speaker",
-    "no-reliable-association"
-  ]);
   function createRoutingState() {
     return {
       routingState: "idle",

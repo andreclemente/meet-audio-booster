@@ -1,15 +1,5 @@
 import { SPEAKER_CONFIRM_MS } from '../../shared/constants.js'
 
-export const ROUTING_STATES = Object.freeze([
-  'idle',
-  'confirmed-speaker',
-  'transitioning',
-  'ambiguous',
-  'multiple-active-streams',
-  'stale-ui-speaker',
-  'no-reliable-association'
-])
-
 export function createRoutingState() {
   return {
     routingState: 'idle',
