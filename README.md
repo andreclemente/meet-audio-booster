@@ -15,11 +15,9 @@ Increase or decrease the volume of individual participants in Google Meet and Ji
 
 ## Installation
 
-### Chrome Web Store
+#### [Chrome Web Store](https://chromewebstore.google.com/detail/meeting-audio-booster/jhfekklmjikhcliimjcchapimohlmhaf)
 
-Coming soon.
-
-### Developer mode
+#### Developer mode
 
 1. Download the repository.
 2. Open chrome://extensions.
