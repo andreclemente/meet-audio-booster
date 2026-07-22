@@ -27,6 +27,25 @@ test('does not accept arbitrary descendant button labels or chat text', () => {
   assert.equal(extractNameFromParticipantRoot(root), null)
 })
 
+test('collapses duplicate name spans inside a recognized Meet name wrapper', () => {
+  const duplicate = [
+    { textContent: 'FirstNameLastName' },
+    { textContent: 'FirstNameLastName' }
+  ]
+  const root = {
+    getAttribute(name) { return name === 'data-participant-id' ? 'p1' : null },
+    querySelectorAll() {
+      return [{
+        matches: selector => selector.includes('.zWGUib') && !selector.includes('button'),
+        getAttribute: () => null,
+        textContent: 'FirstNameLastNameFirstNameLastName',
+        children: duplicate
+      }]
+    }
+  }
+  assert.equal(extractNameFromParticipantRoot(root), 'FirstNameLastName')
+})
+
 test('accepts a name only from a recognized participant name element', () => {
   const root = {
     getAttribute(name) { return name === 'data-participant-id' ? 'p1' : null },

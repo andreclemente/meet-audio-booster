@@ -227,13 +227,23 @@
     if (/^(?:[a-z]+_){1,}[a-z]+$/.test(lower) || /^\d+$/.test(name)) return false;
     return !/(?:microphone|camera|google meet|meeting|participant|presentation|screen)/i.test(name);
   }
+  function extractCandidateName(element) {
+    const explicit = cleanName(element.getAttribute?.("data-participant-name") || element.getAttribute?.("data-self-name"));
+    if (isValidParticipantName(explicit)) return explicit;
+    const aggregate = cleanName(element.textContent);
+    const childNames = [...element.children || []].map((child) => cleanName(child.textContent)).filter(isValidParticipantName);
+    if (childNames.length >= 2 && childNames.every((name) => name === childNames[0]) && aggregate === childNames.join("")) {
+      return childNames[0];
+    }
+    return aggregate;
+  }
   function extractNameFromParticipantRoot(root) {
     if (!root?.getAttribute?.("data-participant-id")) return null;
     const candidates = root.querySelectorAll?.(PARTICIPANT_NAME_SELECTORS) || [];
     for (const element of candidates) {
       if (!element.matches?.(PARTICIPANT_NAME_SELECTORS)) continue;
       if (element.matches?.('button, [role="button"], [aria-hidden="true"]')) continue;
-      const name = cleanName(element.getAttribute?.("data-self-name") || element.textContent);
+      const name = extractCandidateName(element);
       if (isValidParticipantName(name)) return name;
     }
     return null;
