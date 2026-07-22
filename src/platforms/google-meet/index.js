@@ -1,4 +1,4 @@
-import { scanMeetParticipants, observeMeetParticipants, isGoogleParticipantSpeaking } from './participants.js'
+import { scanMeetParticipants, observeMeetParticipants, isGoogleParticipantSpeaking, hasLocalPresentation } from './participants.js'
 import { createAssociationLearner, createFreshAlignmentTracker } from './association.js'
 import { createRoutingState, routeGoogleAudio } from './router.js'
 import { installAudioWorkletHook, createPooledSlot } from './audio-worklet.js'
@@ -33,6 +33,22 @@ export function createGoogleMeetController({ state, context, setStatus, renderSo
   let restoreHook, observer, mutationTimer, reconcileTimer, mediaTimer, routingTimer, slotCounter = 0
 
   function participants() { return visibleParticipants(state, 'google-meet') }
+  function syncPresentationState() {
+    const presenting = hasLocalPresentation()
+    if (presenting === state.google.localPresentationActive) return presenting
+    state.google.localPresentationActive = presenting
+    if (presenting) {
+      for (const slot of state.google.slots) slot.release()
+      for (const pipeline of media.pipelines) pipeline.deactivate()
+      state.google.activeParticipantKey = null
+      state.google.appliedParticipantKey = null
+      state.google.routingState = 'local-presentation-bypass'
+      state.google.transitionGuard.candidateParticipantKey = null
+      state.google.transitionGuard.candidateSince = 0
+    }
+    renderSoon()
+    return presenting
+  }
   function setMode(mode) {
     if (state.google.mode === mode) return
     state.google.mode = mode
@@ -45,11 +61,12 @@ export function createGoogleMeetController({ state, context, setStatus, renderSo
     if (state.google.slots.some(slot => slot.gain === gain)) return
     state.google.slots.push(createPooledSlot(gain, `slot-${++slotCounter}`))
     setMode('worklet')
-    setOutputs(currentMultiplier(), true)
+    syncPresentationState()
     renderSoon()
   }
   function reconcile() {
     const now = Date.now()
+    syncPresentationState()
     const found = new Set()
     for (const data of scanMeetParticipants()) {
       found.add(data.key)
@@ -67,6 +84,10 @@ export function createGoogleMeetController({ state, context, setStatus, renderSo
     if (signature !== state.google.rosterSignature) { state.google.rosterSignature = signature; renderSoon() }
   }
   function scanMedia() {
+    if (state.google.localPresentationActive) {
+      for (const pipeline of media.pipelines) pipeline.deactivate()
+      return
+    }
     media.scan()
     state.google.mediaPipelines = media.pipelines
     if (state.google.slots.length) setMode('worklet')
@@ -76,10 +97,6 @@ export function createGoogleMeetController({ state, context, setStatus, renderSo
   function setOutputs(multiplier, immediate = false) {
     if (state.google.mode === 'media') applyMediaPipelineOutputs(media.pipelines, state.google.routing, multiplier, immediate)
     else for (const slot of state.google.slots) slot.set(multiplier, immediate)
-  }
-  function currentMultiplier() {
-    const participant = state.participants.get(state.google.activeParticipantKey)
-    return participant?.present ? participant.value : 1
   }
   function currentUiSpeakers() {
     return collectCurrentUiSpeakers(participants())
@@ -148,6 +165,18 @@ export function createGoogleMeetController({ state, context, setStatus, renderSo
     setStatus(active ? `${active.name} · automatic routing` : labels[routing.routingState] || `${participants().length} participants ready`)
   }
   function route() {
+    if (state.google.localPresentationActive) {
+      for (const slot of state.google.slots) slot.release()
+      if (state.google.mode === 'media') for (const pipeline of media.pipelines) pipeline.deactivate()
+      state.google.activeParticipantKey = null
+      state.google.appliedParticipantKey = null
+      state.google.routingState = 'local-presentation-bypass'
+      state.google.transitionGuard.candidateParticipantKey = null
+      state.google.transitionGuard.candidateSince = 0
+      setStatus('Presenting · own presentation audio bypassed')
+      updateLiveUi()
+      return
+    }
     const now = Date.now()
     const speakers = currentUiSpeakers()
     if (state.google.mode === 'media') routeMedia(now, speakers)
@@ -157,16 +186,24 @@ export function createGoogleMeetController({ state, context, setStatus, renderSo
   function start() {
     restoreHook = installAudioWorkletHook(registerSlot)
     reconcile(); scanMedia()
-    observer = observeMeetParticipants(() => { clearTimeout(mutationTimer); mutationTimer = setTimeout(reconcile, 80) })
+    observer = observeMeetParticipants(() => {
+      syncPresentationState()
+      clearTimeout(mutationTimer)
+      mutationTimer = setTimeout(reconcile, 80)
+    })
     reconcileTimer = setInterval(reconcile, 750)
     mediaTimer = setInterval(scanMedia, 500)
     routingTimer = setInterval(route, 30)
   }
   function stop() {
     observer?.disconnect(); clearTimeout(mutationTimer); clearInterval(reconcileTimer); clearInterval(mediaTimer); clearInterval(routingTimer)
-    restoreHook?.(); setOutputs(1, true); media.destroy()
+    restoreHook?.()
+    if (state.google.localPresentationActive) for (const slot of state.google.slots) slot.release()
+    else setOutputs(1, true)
+    media.destroy()
   }
   function applyParticipantGain(participant) {
+    if (syncPresentationState()) return
     // Pooled worklets expose no stable per-participant energy identity, so
     // pre-UI stale detection is unavailable; UI edges neutralize first and
     // no marker hold or permanent slot mapping is retained.

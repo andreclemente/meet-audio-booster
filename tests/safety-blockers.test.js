@@ -5,7 +5,7 @@ import path from 'node:path'
 import { applyMediaPipelineOutputs, activateMediaModePipelines } from '../src/platforms/google-meet/index.js'
 import { createFreshAlignmentTracker, createAssociationLearner } from '../src/platforms/google-meet/association.js'
 import { routeGoogleAudio, createRoutingState } from '../src/platforms/google-meet/router.js'
-import { scanMeetParticipants, isSelfParticipant } from '../src/platforms/google-meet/participants.js'
+import { scanMeetParticipants, isSelfParticipant, isLocalPresentationRoot } from '../src/platforms/google-meet/participants.js'
 import { installAudioWorkletHook, createPooledSlot } from '../src/platforms/google-meet/audio-worklet.js'
 import { createAudioContext } from '../src/shared/audio.js'
 import { createDebugInfo } from '../src/shared/debug.js'
@@ -71,7 +71,7 @@ test('stuck UI A cannot teach newly energetic B or leak muted/high A gain to B',
   assert.equal(pipelines[1].appliedMultiplier, 1)
 })
 
-test('neutral worklet routing does not override a later Meet-owned gain change', () => {
+test('neutral worklet discovery leaves the native Meet gain untouched', () => {
   const writes = []
   const gain = {
     gain: {
@@ -83,11 +83,17 @@ test('neutral worklet routing does not override a later Meet-owned gain change',
   const slot = createPooledSlot(gain, 'slot-1')
 
   slot.neutral(true)
-  gain.gain.value = 0
-  slot.set(1)
+  assert.deepEqual(writes, [])
+  slot.set(2, true)
+  slot.neutral(true)
+  assert.equal(gain.gain.value, 1)
+  assert.deepEqual(writes, [2, 1])
 
+  slot.set(2, true)
+  gain.gain.value = 0
+  slot.release()
   assert.equal(gain.gain.value, 0)
-  assert.deepEqual(writes, [1])
+  assert.deepEqual(writes, [2, 1, 2])
 })
 
 test('stopping worklet hook does not overwrite a later AudioNode connect wrapper', () => {
@@ -113,6 +119,31 @@ test('AudioContext constructor failures are represented as unavailable', () => {
   const Original = globalThis.AudioContext
   globalThis.AudioContext = class { constructor() { throw new Error('denied') } }
   try { assert.equal(createAudioContext(), null) } finally { globalThis.AudioContext = Original }
+})
+
+test('local presentation controls are detected without accepting a remote participant tile', () => {
+  function root(text, name = null) {
+    const node = name ? namedNode(name) : null
+    return {
+      innerText: text,
+      textContent: text,
+      getAttribute(attr) {
+        return attr === 'data-participant-id' ? 'spaces/example/devices/147' : null
+      },
+      querySelector(selector) { return node && selector.includes('.zWGUib') ? node : null },
+      querySelectorAll(selector) {
+        if (selector === '[aria-label]') return []
+        return node && selector.includes('.zWGUib') ? [node] : []
+      }
+    }
+  }
+
+  const presentationText = 'stylus_laser_pointer Everyone can see your annotations Scroll & zoom your presentation in Meet Enter Full Screen'
+  assert.equal(isLocalPresentationRoot(root(presentationText)), true)
+  assert.equal(isLocalPresentationRoot(root(presentationText, 'Alice Smith')), false)
+  assert.equal(isLocalPresentationRoot(root(
+    "keep_outline Pin André Clemente mic_off You can't unmute someone else More options for André Clemente"
+  )), false)
 })
 
 test('remote mute helper text does not identify a participant as self', () => {
@@ -151,11 +182,15 @@ function participantRoot(id, { name = null, requested = false, role = 'listitem'
   }
 }
 
-test('production participant scan rejects chat IDs and icon text but accepts a strict tile', () => {
+test('production participant scan rejects chat, icon, and own-presentation records but accepts a strict tile', () => {
   const chat = participantRoot('chat-id', { text: 'Fake Chat Name', role: 'listitem' })
   const icon = participantRoot('icon-id', { name: 'keep_outline' })
+  const presentation = participantRoot('presentation-id', {
+    requested: true,
+    text: 'Everyone can see your annotations Scroll & zoom your presentation in Meet'
+  })
   const real = participantRoot('real-id', { name: 'Alice Smith' })
-  const root = { querySelectorAll: () => [chat, icon, real] }
+  const root = { querySelectorAll: () => [chat, icon, presentation, real] }
   assert.deepEqual(scanMeetParticipants(root).map(item => [item.participantId, item.name]), [['real-id', 'Alice Smith']])
 })
 
