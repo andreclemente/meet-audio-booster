@@ -42,11 +42,18 @@ export function createGoogleMeetController({ state, context, setStatus, renderSo
     renderSoon()
   }
   function registerSlot(gain) {
-    if (state.google.slots.some(slot => slot.gain === gain)) return
-    state.google.slots.push(createPooledSlot(gain, `slot-${++slotCounter}`))
+    const existing = state.google.slots.find(slot => slot.gain === gain)
+    if (existing) return () => {}
+    const slot = createPooledSlot(gain, `slot-${++slotCounter}`)
+    state.google.slots.push(slot)
     setMode('worklet')
     setOutputs(currentMultiplier(), true)
     renderSoon()
+    return () => {
+      slot.neutral(true)
+      state.google.slots = state.google.slots.filter(candidate => candidate !== slot)
+      renderSoon()
+    }
   }
   function reconcile() {
     const now = Date.now()

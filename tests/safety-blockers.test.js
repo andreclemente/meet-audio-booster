@@ -71,7 +71,7 @@ test('stuck UI A cannot teach newly energetic B or leak muted/high A gain to B',
   assert.equal(pipelines[1].appliedMultiplier, 1)
 })
 
-test('neutral worklet routing does not override a later Meet-owned gain change', () => {
+test('neutral worklet routing does not repeatedly rewrite the multiplier', () => {
   const writes = []
   const gain = {
     gain: {
@@ -88,6 +88,96 @@ test('neutral worklet routing does not override a later Meet-owned gain change',
 
   assert.equal(gain.gain.value, 0)
   assert.deepEqual(writes, [1])
+})
+
+test('worklet hook inserts an extension-owned gain and preserves Meet gain ownership', () => {
+  const OriginalAudioNode = globalThis.AudioNode
+  const calls = []
+  const disconnects = []
+  let extensionGain = null
+  let disposed = 0
+
+  class FakeAudioNode {
+    constructor(context) { this.context = context }
+    connect(destination, ...ports) {
+      calls.push({ from: this, to: destination, ports })
+      return destination
+    }
+    disconnect(...args) { disconnects.push({ from: this, args }) }
+  }
+  class AudioWorkletNode extends FakeAudioNode {}
+  class GainNode extends FakeAudioNode {
+    constructor(context) {
+      super(context)
+      this.gain = { value: 1, context, setValueAtTime(value) { this.value = value } }
+    }
+  }
+  const context = {
+    currentTime: 0,
+    createGain() { extensionGain = new GainNode(this); return extensionGain }
+  }
+  const source = new AudioWorkletNode(context)
+  const meetGain = new GainNode(context)
+  let slot = null
+
+  globalThis.AudioNode = FakeAudioNode
+  try {
+    const restore = installAudioWorkletHook(gain => {
+      slot = createPooledSlot(gain, 'slot-1')
+      return () => { disposed++ }
+    })
+    const result = source.connect(meetGain, 2, 3)
+
+    assert.equal(result, meetGain)
+    assert.ok(extensionGain)
+    assert.equal(slot.gain, extensionGain)
+    assert.deepEqual(calls.map(call => [call.from, call.to, call.ports]), [
+      [source, extensionGain, [2, 0]],
+      [extensionGain, meetGain, [0, 3]]
+    ])
+
+    meetGain.gain.value = 0
+    slot.set(2, true)
+    assert.equal(meetGain.gain.value, 0)
+    assert.equal(extensionGain.gain.value, 2)
+
+    source.disconnect(meetGain, 2, 3)
+    assert.deepEqual(disconnects.map(call => [call.from, call.args]), [
+      [source, [extensionGain, 2, 0]],
+      [extensionGain, [meetGain, 0, 3]]
+    ])
+    assert.equal(disposed, 1)
+
+    calls.length = 0
+    disconnects.length = 0
+    source.connect(meetGain)
+    const coercibleOutputGain = extensionGain
+    source.disconnect('0')
+    assert.deepEqual(disconnects.map(call => [call.from, call.args]), [
+      [source, ['0']],
+      [coercibleOutputGain, [meetGain, 0, 0]]
+    ])
+    assert.equal(disposed, 2)
+
+    calls.length = 0
+    disconnects.length = 0
+    source.connect(meetGain)
+    const liveGain = extensionGain
+    restore()
+    assert.deepEqual(calls.map(call => [call.from, call.to, call.ports]), [
+      [source, liveGain, [0, 0]],
+      [liveGain, meetGain, [0, 0]],
+      [source, meetGain, [0, 0]]
+    ])
+    assert.deepEqual(disconnects.map(call => [call.from, call.args]), [
+      [source, [liveGain, 0, 0]],
+      [liveGain, [meetGain, 0, 0]]
+    ])
+    assert.equal(disposed, 3)
+  } finally {
+    globalThis.AudioNode = OriginalAudioNode
+    delete globalThis.__meetingAudioBoosterWorkletHook
+  }
 })
 
 test('stopping worklet hook does not overwrite a later AudioNode connect wrapper', () => {

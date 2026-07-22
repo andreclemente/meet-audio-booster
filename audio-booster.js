@@ -401,19 +401,172 @@
   function installAudioWorkletHook(onSlot) {
     if (!globalThis.AudioNode || globalThis.__meetingAudioBoosterWorkletHook) return () => {
     };
-    const original = AudioNode.prototype.connect;
-    globalThis.__meetingAudioBoosterWorkletHook = original;
-    const wrapper = function(...args) {
-      const from = this;
-      const to = args[0];
-      const result = original.apply(from, args);
-      if (from?.constructor?.name === "AudioWorkletNode" && to?.constructor?.name === "GainNode") onSlot(to);
-      return result;
+    const originalConnect = AudioNode.prototype.connect;
+    const originalDisconnect = AudioNode.prototype.disconnect;
+    const routes = /* @__PURE__ */ new WeakMap();
+    const liveRoutes = /* @__PURE__ */ new Set();
+    let active = true;
+    function normalizePort(value) {
+      return value === void 0 ? 0 : Number(value) >>> 0;
+    }
+    function isAudioDestination(value) {
+      try {
+        if (globalThis.AudioNode && value instanceof globalThis.AudioNode) return true;
+        if (globalThis.AudioParam && value instanceof globalThis.AudioParam) return true;
+      } catch {
+      }
+      return false;
+    }
+    function sourceRoutes(source) {
+      let byDestination = routes.get(source);
+      if (!byDestination) {
+        byDestination = /* @__PURE__ */ new Map();
+        routes.set(source, byDestination);
+      }
+      return byDestination;
+    }
+    function removeRecord(route) {
+      route.dispose?.();
+      liveRoutes.delete(route);
+      const byDestination = routes.get(route.source);
+      const destinationRoutes = byDestination?.get(route.destination);
+      destinationRoutes?.delete(route.key);
+      if (destinationRoutes && !destinationRoutes.size) byDestination.delete(route.destination);
+      if (byDestination && !byDestination.size) routes.delete(route.source);
+    }
+    function disconnectOwnedRoute(route, sourceAlreadyDisconnected = false) {
+      if (!sourceAlreadyDisconnected) {
+        try {
+          originalDisconnect.call(route.source, route.gain, route.output, 0);
+        } catch {
+        }
+      }
+      try {
+        originalDisconnect.call(route.gain, route.destination, 0, route.input);
+      } catch {
+      }
+      removeRecord(route);
+    }
+    function restoreNativeRoute(route) {
+      try {
+        originalDisconnect.call(route.source, route.gain, route.output, 0);
+      } catch {
+      }
+      let restored = false;
+      try {
+        originalConnect.call(route.source, route.destination, route.output, route.input);
+        restored = true;
+      } catch {
+      }
+      if (restored) {
+        try {
+          originalDisconnect.call(route.gain, route.destination, 0, route.input);
+        } catch {
+        }
+      } else {
+        try {
+          originalConnect.call(route.source, route.gain, route.output, 0);
+        } catch {
+        }
+      }
+      removeRecord(route);
+    }
+    const connectWrapper = function(...args) {
+      if (!active) return originalConnect.apply(this, args);
+      const source = this;
+      const destination = args[0];
+      const isPooledRoute = source?.constructor?.name === "AudioWorkletNode" && destination?.constructor?.name === "GainNode";
+      if (!isPooledRoute) return originalConnect.apply(source, args);
+      let output, input;
+      try {
+        output = normalizePort(args.length > 1 ? args[1] : 0);
+        input = normalizePort(args.length > 2 ? args[2] : 0);
+      } catch {
+        return originalConnect.apply(source, args);
+      }
+      const key = `${output}:${input}`;
+      const byDestination = sourceRoutes(source);
+      let destinationRoutes = byDestination.get(destination);
+      if (!destinationRoutes) {
+        destinationRoutes = /* @__PURE__ */ new Map();
+        byDestination.set(destination, destinationRoutes);
+      }
+      if (destinationRoutes.has(key)) return destination;
+      let gain;
+      try {
+        gain = source.context?.createGain?.();
+        if (!gain) return originalConnect.apply(source, args);
+        originalConnect.call(source, gain, output, 0);
+        originalConnect.call(gain, destination, 0, input);
+      } catch {
+        if (gain) {
+          try {
+            originalDisconnect.call(source, gain, output, 0);
+          } catch {
+          }
+          try {
+            originalDisconnect.call(gain, destination, 0, input);
+          } catch {
+          }
+        }
+        return originalConnect.apply(source, args);
+      }
+      const route = { source, destination, gain, output, input, key, dispose: null };
+      destinationRoutes.set(key, route);
+      liveRoutes.add(route);
+      try {
+        route.dispose = onSlot(gain) || null;
+      } catch (error) {
+        console.warn("[Meet Audio Booster] Could not register worklet slot", error);
+      }
+      return destination;
     };
-    AudioNode.prototype.connect = wrapper;
+    const disconnectWrapper = function(...args) {
+      if (!active) return originalDisconnect.apply(this, args);
+      const source = this;
+      const byDestination = routes.get(source);
+      if (!byDestination?.size) return originalDisconnect.apply(source, args);
+      if (!args.length) {
+        originalDisconnect.apply(source, args);
+        const owned = [...liveRoutes].filter((route) => route.source === source);
+        for (const route of owned) disconnectOwnedRoute(route, true);
+        return void 0;
+      }
+      if (args.length === 1 && !isAudioDestination(args[0])) {
+        originalDisconnect.apply(source, args);
+        const output2 = normalizePort(args[0]);
+        const owned = [...liveRoutes].filter((route) => route.source === source && route.output === output2);
+        for (const route of owned) disconnectOwnedRoute(route, true);
+        return void 0;
+      }
+      const destination = args[0];
+      const destinationRoutes = byDestination.get(destination);
+      if (!destinationRoutes?.size) return originalDisconnect.apply(source, args);
+      let output, input;
+      try {
+        output = args.length > 1 ? normalizePort(args[1]) : null;
+        input = args.length > 2 ? normalizePort(args[2]) : null;
+      } catch {
+        return originalDisconnect.apply(source, args);
+      }
+      const matched = [...destinationRoutes.values()].filter((route) => {
+        if (output !== null && route.output !== output) return false;
+        return input === null || route.input === input;
+      });
+      if (!matched.length) return originalDisconnect.apply(source, args);
+      for (const route of matched) disconnectOwnedRoute(route);
+      return void 0;
+    };
+    const marker = { originalConnect, originalDisconnect };
+    globalThis.__meetingAudioBoosterWorkletHook = marker;
+    AudioNode.prototype.connect = connectWrapper;
+    AudioNode.prototype.disconnect = disconnectWrapper;
     return () => {
-      if (AudioNode.prototype.connect === wrapper) AudioNode.prototype.connect = original;
-      delete globalThis.__meetingAudioBoosterWorkletHook;
+      active = false;
+      for (const route of [...liveRoutes]) restoreNativeRoute(route);
+      if (AudioNode.prototype.connect === connectWrapper) AudioNode.prototype.connect = originalConnect;
+      if (AudioNode.prototype.disconnect === disconnectWrapper) AudioNode.prototype.disconnect = originalDisconnect;
+      if (globalThis.__meetingAudioBoosterWorkletHook === marker) delete globalThis.__meetingAudioBoosterWorkletHook;
     };
   }
   function createPooledSlot(gain, id) {
@@ -704,11 +857,19 @@
       renderSoon();
     }
     function registerSlot(gain) {
-      if (state.google.slots.some((slot) => slot.gain === gain)) return;
-      state.google.slots.push(createPooledSlot(gain, `slot-${++slotCounter}`));
+      const existing = state.google.slots.find((slot2) => slot2.gain === gain);
+      if (existing) return () => {
+      };
+      const slot = createPooledSlot(gain, `slot-${++slotCounter}`);
+      state.google.slots.push(slot);
       setMode("worklet");
       setOutputs(currentMultiplier(), true);
       renderSoon();
+      return () => {
+        slot.neutral(true);
+        state.google.slots = state.google.slots.filter((candidate) => candidate !== slot);
+        renderSoon();
+      };
     }
     function reconcile() {
       const now = Date.now();
