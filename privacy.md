@@ -2,7 +2,7 @@
 
 Last updated: 2026-07-22
 
-Meeting Audio Booster does not collect, transmit, sell, or store personal information outside your browser.
+Meet Audio Booster does not collect, transmit, sell, or store personal information outside your browser.
 
 ## What the extension does
 
@@ -19,7 +19,7 @@ Participant names or platform IDs may form local preference keys. This informati
 
 ## Data collection
 
-Meeting Audio Booster:
+Meet Audio Booster:
 
 - Does not send data to a server
 - Does not use analytics, tracking, cookies, or advertising

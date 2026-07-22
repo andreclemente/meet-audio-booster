@@ -10,6 +10,6 @@ chrome.action.onClicked.addListener(async (tab) => {
       }
     })
   } catch (error) {
-    console.warn('Meeting Audio Booster could not be shown on this page', error)
+    console.warn('Meet Audio Booster could not be shown on this page', error)
   }
 })

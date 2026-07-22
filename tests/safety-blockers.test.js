@@ -153,8 +153,10 @@ test('debug snapshots expose required JSON-safe pipeline and participant fields'
   assert.doesNotThrow(() => JSON.stringify(info))
 })
 
-test('manifest version equals package version', async () => {
+test('manifest metadata matches the package and product name', async () => {
   const root = path.resolve(import.meta.dirname, '..')
   const [manifest, pkg] = await Promise.all(['manifest.json', 'package.json'].map(async file => JSON.parse(await readFile(path.join(root, file), 'utf8'))))
   assert.equal(manifest.version, pkg.version)
+  assert.equal(manifest.name, 'Meet Audio Booster')
+  assert.equal(manifest.action.default_title, 'Show Meet Audio Booster')
 })

@@ -1,4 +1,4 @@
-# Meeting Audio Booster
+# Meet Audio Booster
 
 Per-participant playback volume controls for Google Meet and Jitsi Meet. Preferences stay in browser `localStorage`; the extension has no telemetry and makes no network requests.
 
