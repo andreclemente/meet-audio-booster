@@ -865,6 +865,19 @@
       return participant.speaking;
     });
   }
+  function collectCurrentUiSpeakersAcrossRoots(participants, root = globalThis.document) {
+    const rootsByParticipantId = /* @__PURE__ */ new Map();
+    for (const element of root?.querySelectorAll?.("[data-participant-id]") || []) {
+      const participantId = element.getAttribute?.("data-participant-id");
+      if (!participantId) continue;
+      if (!rootsByParticipantId.has(participantId)) rootsByParticipantId.set(participantId, []);
+      rootsByParticipantId.get(participantId).push(element);
+    }
+    return collectCurrentUiSpeakers(participants, (participant) => {
+      const roots = rootsByParticipantId.get(participant.participantId);
+      return roots?.length ? roots.some(isGoogleParticipantSpeaking) : isGoogleParticipantSpeaking(participant.element);
+    });
+  }
   function createWorkletSpeakerTracker({ confirmMs = 50 } = {}) {
     let confirmed = null;
     let candidateKey = null;
@@ -1026,7 +1039,7 @@
       else for (const slot of state.google.slots) slot.set(multiplier, immediate);
     }
     function currentUiSpeakers() {
-      return collectCurrentUiSpeakers(participants());
+      return collectCurrentUiSpeakersAcrossRoots(participants());
     }
     function neutralizeHiddenTab() {
       workletSpeakerTracker.reset("hidden-tab");

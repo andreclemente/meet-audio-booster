@@ -1,6 +1,27 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { collectCurrentUiSpeakers, createGoogleMeetController, createWorkletSpeakerTracker } from '../src/platforms/google-meet/index.js'
+import { collectCurrentUiSpeakers, collectCurrentUiSpeakersAcrossRoots, createGoogleMeetController, createWorkletSpeakerTracker } from '../src/platforms/google-meet/index.js'
+
+function fakeParticipantRoot(participantId, speaking = false) {
+  return {
+    getAttribute(name) { return name === 'data-participant-id' ? participantId : null },
+    matches(selector) { return selector === '.BlxGDf' && speaking },
+    querySelector() { return null },
+    querySelectorAll() { return [] }
+  }
+}
+
+test('speaker detection uses a speaking tile sibling when the selected roster root is quiet', () => {
+  const tile = fakeParticipantRoot('device-a', true)
+  const roster = fakeParticipantRoot('device-a', false)
+  const root = { querySelectorAll: selector => selector === '[data-participant-id]' ? [tile, roster] : [] }
+  const alice = { key: 'A', participantId: 'device-a', element: roster, speaking: false, lastSpeakingAt: 0 }
+
+  const result = collectCurrentUiSpeakersAcrossRoots([alice], root)
+
+  assert.deepEqual(result.map(participant => participant.key), ['A'])
+  assert.equal(alice.speaking, true)
+})
 
 test('previous UI speaker is not held after the speaking marker clears', () => {
   const participants = [
