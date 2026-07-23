@@ -18,7 +18,7 @@ export function createDebugInfo(state, visibleParticipants) {
   }))
   const slots = state.google.slots.map(slot => ({
     id: slot.id, baseGain: slot.baseGain, appliedMultiplier: slot.appliedMultiplier,
-    targetValue: slot.targetValue, actualValue: Number(slot.gain?.gain?.value), participantKey: null
+    targetValue: slot.targetValue, actualValue: Number(slot.actualValue), participantKey: null
   }))
   const mediaPipelines = state.google.mediaPipelines.map(pipeline => {
     const track = pipeline.tracks?.[0]

@@ -388,20 +388,43 @@
     const original = owner.getDisplayMedia;
     if (typeof original !== "function" || owner[HOOK_KEY]) return () => {
     };
+    const captures = /* @__PURE__ */ new Set();
+    let active = false;
+    let disposed = false;
+    const emit = (next) => {
+      if (disposed || active === next) return;
+      active = next;
+      onActive(next);
+    };
+    const removeCapture = (capture) => {
+      if (!captures.delete(capture)) return;
+      for (const track of capture.tracks) track.removeEventListener?.("ended", capture.checkEnded);
+      emit(captures.size > 0);
+    };
     const wrapped = async function(...args) {
       const stream = await original.apply(this, args);
-      const videoTracks = stream?.getVideoTracks?.() || [];
-      const tracks = videoTracks.length ? videoTracks : stream?.getTracks?.() || [];
-      const checkEnded = () => {
-        if (tracks.length && tracks.every((track) => track.readyState === "ended")) onActive(false);
+      if (disposed) return stream;
+      const allTracks = stream?.getTracks?.() || [];
+      const tracks = allTracks.length ? allTracks : stream?.getVideoTracks?.() || [];
+      if (!tracks.length || tracks.every((track) => track.readyState === "ended")) return stream;
+      const capture = { tracks, checkEnded: null };
+      capture.checkEnded = () => {
+        if (tracks.length && tracks.every((track) => track.readyState === "ended")) removeCapture(capture);
       };
-      for (const track of tracks) track.addEventListener?.("ended", checkEnded, { once: true });
-      onActive(true);
+      captures.add(capture);
+      for (const track of tracks) track.addEventListener?.("ended", capture.checkEnded);
+      emit(true);
       return stream;
     };
     owner[HOOK_KEY] = wrapped;
     owner.getDisplayMedia = wrapped;
     return () => {
+      if (disposed) return;
+      disposed = true;
+      for (const capture of captures) {
+        for (const track of capture.tracks) track.removeEventListener?.("ended", capture.checkEnded);
+      }
+      captures.clear();
       if (owner.getDisplayMedia === wrapped) owner.getDisplayMedia = original;
       if (owner[HOOK_KEY] === wrapped) delete owner[HOOK_KEY];
     };
@@ -437,21 +460,141 @@
   }
 
   // src/platforms/google-meet/audio-worklet.js
-  function installAudioWorkletHook(onSlot) {
+  function normalizeIndex(value) {
+    return value === void 0 ? 0 : value;
+  }
+  function connectionMatches(mapping, args) {
+    if (!args.length) return true;
+    if (typeof args[0] === "number") return mapping.output === args[0];
+    if (args[0] !== mapping.destination) return false;
+    if (args.length > 1 && mapping.output !== normalizeIndex(args[1])) return false;
+    if (args.length > 2 && mapping.input !== normalizeIndex(args[2])) return false;
+    return true;
+  }
+  function installAudioWorkletHook(onSlot, onRemove = () => {
+  }) {
     if (!globalThis.AudioNode || globalThis.__meetingAudioBoosterWorkletHook) return () => {
     };
-    const original = AudioNode.prototype.connect;
-    globalThis.__meetingAudioBoosterWorkletHook = original;
-    const wrapper = function(...args) {
-      const from = this;
-      const to = args[0];
-      const result = original.apply(from, args);
-      if (from?.constructor?.name === "AudioWorkletNode" && to?.constructor?.name === "GainNode") onSlot(to);
-      return result;
+    const originalConnect = AudioNode.prototype.connect;
+    const originalDisconnect = AudioNode.prototype.disconnect;
+    const mappings = [];
+    let disposed = false;
+    const connectWrapper = function(...args) {
+      if (disposed) return originalConnect.apply(this, args);
+      const destination = args[0];
+      const isPooledConnection = this?.constructor?.name === "AudioWorkletNode" && destination?.constructor?.name === "GainNode";
+      if (!isPooledConnection || typeof destination?.context?.createGain !== "function") return originalConnect.apply(this, args);
+      const output = normalizeIndex(args[1]);
+      const input = normalizeIndex(args[2]);
+      const existing = mappings.find((item) => item.source === this && item.destination === destination && item.output === output && item.input === input);
+      if (existing) return destination;
+      let removedDirect = false;
+      try {
+        originalDisconnect.call(this, destination, output, input);
+        removedDirect = true;
+      } catch (error) {
+        if (error?.name !== "InvalidAccessError") throw error;
+      }
+      let booster;
+      let sourceConnected = false;
+      try {
+        booster = destination.context.createGain();
+        booster.gain.value = 1;
+        const sourceArgs = args.length > 1 ? [booster, args[1]] : [booster];
+        const destinationArgs = args.length > 2 ? [destination, 0, args[2]] : [destination];
+        originalConnect.apply(this, sourceArgs);
+        sourceConnected = true;
+        originalConnect.apply(booster, destinationArgs);
+      } catch (error) {
+        if (sourceConnected) {
+          try {
+            originalDisconnect.call(this, booster, output, 0);
+          } catch {
+          }
+        }
+        if (removedDirect) {
+          try {
+            originalConnect.apply(this, args);
+          } catch {
+          }
+        }
+        throw error;
+      }
+      mappings.push({ source: this, destination, booster, output, input, originalArgs: [...args] });
+      try {
+        onSlot(booster);
+      } catch {
+      }
+      return destination;
     };
-    AudioNode.prototype.connect = wrapper;
+    const disconnectWrapper = function(...args) {
+      if (disposed) return originalDisconnect.apply(this, args);
+      const matched = mappings.filter((mapping) => mapping.source === this && connectionMatches(mapping, args));
+      if (!matched.length) return originalDisconnect.apply(this, args);
+      let nativeError = null;
+      if (!args.length || typeof args[0] === "number") originalDisconnect.apply(this, args);
+      else {
+        try {
+          originalDisconnect.apply(this, args);
+        } catch (error) {
+          nativeError = error;
+        }
+        for (const mapping of matched) {
+          try {
+            originalDisconnect.call(this, mapping.booster, mapping.output, 0);
+          } catch {
+          }
+        }
+      }
+      for (const mapping of matched) {
+        try {
+          originalDisconnect.call(mapping.booster, mapping.destination, 0, mapping.input);
+        } catch {
+        }
+        const index = mappings.indexOf(mapping);
+        if (index >= 0) mappings.splice(index, 1);
+        try {
+          onRemove(mapping.booster);
+        } catch {
+        }
+      }
+      if (nativeError && nativeError.name !== "InvalidAccessError") throw nativeError;
+    };
+    AudioNode.prototype.connect = connectWrapper;
+    AudioNode.prototype.disconnect = disconnectWrapper;
+    globalThis.__meetingAudioBoosterWorkletHook = { originalConnect, originalDisconnect };
     return () => {
-      if (AudioNode.prototype.connect === wrapper) AudioNode.prototype.connect = original;
+      if (disposed) return;
+      disposed = true;
+      for (const mapping of [...mappings]) {
+        try {
+          writeAudioParam(mapping.booster.gain, 1);
+        } catch {
+        }
+        let restored = false;
+        try {
+          originalConnect.apply(mapping.source, mapping.originalArgs);
+          restored = true;
+        } catch {
+        }
+        if (restored) {
+          try {
+            originalDisconnect.call(mapping.source, mapping.booster, mapping.output, 0);
+          } catch {
+          }
+          try {
+            originalDisconnect.call(mapping.booster, mapping.destination, 0, mapping.input);
+          } catch {
+          }
+          try {
+            onRemove(mapping.booster);
+          } catch {
+          }
+        }
+      }
+      mappings.length = 0;
+      if (AudioNode.prototype.connect === connectWrapper) AudioNode.prototype.connect = originalConnect;
+      if (AudioNode.prototype.disconnect === disconnectWrapper) AudioNode.prototype.disconnect = originalDisconnect;
       delete globalThis.__meetingAudioBoosterWorkletHook;
     };
   }
@@ -464,40 +607,30 @@
       nativeValue: baseGain,
       appliedMultiplier: 1,
       targetValue: baseGain,
-      lastWriteAt: 0,
-      modified: false,
-      // A pooled slot is deliberately never assigned a participant identity.
       participantKey: null,
-      set(multiplier, immediate = false) {
+      get actualValue() {
+        return readAudioParam(gain.gain);
+      },
+      set(multiplier) {
         const safe = Number.isFinite(multiplier) ? Math.max(0, multiplier) : 1;
-        const actual = readAudioParam(gain.gain);
-        if (!this.modified || Math.abs(actual - this.targetValue) > 2e-3) this.nativeValue = actual;
-        const target = this.nativeValue * safe;
-        const now = performance.now();
+        if (safe === this.appliedMultiplier) return;
+        writeAudioParam(gain.gain, safe);
         this.appliedMultiplier = safe;
-        this.targetValue = target;
+        this.targetValue = safe;
         this.participantKey = null;
-        if (Math.abs(actual - target) <= 2e-3) {
-          this.modified = Math.abs(target - this.nativeValue) > 2e-3;
-          return;
-        }
-        if (safe === 1 && !this.modified) return;
-        if (!immediate && now - this.lastWriteAt < 90) return;
-        writeAudioParam(gain.gain, target);
-        this.modified = Math.abs(target - this.nativeValue) > 2e-3;
-        this.lastWriteAt = now;
       },
       release() {
-        const actual = readAudioParam(gain.gain);
-        if (this.modified && Math.abs(actual - this.targetValue) > 2e-3) this.nativeValue = actual;
-        if (this.modified && Math.abs(actual - this.nativeValue) > 2e-3) writeAudioParam(gain.gain, this.nativeValue);
+        if (this.appliedMultiplier === 1) return;
+        writeAudioParam(gain.gain, 1);
         this.appliedMultiplier = 1;
-        this.targetValue = this.nativeValue;
+        this.targetValue = 1;
         this.participantKey = null;
-        this.modified = false;
       },
-      neutral(immediate = true) {
-        this.set(1, immediate);
+      neutral() {
+        this.release();
+      },
+      destroy() {
+        this.release();
       }
     };
   }
@@ -845,6 +978,13 @@
       syncPresentationState();
       renderSoon();
     }
+    function unregisterSlot(gain) {
+      const index = state.google.slots.findIndex((slot) => slot.gain === gain);
+      if (index < 0) return;
+      state.google.slots[index].destroy();
+      state.google.slots.splice(index, 1);
+      renderSoon();
+    }
     function reconcile() {
       const now = Date.now();
       syncPresentationState();
@@ -968,7 +1108,7 @@
     }
     function start() {
       restoreCaptureHook = installLocalPresentationCaptureHook(setCapturePresentationActive);
-      restoreHook = installAudioWorkletHook(registerSlot);
+      restoreHook = installAudioWorkletHook(registerSlot, unregisterSlot);
       reconcile();
       scanMedia();
       observer = observeMeetParticipants(() => {
@@ -996,8 +1136,9 @@
       if (visibilityHandler) document.removeEventListener("visibilitychange", visibilityHandler);
       restoreCaptureHook?.();
       restoreHook?.();
-      if (state.google.localPresentationActive) for (const slot of state.google.slots) slot.release();
-      else setOutputs(1, true);
+      if (state.google.mode === "media") setOutputs(1, true);
+      for (const slot of state.google.slots) slot.destroy();
+      state.google.slots = [];
       media.destroy();
     }
     function applyParticipantGain(participant) {
@@ -1411,7 +1552,7 @@
       baseGain: slot.baseGain,
       appliedMultiplier: slot.appliedMultiplier,
       targetValue: slot.targetValue,
-      actualValue: Number(slot.gain?.gain?.value),
+      actualValue: Number(slot.actualValue),
       participantKey: null
     }));
     const mediaPipelines = state.google.mediaPipelines.map((pipeline) => {

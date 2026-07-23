@@ -1,19 +1,115 @@
 import { readAudioParam, writeAudioParam } from '../../shared/audio.js'
 
-export function installAudioWorkletHook(onSlot) {
+function normalizeIndex(value) {
+  return value === undefined ? 0 : value
+}
+
+function connectionMatches(mapping, args) {
+  if (!args.length) return true
+  if (typeof args[0] === 'number') return mapping.output === args[0]
+  if (args[0] !== mapping.destination) return false
+  if (args.length > 1 && mapping.output !== normalizeIndex(args[1])) return false
+  if (args.length > 2 && mapping.input !== normalizeIndex(args[2])) return false
+  return true
+}
+
+export function installAudioWorkletHook(onSlot, onRemove = () => {}) {
   if (!globalThis.AudioNode || globalThis.__meetingAudioBoosterWorkletHook) return () => {}
-  const original = AudioNode.prototype.connect
-  globalThis.__meetingAudioBoosterWorkletHook = original
-  const wrapper = function (...args) {
-    const from = this
-    const to = args[0]
-    const result = original.apply(from, args)
-    if (from?.constructor?.name === 'AudioWorkletNode' && to?.constructor?.name === 'GainNode') onSlot(to)
-    return result
+  const originalConnect = AudioNode.prototype.connect
+  const originalDisconnect = AudioNode.prototype.disconnect
+  const mappings = []
+  let disposed = false
+
+  const connectWrapper = function (...args) {
+    if (disposed) return originalConnect.apply(this, args)
+    const destination = args[0]
+    const isPooledConnection = this?.constructor?.name === 'AudioWorkletNode' && destination?.constructor?.name === 'GainNode'
+    if (!isPooledConnection || typeof destination?.context?.createGain !== 'function') return originalConnect.apply(this, args)
+    const output = normalizeIndex(args[1])
+    const input = normalizeIndex(args[2])
+    const existing = mappings.find(item => item.source === this && item.destination === destination && item.output === output && item.input === input)
+    if (existing) return destination
+
+    // Native connect is idempotent for an identical edge. Remove any edge
+    // created before this hook so replacing it cannot produce a parallel path.
+    let removedDirect = false
+    try {
+      originalDisconnect.call(this, destination, output, input)
+      removedDirect = true
+    } catch (error) {
+      if (error?.name !== 'InvalidAccessError') throw error
+    }
+    let booster
+    let sourceConnected = false
+    try {
+      booster = destination.context.createGain()
+      booster.gain.value = 1
+      const sourceArgs = args.length > 1 ? [booster, args[1]] : [booster]
+      const destinationArgs = args.length > 2 ? [destination, 0, args[2]] : [destination]
+      originalConnect.apply(this, sourceArgs)
+      sourceConnected = true
+      originalConnect.apply(booster, destinationArgs)
+    } catch (error) {
+      if (sourceConnected) {
+        try { originalDisconnect.call(this, booster, output, 0) } catch {}
+      }
+      if (removedDirect) {
+        try { originalConnect.apply(this, args) } catch {}
+      }
+      throw error
+    }
+    mappings.push({ source: this, destination, booster, output, input, originalArgs: [...args] })
+    try { onSlot(booster) } catch {}
+    return destination
   }
-  AudioNode.prototype.connect = wrapper
+
+  const disconnectWrapper = function (...args) {
+    if (disposed) return originalDisconnect.apply(this, args)
+    const matched = mappings.filter(mapping => mapping.source === this && connectionMatches(mapping, args))
+    if (!matched.length) return originalDisconnect.apply(this, args)
+
+    let nativeError = null
+    if (!args.length || typeof args[0] === 'number') originalDisconnect.apply(this, args)
+    else {
+      try { originalDisconnect.apply(this, args) } catch (error) { nativeError = error }
+      for (const mapping of matched) {
+        try { originalDisconnect.call(this, mapping.booster, mapping.output, 0) } catch {}
+      }
+    }
+    for (const mapping of matched) {
+      try { originalDisconnect.call(mapping.booster, mapping.destination, 0, mapping.input) } catch {}
+      const index = mappings.indexOf(mapping)
+      if (index >= 0) mappings.splice(index, 1)
+      try { onRemove(mapping.booster) } catch {}
+    }
+    if (nativeError && nativeError.name !== 'InvalidAccessError') throw nativeError
+  }
+
+  AudioNode.prototype.connect = connectWrapper
+  AudioNode.prototype.disconnect = disconnectWrapper
+  globalThis.__meetingAudioBoosterWorkletHook = { originalConnect, originalDisconnect }
+
   return () => {
-    if (AudioNode.prototype.connect === wrapper) AudioNode.prototype.connect = original
+    if (disposed) return
+    disposed = true
+    for (const mapping of [...mappings]) {
+      // The direct route is connected before the owned route is removed. Make
+      // that synchronous overlap neutral even if the slot was boosted.
+      try { writeAudioParam(mapping.booster.gain, 1) } catch {}
+      let restored = false
+      try {
+        originalConnect.apply(mapping.source, mapping.originalArgs)
+        restored = true
+      } catch {}
+      if (restored) {
+        try { originalDisconnect.call(mapping.source, mapping.booster, mapping.output, 0) } catch {}
+        try { originalDisconnect.call(mapping.booster, mapping.destination, 0, mapping.input) } catch {}
+        try { onRemove(mapping.booster) } catch {}
+      }
+    }
+    mappings.length = 0
+    if (AudioNode.prototype.connect === connectWrapper) AudioNode.prototype.connect = originalConnect
+    if (AudioNode.prototype.disconnect === disconnectWrapper) AudioNode.prototype.disconnect = originalDisconnect
     delete globalThis.__meetingAudioBoosterWorkletHook
   }
 }
@@ -21,40 +117,30 @@ export function installAudioWorkletHook(onSlot) {
 export function createPooledSlot(gain, id) {
   const baseGain = readAudioParam(gain.gain)
   return {
-    id, gain, baseGain, nativeValue: baseGain, appliedMultiplier: 1, targetValue: baseGain, lastWriteAt: 0, modified: false,
-    // A pooled slot is deliberately never assigned a participant identity.
+    id,
+    gain,
+    baseGain,
+    nativeValue: baseGain,
+    appliedMultiplier: 1,
+    targetValue: baseGain,
     participantKey: null,
-    set(multiplier, immediate = false) {
+    get actualValue() { return readAudioParam(gain.gain) },
+    set(multiplier) {
       const safe = Number.isFinite(multiplier) ? Math.max(0, multiplier) : 1
-      const actual = readAudioParam(gain.gain)
-      if (!this.modified || Math.abs(actual - this.targetValue) > 0.002) this.nativeValue = actual
-      const target = this.nativeValue * safe
-      const now = performance.now()
+      if (safe === this.appliedMultiplier) return
+      writeAudioParam(gain.gain, safe)
       this.appliedMultiplier = safe
-      this.targetValue = target
+      this.targetValue = safe
       this.participantKey = null
-      // Discovery and idle routing must not touch Meet's own pooled gain. If
-      // Meet changes it (notably to 0 for self-presentation), that native value
-      // becomes the new baseline and is never overwritten by a multiplier.
-      if (Math.abs(actual - target) <= 0.002) {
-        this.modified = Math.abs(target - this.nativeValue) > 0.002
-        return
-      }
-      if (safe === 1 && !this.modified) return
-      if (!immediate && now - this.lastWriteAt < 90) return
-      writeAudioParam(gain.gain, target)
-      this.modified = Math.abs(target - this.nativeValue) > 0.002
-      this.lastWriteAt = now
     },
     release() {
-      const actual = readAudioParam(gain.gain)
-      if (this.modified && Math.abs(actual - this.targetValue) > 0.002) this.nativeValue = actual
-      if (this.modified && Math.abs(actual - this.nativeValue) > 0.002) writeAudioParam(gain.gain, this.nativeValue)
+      if (this.appliedMultiplier === 1) return
+      writeAudioParam(gain.gain, 1)
       this.appliedMultiplier = 1
-      this.targetValue = this.nativeValue
+      this.targetValue = 1
       this.participantKey = null
-      this.modified = false
     },
-    neutral(immediate = true) { this.set(1, immediate) }
+    neutral() { this.release() },
+    destroy() { this.release() }
   }
 }

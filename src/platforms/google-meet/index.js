@@ -141,6 +141,13 @@ export function createGoogleMeetController({ state, context, setStatus, renderSo
     syncPresentationState()
     renderSoon()
   }
+  function unregisterSlot(gain) {
+    const index = state.google.slots.findIndex(slot => slot.gain === gain)
+    if (index < 0) return
+    state.google.slots[index].destroy()
+    state.google.slots.splice(index, 1)
+    renderSoon()
+  }
   function reconcile() {
     const now = Date.now()
     syncPresentationState()
@@ -260,7 +267,7 @@ export function createGoogleMeetController({ state, context, setStatus, renderSo
   }
   function start() {
     restoreCaptureHook = installLocalPresentationCaptureHook(setCapturePresentationActive)
-    restoreHook = installAudioWorkletHook(registerSlot)
+    restoreHook = installAudioWorkletHook(registerSlot, unregisterSlot)
     reconcile(); scanMedia()
     observer = observeMeetParticipants(() => {
       syncPresentationState()
@@ -283,8 +290,9 @@ export function createGoogleMeetController({ state, context, setStatus, renderSo
     if (visibilityHandler) document.removeEventListener('visibilitychange', visibilityHandler)
     restoreCaptureHook?.()
     restoreHook?.()
-    if (state.google.localPresentationActive) for (const slot of state.google.slots) slot.release()
-    else setOutputs(1, true)
+    if (state.google.mode === 'media') setOutputs(1, true)
+    for (const slot of state.google.slots) slot.destroy()
+    state.google.slots = []
     media.destroy()
   }
   function applyParticipantGain(participant) {

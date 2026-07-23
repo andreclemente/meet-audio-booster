@@ -6,15 +6,33 @@ export function installLocalPresentationCaptureHook(onActive, mediaDevices = glo
   const original = owner.getDisplayMedia
   if (typeof original !== 'function' || owner[HOOK_KEY]) return () => {}
 
+  const captures = new Set()
+  let active = false
+  let disposed = false
+  const emit = next => {
+    if (disposed || active === next) return
+    active = next
+    onActive(next)
+  }
+  const removeCapture = capture => {
+    if (!captures.delete(capture)) return
+    for (const track of capture.tracks) track.removeEventListener?.('ended', capture.checkEnded)
+    emit(captures.size > 0)
+  }
+
   const wrapped = async function (...args) {
     const stream = await original.apply(this, args)
-    const videoTracks = stream?.getVideoTracks?.() || []
-    const tracks = videoTracks.length ? videoTracks : (stream?.getTracks?.() || [])
-    const checkEnded = () => {
-      if (tracks.length && tracks.every(track => track.readyState === 'ended')) onActive(false)
+    if (disposed) return stream
+    const allTracks = stream?.getTracks?.() || []
+    const tracks = allTracks.length ? allTracks : (stream?.getVideoTracks?.() || [])
+    if (!tracks.length || tracks.every(track => track.readyState === 'ended')) return stream
+    const capture = { tracks, checkEnded: null }
+    capture.checkEnded = () => {
+      if (tracks.length && tracks.every(track => track.readyState === 'ended')) removeCapture(capture)
     }
-    for (const track of tracks) track.addEventListener?.('ended', checkEnded, { once: true })
-    onActive(true)
+    captures.add(capture)
+    for (const track of tracks) track.addEventListener?.('ended', capture.checkEnded)
+    emit(true)
     return stream
   }
 
@@ -22,6 +40,12 @@ export function installLocalPresentationCaptureHook(onActive, mediaDevices = glo
   owner.getDisplayMedia = wrapped
 
   return () => {
+    if (disposed) return
+    disposed = true
+    for (const capture of captures) {
+      for (const track of capture.tracks) track.removeEventListener?.('ended', capture.checkEnded)
+    }
+    captures.clear()
     if (owner.getDisplayMedia === wrapped) owner.getDisplayMedia = original
     if (owner[HOOK_KEY] === wrapped) delete owner[HOOK_KEY]
   }
