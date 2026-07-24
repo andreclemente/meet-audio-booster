@@ -1,6 +1,7 @@
-import { scanMeetParticipants, observeMeetParticipants, isGoogleParticipantSpeaking } from './participants.js'
+import { scanMeetParticipants, observeMeetParticipants, isGoogleParticipantSpeaking, hasLocalPresentation } from './participants.js'
 import { createAssociationLearner, createFreshAlignmentTracker } from './association.js'
 import { createRoutingState, routeGoogleAudio } from './router.js'
+import { installLocalPresentationCaptureHook } from './presentation.js'
 import { installAudioWorkletHook, createPooledSlot } from './audio-worklet.js'
 import { createMediaPipelineManager } from './media-elements.js'
 import { upsertParticipant, visibleParticipants } from '../../state.js'
@@ -11,6 +12,85 @@ export function collectCurrentUiSpeakers(participants, isSpeaking = participant 
     if (participant.speaking) participant.lastSpeakingAt = Date.now()
     return participant.speaking
   })
+}
+
+export function collectCurrentUiSpeakersAcrossRoots(participants, root = globalThis.document) {
+  const rootsByParticipantId = new Map()
+  for (const element of root?.querySelectorAll?.('[data-participant-id]') || []) {
+    const participantId = element.getAttribute?.('data-participant-id')
+    if (!participantId) continue
+    if (!rootsByParticipantId.has(participantId)) rootsByParticipantId.set(participantId, [])
+    rootsByParticipantId.get(participantId).push(element)
+  }
+  return collectCurrentUiSpeakers(participants, participant => {
+    const roots = rootsByParticipantId.get(participant.participantId)
+    return roots?.length
+      ? roots.some(isGoogleParticipantSpeaking)
+      : isGoogleParticipantSpeaking(participant.element)
+  })
+}
+
+export function createWorkletSpeakerTracker({ confirmMs = 50 } = {}) {
+  let confirmed = null
+  let candidateKey = null
+  let candidateSince = 0
+
+  function result(routingState, participant = null, multiplier = 1) {
+    return {
+      routingState,
+      activeParticipantKey: participant?.key || null,
+      appliedParticipantKey: participant?.key || null,
+      multiplier,
+      candidateParticipantKey: candidateKey,
+      candidateSince
+    }
+  }
+
+  function reset(routingState = 'idle') {
+    confirmed = null
+    candidateKey = null
+    candidateSince = 0
+    return result(routingState)
+  }
+
+  function update({ now, speakers = [], hidden = false }) {
+    if (hidden) return reset('hidden-tab')
+    if (speakers.length > 1) return reset('ambiguous')
+
+    const speaker = speakers[0] || null
+    if (speaker) {
+      if (confirmed?.key === speaker.key) {
+        confirmed = speaker
+        candidateKey = null
+        candidateSince = 0
+        return result('confirmed-speaker', confirmed, confirmed.value)
+      }
+
+      if (confirmed) confirmed = null
+      if (candidateKey !== speaker.key) {
+        candidateKey = speaker.key
+        candidateSince = now
+        return result('transitioning')
+      }
+      if (now - candidateSince < confirmMs) return result('transitioning')
+
+      confirmed = speaker
+      candidateKey = null
+      candidateSince = 0
+      return result('confirmed-speaker', confirmed, confirmed.value)
+    }
+
+    candidateKey = null
+    candidateSince = 0
+    // Meet's visual speaking marker is intermittent and can disappear for
+    // arbitrary periods during one person's turn. Do not pulse a confirmed
+    // gain back to unity merely because the marker is absent. Concrete safety
+    // events above (another/overlapping speaker or hidden tab) still reset it.
+    if (confirmed) return result('confirmed-speaker', confirmed, confirmed.value)
+    return reset('idle')
+  }
+
+  return { update, reset }
 }
 
 export function applyMediaPipelineOutputs(pipelines, routing, multiplier, immediate = false) {
@@ -30,9 +110,38 @@ export function createGoogleMeetController({ state, context, setStatus, renderSo
   const learner = createAssociationLearner()
   const alignmentTracker = createFreshAlignmentTracker()
   const media = createMediaPipelineManager(context)
-  let restoreHook, observer, mutationTimer, reconcileTimer, mediaTimer, routingTimer, slotCounter = 0
+  const workletSpeakerTracker = createWorkletSpeakerTracker()
+  let restoreHook, restoreCaptureHook, observer, mutationTimer, reconcileTimer, mediaTimer, routingTimer, visibilityHandler, slotCounter = 0
+  let capturePresentationActive = false
+  let domPresentationActive = false
 
   function participants() { return visibleParticipants(state, 'google-meet') }
+  function applyPresentationState() {
+    const presenting = capturePresentationActive || domPresentationActive
+    if (presenting === state.google.localPresentationActive) return presenting
+    state.google.localPresentationActive = presenting
+    if (presenting) {
+      workletSpeakerTracker.reset('local-presentation-bypass')
+      for (const slot of state.google.slots) slot.release()
+      for (const pipeline of media.pipelines) pipeline.deactivate()
+      state.google.activeParticipantKey = null
+      state.google.appliedParticipantKey = null
+      state.google.routingState = 'local-presentation-bypass'
+      state.google.transitionGuard.candidateParticipantKey = null
+      state.google.transitionGuard.candidateSince = 0
+    }
+    renderSoon()
+    return presenting
+  }
+  function setCapturePresentationActive(active) {
+    capturePresentationActive = active
+    if (!active) domPresentationActive = hasLocalPresentation()
+    return applyPresentationState()
+  }
+  function syncPresentationState() {
+    domPresentationActive = hasLocalPresentation()
+    return applyPresentationState()
+  }
   function setMode(mode) {
     if (state.google.mode === mode) return
     state.google.mode = mode
@@ -45,11 +154,19 @@ export function createGoogleMeetController({ state, context, setStatus, renderSo
     if (state.google.slots.some(slot => slot.gain === gain)) return
     state.google.slots.push(createPooledSlot(gain, `slot-${++slotCounter}`))
     setMode('worklet')
-    setOutputs(currentMultiplier(), true)
+    syncPresentationState()
+    renderSoon()
+  }
+  function unregisterSlot(gain) {
+    const index = state.google.slots.findIndex(slot => slot.gain === gain)
+    if (index < 0) return
+    state.google.slots[index].destroy()
+    state.google.slots.splice(index, 1)
     renderSoon()
   }
   function reconcile() {
     const now = Date.now()
+    syncPresentationState()
     const found = new Set()
     for (const data of scanMeetParticipants()) {
       found.add(data.key)
@@ -67,6 +184,10 @@ export function createGoogleMeetController({ state, context, setStatus, renderSo
     if (signature !== state.google.rosterSignature) { state.google.rosterSignature = signature; renderSoon() }
   }
   function scanMedia() {
+    if (state.google.localPresentationActive) {
+      for (const pipeline of media.pipelines) pipeline.deactivate()
+      return
+    }
     media.scan()
     state.google.mediaPipelines = media.pipelines
     if (state.google.slots.length) setMode('worklet')
@@ -77,47 +198,36 @@ export function createGoogleMeetController({ state, context, setStatus, renderSo
     if (state.google.mode === 'media') applyMediaPipelineOutputs(media.pipelines, state.google.routing, multiplier, immediate)
     else for (const slot of state.google.slots) slot.set(multiplier, immediate)
   }
-  function currentMultiplier() {
-    const participant = state.participants.get(state.google.activeParticipantKey)
-    return participant?.present ? participant.value : 1
-  }
   function currentUiSpeakers() {
-    return collectCurrentUiSpeakers(participants())
+    return collectCurrentUiSpeakersAcrossRoots(participants())
+  }
+  function neutralizeHiddenTab() {
+    workletSpeakerTracker.reset('hidden-tab')
+    state.google.routing = { ...createRoutingState(), routingState: 'hidden-tab' }
+    state.google.activeParticipantKey = null
+    state.google.appliedParticipantKey = null
+    state.google.routingState = 'hidden-tab'
+    state.google.transitionGuard.candidateParticipantKey = null
+    state.google.transitionGuard.candidateSince = 0
+    setOutputs(1, true)
+    setStatus('Meet tab hidden · using safe 100% volume')
   }
   function routeWorklet(now, speakers) {
-    let active = speakers.length === 1 ? speakers[0] : null
-    let status = !participants().length ? 'Waiting for participants'
+    const hidden = Boolean(globalThis.document?.hidden)
+    const routing = workletSpeakerTracker.update({ now, speakers, hidden })
+    const active = state.participants.get(routing.appliedParticipantKey) || null
+    const status = !participants().length ? 'Waiting for participants'
       : speakers.length > 1 ? 'Overlapping speakers · using safe 100% volume'
+      : hidden ? 'Meet tab hidden · using safe 100% volume'
       : active ? `${active.name} · automatic routing` : `${participants().length} participants ready`
-    const nextKey = active?.key || null
-    const guard = state.google.transitionGuard
-    if (nextKey !== state.google.activeParticipantKey) {
-      setOutputs(1, true)
-      state.google.activeParticipantKey = null
-      state.google.appliedParticipantKey = null
-      state.google.routingState = nextKey ? 'transitioning' : speakers.length > 1 ? 'ambiguous' : 'idle'
-      if (nextKey !== guard.candidateParticipantKey) {
-        guard.candidateParticipantKey = nextKey
-        guard.candidateSince = now
-      } else if (nextKey && now - guard.candidateSince >= 50) {
-        state.google.activeParticipantKey = nextKey
-        state.google.appliedParticipantKey = nextKey
-        state.google.routingState = 'confirmed-speaker'
-        guard.candidateParticipantKey = null
-        guard.candidateSince = 0
-        setOutputs(active.value, true)
-      }
-    } else if (active) {
-      state.google.routingState = 'confirmed-speaker'
-      state.google.appliedParticipantKey = active.key
-      setOutputs(active.value)
-    } else {
-      guard.candidateParticipantKey = null
-      guard.candidateSince = 0
-      state.google.routingState = speakers.length > 1 ? 'ambiguous' : 'idle'
-      state.google.appliedParticipantKey = null
-      setOutputs(1)
-    }
+    const changed = routing.appliedParticipantKey !== state.google.appliedParticipantKey ||
+      routing.routingState !== state.google.routingState
+    state.google.activeParticipantKey = routing.activeParticipantKey
+    state.google.appliedParticipantKey = routing.appliedParticipantKey
+    state.google.routingState = routing.routingState
+    state.google.transitionGuard.candidateParticipantKey = routing.candidateParticipantKey
+    state.google.transitionGuard.candidateSince = routing.candidateSince
+    setOutputs(routing.multiplier, changed || routing.multiplier === 1)
     setStatus(status)
   }
   function routeMedia(now, speakers) {
@@ -148,6 +258,23 @@ export function createGoogleMeetController({ state, context, setStatus, renderSo
     setStatus(active ? `${active.name} · automatic routing` : labels[routing.routingState] || `${participants().length} participants ready`)
   }
   function route() {
+    if (state.google.localPresentationActive) {
+      for (const slot of state.google.slots) slot.release()
+      if (state.google.mode === 'media') for (const pipeline of media.pipelines) pipeline.deactivate()
+      state.google.activeParticipantKey = null
+      state.google.appliedParticipantKey = null
+      state.google.routingState = 'local-presentation-bypass'
+      state.google.transitionGuard.candidateParticipantKey = null
+      state.google.transitionGuard.candidateSince = 0
+      setStatus('Presenting · own presentation audio bypassed')
+      updateLiveUi()
+      return
+    }
+    if (globalThis.document?.hidden) {
+      neutralizeHiddenTab()
+      updateLiveUi()
+      return
+    }
     const now = Date.now()
     const speakers = currentUiSpeakers()
     if (state.google.mode === 'media') routeMedia(now, speakers)
@@ -155,21 +282,41 @@ export function createGoogleMeetController({ state, context, setStatus, renderSo
     updateLiveUi()
   }
   function start() {
-    restoreHook = installAudioWorkletHook(registerSlot)
+    restoreCaptureHook = installLocalPresentationCaptureHook(setCapturePresentationActive)
+    restoreHook = installAudioWorkletHook(registerSlot, unregisterSlot)
     reconcile(); scanMedia()
-    observer = observeMeetParticipants(() => { clearTimeout(mutationTimer); mutationTimer = setTimeout(reconcile, 80) })
+    observer = observeMeetParticipants(() => {
+      syncPresentationState()
+      clearTimeout(mutationTimer)
+      mutationTimer = setTimeout(reconcile, 80)
+    })
     reconcileTimer = setInterval(reconcile, 750)
     mediaTimer = setInterval(scanMedia, 500)
     routingTimer = setInterval(route, 30)
+    visibilityHandler = () => {
+      if (document.hidden) {
+        neutralizeHiddenTab()
+        updateLiveUi()
+      } else route()
+    }
+    document.addEventListener('visibilitychange', visibilityHandler)
   }
   function stop() {
     observer?.disconnect(); clearTimeout(mutationTimer); clearInterval(reconcileTimer); clearInterval(mediaTimer); clearInterval(routingTimer)
-    restoreHook?.(); setOutputs(1, true); media.destroy()
+    if (visibilityHandler) document.removeEventListener('visibilitychange', visibilityHandler)
+    restoreCaptureHook?.()
+    restoreHook?.()
+    if (state.google.mode === 'media') setOutputs(1, true)
+    for (const slot of state.google.slots) slot.destroy()
+    state.google.slots = []
+    media.destroy()
   }
   function applyParticipantGain(participant) {
-    // Pooled worklets expose no stable per-participant energy identity, so
-    // pre-UI stale detection is unavailable; UI edges neutralize first and
-    // no marker hold or permanent slot mapping is retained.
+    if (syncPresentationState()) return
+    if (globalThis.document?.hidden) return
+    // Pooled worklets expose no stable per-participant energy identity. Keep
+    // the confirmed speaker latched through missing UI markers; concrete
+    // speaker changes, overlap, presentation, and hidden tabs neutralize it.
     if (state.google.activeParticipantKey === participant.key) setOutputs(participant.value, true)
   }
   return { start, stop, route, applyParticipantGain, setOutputs, get pipelines() { return media.pipelines } }

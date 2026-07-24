@@ -141,7 +141,8 @@
         routingState: "idle",
         transitionGuard: { candidateParticipantKey: null, candidateSince: 0 },
         routing: createRoutingState(),
-        rosterSignature: ""
+        rosterSignature: "",
+        localPresentationActive: false
       },
       jitsi: { pipelines: [], keepAliveTimer: null }
     };
@@ -268,9 +269,19 @@
   }
 
   // src/platforms/google-meet/participants.js
+  function isLocalPresentationRoot(root) {
+    if (!root?.getAttribute?.("data-participant-id")) return false;
+    if (extractNameFromParticipantRoot(root)) return false;
+    const labels = [...root.querySelectorAll?.("[aria-label]") || []].map((element) => element.getAttribute("aria-label") || "");
+    const text = `${root.innerText || root.textContent || ""} ${labels.join(" ")}`;
+    return /\beveryone can see your annotations\b/i.test(text) && /\bscroll\s*(?:&|and)\s*zoom your presentation in meet\b/i.test(text);
+  }
+  function hasLocalPresentation(root = document) {
+    return [...root.querySelectorAll?.("[data-participant-id]") || []].some(isLocalPresentationRoot);
+  }
   function isSelfParticipant(root) {
     const text = root?.innerText || root?.textContent || "";
-    if (isSelfText(text)) return true;
+    if (/(^|\s)\(you\)(?=\s|$)/i.test(text)) return true;
     const labels = [...root?.querySelectorAll?.("[aria-label]") || []].map((element) => element.getAttribute("aria-label") || "");
     if (labels.some((label) => /^(Reframe|Backgrounds and effects)$/i.test(label))) return true;
     return labels.some((label) => /^your\b|\byou are\b|\byou\s+\(/i.test(label) || /^(mute|unmute|turn (?:on|off)) your (?:microphone|camera)$/i.test(label));
@@ -294,7 +305,7 @@
     const roots = /* @__PURE__ */ new Map();
     for (const element of root.querySelectorAll?.("[data-participant-id]") || []) {
       const participantId = element.getAttribute("data-participant-id");
-      if (!participantId || !isRecognizedParticipantRoot(element)) continue;
+      if (!participantId || !isRecognizedParticipantRoot(element) || isLocalPresentationRoot(element)) continue;
       const current = roots.get(participantId);
       if (!current || scoreRoot(element) > scoreRoot(current)) roots.set(participantId, element);
     }
@@ -368,6 +379,57 @@
     };
   }
 
+  // src/platforms/google-meet/presentation.js
+  var HOOK_KEY = "__meetingAudioBoosterDisplayCaptureHook";
+  function installLocalPresentationCaptureHook(onActive, mediaDevices = globalThis.navigator?.mediaDevices) {
+    if (!mediaDevices) return () => {
+    };
+    const owner = Object.getPrototypeOf(mediaDevices) || mediaDevices;
+    const original = owner.getDisplayMedia;
+    if (typeof original !== "function" || owner[HOOK_KEY]) return () => {
+    };
+    const captures = /* @__PURE__ */ new Set();
+    let active = false;
+    let disposed = false;
+    const emit = (next) => {
+      if (disposed || active === next) return;
+      active = next;
+      onActive(next);
+    };
+    const removeCapture = (capture) => {
+      if (!captures.delete(capture)) return;
+      for (const track of capture.tracks) track.removeEventListener?.("ended", capture.checkEnded);
+      emit(captures.size > 0);
+    };
+    const wrapped = async function(...args) {
+      const stream = await original.apply(this, args);
+      if (disposed) return stream;
+      const allTracks = stream?.getTracks?.() || [];
+      const tracks = allTracks.length ? allTracks : stream?.getVideoTracks?.() || [];
+      if (!tracks.length || tracks.every((track) => track.readyState === "ended")) return stream;
+      const capture = { tracks, checkEnded: null };
+      capture.checkEnded = () => {
+        if (tracks.length && tracks.every((track) => track.readyState === "ended")) removeCapture(capture);
+      };
+      captures.add(capture);
+      for (const track of tracks) track.addEventListener?.("ended", capture.checkEnded);
+      emit(true);
+      return stream;
+    };
+    owner[HOOK_KEY] = wrapped;
+    owner.getDisplayMedia = wrapped;
+    return () => {
+      if (disposed) return;
+      disposed = true;
+      for (const capture of captures) {
+        for (const track of capture.tracks) track.removeEventListener?.("ended", capture.checkEnded);
+      }
+      captures.clear();
+      if (owner.getDisplayMedia === wrapped) owner.getDisplayMedia = original;
+      if (owner[HOOK_KEY] === wrapped) delete owner[HOOK_KEY];
+    };
+  }
+
   // src/shared/audio.js
   function readAudioParam(param, fallback = 1) {
     const value = Number(param?.value);
@@ -398,21 +460,141 @@
   }
 
   // src/platforms/google-meet/audio-worklet.js
-  function installAudioWorkletHook(onSlot) {
+  function normalizeIndex(value) {
+    return value === void 0 ? 0 : value;
+  }
+  function connectionMatches(mapping, args) {
+    if (!args.length) return true;
+    if (typeof args[0] === "number") return mapping.output === args[0];
+    if (args[0] !== mapping.destination) return false;
+    if (args.length > 1 && mapping.output !== normalizeIndex(args[1])) return false;
+    if (args.length > 2 && mapping.input !== normalizeIndex(args[2])) return false;
+    return true;
+  }
+  function installAudioWorkletHook(onSlot, onRemove = () => {
+  }) {
     if (!globalThis.AudioNode || globalThis.__meetingAudioBoosterWorkletHook) return () => {
     };
-    const original = AudioNode.prototype.connect;
-    globalThis.__meetingAudioBoosterWorkletHook = original;
-    const wrapper = function(...args) {
-      const from = this;
-      const to = args[0];
-      const result = original.apply(from, args);
-      if (from?.constructor?.name === "AudioWorkletNode" && to?.constructor?.name === "GainNode") onSlot(to);
-      return result;
+    const originalConnect = AudioNode.prototype.connect;
+    const originalDisconnect = AudioNode.prototype.disconnect;
+    const mappings = [];
+    let disposed = false;
+    const connectWrapper = function(...args) {
+      if (disposed) return originalConnect.apply(this, args);
+      const destination = args[0];
+      const isPooledConnection = this?.constructor?.name === "AudioWorkletNode" && destination?.constructor?.name === "GainNode";
+      if (!isPooledConnection || typeof destination?.context?.createGain !== "function") return originalConnect.apply(this, args);
+      const output = normalizeIndex(args[1]);
+      const input = normalizeIndex(args[2]);
+      const existing = mappings.find((item) => item.source === this && item.destination === destination && item.output === output && item.input === input);
+      if (existing) return destination;
+      let removedDirect = false;
+      try {
+        originalDisconnect.call(this, destination, output, input);
+        removedDirect = true;
+      } catch (error) {
+        if (error?.name !== "InvalidAccessError") throw error;
+      }
+      let booster;
+      let sourceConnected = false;
+      try {
+        booster = destination.context.createGain();
+        booster.gain.value = 1;
+        const sourceArgs = args.length > 1 ? [booster, args[1]] : [booster];
+        const destinationArgs = args.length > 2 ? [destination, 0, args[2]] : [destination];
+        originalConnect.apply(this, sourceArgs);
+        sourceConnected = true;
+        originalConnect.apply(booster, destinationArgs);
+      } catch (error) {
+        if (sourceConnected) {
+          try {
+            originalDisconnect.call(this, booster, output, 0);
+          } catch {
+          }
+        }
+        if (removedDirect) {
+          try {
+            originalConnect.apply(this, args);
+          } catch {
+          }
+        }
+        throw error;
+      }
+      mappings.push({ source: this, destination, booster, output, input, originalArgs: [...args] });
+      try {
+        onSlot(booster);
+      } catch {
+      }
+      return destination;
     };
-    AudioNode.prototype.connect = wrapper;
+    const disconnectWrapper = function(...args) {
+      if (disposed) return originalDisconnect.apply(this, args);
+      const matched = mappings.filter((mapping) => mapping.source === this && connectionMatches(mapping, args));
+      if (!matched.length) return originalDisconnect.apply(this, args);
+      let nativeError = null;
+      if (!args.length || typeof args[0] === "number") originalDisconnect.apply(this, args);
+      else {
+        try {
+          originalDisconnect.apply(this, args);
+        } catch (error) {
+          nativeError = error;
+        }
+        for (const mapping of matched) {
+          try {
+            originalDisconnect.call(this, mapping.booster, mapping.output, 0);
+          } catch {
+          }
+        }
+      }
+      for (const mapping of matched) {
+        try {
+          originalDisconnect.call(mapping.booster, mapping.destination, 0, mapping.input);
+        } catch {
+        }
+        const index = mappings.indexOf(mapping);
+        if (index >= 0) mappings.splice(index, 1);
+        try {
+          onRemove(mapping.booster);
+        } catch {
+        }
+      }
+      if (nativeError && nativeError.name !== "InvalidAccessError") throw nativeError;
+    };
+    AudioNode.prototype.connect = connectWrapper;
+    AudioNode.prototype.disconnect = disconnectWrapper;
+    globalThis.__meetingAudioBoosterWorkletHook = { originalConnect, originalDisconnect };
     return () => {
-      if (AudioNode.prototype.connect === wrapper) AudioNode.prototype.connect = original;
+      if (disposed) return;
+      disposed = true;
+      for (const mapping of [...mappings]) {
+        try {
+          writeAudioParam(mapping.booster.gain, 1);
+        } catch {
+        }
+        let restored = false;
+        try {
+          originalConnect.apply(mapping.source, mapping.originalArgs);
+          restored = true;
+        } catch {
+        }
+        if (restored) {
+          try {
+            originalDisconnect.call(mapping.source, mapping.booster, mapping.output, 0);
+          } catch {
+          }
+          try {
+            originalDisconnect.call(mapping.booster, mapping.destination, 0, mapping.input);
+          } catch {
+          }
+          try {
+            onRemove(mapping.booster);
+          } catch {
+          }
+        }
+      }
+      mappings.length = 0;
+      if (AudioNode.prototype.connect === connectWrapper) AudioNode.prototype.connect = originalConnect;
+      if (AudioNode.prototype.disconnect === disconnectWrapper) AudioNode.prototype.disconnect = originalDisconnect;
       delete globalThis.__meetingAudioBoosterWorkletHook;
     };
   }
@@ -422,25 +604,33 @@
       id,
       gain,
       baseGain,
+      nativeValue: baseGain,
       appliedMultiplier: 1,
       targetValue: baseGain,
-      lastWriteAt: 0,
-      // A pooled slot is deliberately never assigned a participant identity.
       participantKey: null,
-      set(multiplier, immediate = false) {
-        const safe = Number.isFinite(multiplier) ? Math.max(0, multiplier) : 1;
-        const target = baseGain * safe;
-        const actual = Number(gain?.gain?.value);
-        const now = performance.now();
-        this.appliedMultiplier = safe;
-        this.targetValue = target;
-        this.participantKey = null;
-        if (!immediate && Number.isFinite(actual) && Math.abs(actual - target) <= 2e-3 && now - this.lastWriteAt < 90) return;
-        writeAudioParam(gain.gain, target);
-        this.lastWriteAt = now;
+      get actualValue() {
+        return readAudioParam(gain.gain);
       },
-      neutral(immediate = true) {
-        this.set(1, immediate);
+      set(multiplier) {
+        const safe = Number.isFinite(multiplier) ? Math.max(0, multiplier) : 1;
+        if (safe === this.appliedMultiplier) return;
+        writeAudioParam(gain.gain, safe);
+        this.appliedMultiplier = safe;
+        this.targetValue = safe;
+        this.participantKey = null;
+      },
+      release() {
+        if (this.appliedMultiplier === 1) return;
+        writeAudioParam(gain.gain, 1);
+        this.appliedMultiplier = 1;
+        this.targetValue = 1;
+        this.participantKey = null;
+      },
+      neutral() {
+        this.release();
+      },
+      destroy() {
+        this.release();
       }
     };
   }
@@ -675,6 +865,69 @@
       return participant.speaking;
     });
   }
+  function collectCurrentUiSpeakersAcrossRoots(participants, root = globalThis.document) {
+    const rootsByParticipantId = /* @__PURE__ */ new Map();
+    for (const element of root?.querySelectorAll?.("[data-participant-id]") || []) {
+      const participantId = element.getAttribute?.("data-participant-id");
+      if (!participantId) continue;
+      if (!rootsByParticipantId.has(participantId)) rootsByParticipantId.set(participantId, []);
+      rootsByParticipantId.get(participantId).push(element);
+    }
+    return collectCurrentUiSpeakers(participants, (participant) => {
+      const roots = rootsByParticipantId.get(participant.participantId);
+      return roots?.length ? roots.some(isGoogleParticipantSpeaking) : isGoogleParticipantSpeaking(participant.element);
+    });
+  }
+  function createWorkletSpeakerTracker({ confirmMs = 50 } = {}) {
+    let confirmed = null;
+    let candidateKey = null;
+    let candidateSince = 0;
+    function result(routingState, participant = null, multiplier = 1) {
+      return {
+        routingState,
+        activeParticipantKey: participant?.key || null,
+        appliedParticipantKey: participant?.key || null,
+        multiplier,
+        candidateParticipantKey: candidateKey,
+        candidateSince
+      };
+    }
+    function reset(routingState = "idle") {
+      confirmed = null;
+      candidateKey = null;
+      candidateSince = 0;
+      return result(routingState);
+    }
+    function update({ now, speakers = [], hidden = false }) {
+      if (hidden) return reset("hidden-tab");
+      if (speakers.length > 1) return reset("ambiguous");
+      const speaker = speakers[0] || null;
+      if (speaker) {
+        if (confirmed?.key === speaker.key) {
+          confirmed = speaker;
+          candidateKey = null;
+          candidateSince = 0;
+          return result("confirmed-speaker", confirmed, confirmed.value);
+        }
+        if (confirmed) confirmed = null;
+        if (candidateKey !== speaker.key) {
+          candidateKey = speaker.key;
+          candidateSince = now;
+          return result("transitioning");
+        }
+        if (now - candidateSince < confirmMs) return result("transitioning");
+        confirmed = speaker;
+        candidateKey = null;
+        candidateSince = 0;
+        return result("confirmed-speaker", confirmed, confirmed.value);
+      }
+      candidateKey = null;
+      candidateSince = 0;
+      if (confirmed) return result("confirmed-speaker", confirmed, confirmed.value);
+      return reset("idle");
+    }
+    return { update, reset };
+  }
   function applyMediaPipelineOutputs(pipelines, routing, multiplier, immediate = false) {
     const selectedId = routing?.routingState === "confirmed-speaker" ? routing.appliedPipelineId : null;
     const selectedKey = routing?.appliedParticipantKey;
@@ -690,9 +943,38 @@
     const learner = createAssociationLearner();
     const alignmentTracker = createFreshAlignmentTracker();
     const media = createMediaPipelineManager(context);
-    let restoreHook, observer, mutationTimer, reconcileTimer, mediaTimer, routingTimer, slotCounter = 0;
+    const workletSpeakerTracker = createWorkletSpeakerTracker();
+    let restoreHook, restoreCaptureHook, observer, mutationTimer, reconcileTimer, mediaTimer, routingTimer, visibilityHandler, slotCounter = 0;
+    let capturePresentationActive = false;
+    let domPresentationActive = false;
     function participants() {
       return visibleParticipants(state, "google-meet");
+    }
+    function applyPresentationState() {
+      const presenting = capturePresentationActive || domPresentationActive;
+      if (presenting === state.google.localPresentationActive) return presenting;
+      state.google.localPresentationActive = presenting;
+      if (presenting) {
+        workletSpeakerTracker.reset("local-presentation-bypass");
+        for (const slot of state.google.slots) slot.release();
+        for (const pipeline of media.pipelines) pipeline.deactivate();
+        state.google.activeParticipantKey = null;
+        state.google.appliedParticipantKey = null;
+        state.google.routingState = "local-presentation-bypass";
+        state.google.transitionGuard.candidateParticipantKey = null;
+        state.google.transitionGuard.candidateSince = 0;
+      }
+      renderSoon();
+      return presenting;
+    }
+    function setCapturePresentationActive(active) {
+      capturePresentationActive = active;
+      if (!active) domPresentationActive = hasLocalPresentation();
+      return applyPresentationState();
+    }
+    function syncPresentationState() {
+      domPresentationActive = hasLocalPresentation();
+      return applyPresentationState();
     }
     function setMode(mode) {
       if (state.google.mode === mode) return;
@@ -706,11 +988,19 @@
       if (state.google.slots.some((slot) => slot.gain === gain)) return;
       state.google.slots.push(createPooledSlot(gain, `slot-${++slotCounter}`));
       setMode("worklet");
-      setOutputs(currentMultiplier(), true);
+      syncPresentationState();
+      renderSoon();
+    }
+    function unregisterSlot(gain) {
+      const index = state.google.slots.findIndex((slot) => slot.gain === gain);
+      if (index < 0) return;
+      state.google.slots[index].destroy();
+      state.google.slots.splice(index, 1);
       renderSoon();
     }
     function reconcile() {
       const now = Date.now();
+      syncPresentationState();
       const found = /* @__PURE__ */ new Set();
       for (const data of scanMeetParticipants()) {
         found.add(data.key);
@@ -734,6 +1024,10 @@
       }
     }
     function scanMedia() {
+      if (state.google.localPresentationActive) {
+        for (const pipeline of media.pipelines) pipeline.deactivate();
+        return;
+      }
       media.scan();
       state.google.mediaPipelines = media.pipelines;
       if (state.google.slots.length) setMode("worklet");
@@ -744,45 +1038,32 @@
       if (state.google.mode === "media") applyMediaPipelineOutputs(media.pipelines, state.google.routing, multiplier, immediate);
       else for (const slot of state.google.slots) slot.set(multiplier, immediate);
     }
-    function currentMultiplier() {
-      const participant = state.participants.get(state.google.activeParticipantKey);
-      return participant?.present ? participant.value : 1;
-    }
     function currentUiSpeakers() {
-      return collectCurrentUiSpeakers(participants());
+      return collectCurrentUiSpeakersAcrossRoots(participants());
+    }
+    function neutralizeHiddenTab() {
+      workletSpeakerTracker.reset("hidden-tab");
+      state.google.routing = { ...createRoutingState(), routingState: "hidden-tab" };
+      state.google.activeParticipantKey = null;
+      state.google.appliedParticipantKey = null;
+      state.google.routingState = "hidden-tab";
+      state.google.transitionGuard.candidateParticipantKey = null;
+      state.google.transitionGuard.candidateSince = 0;
+      setOutputs(1, true);
+      setStatus("Meet tab hidden · using safe 100% volume");
     }
     function routeWorklet(now, speakers) {
-      let active = speakers.length === 1 ? speakers[0] : null;
-      let status = !participants().length ? "Waiting for participants" : speakers.length > 1 ? "Overlapping speakers · using safe 100% volume" : active ? `${active.name} · automatic routing` : `${participants().length} participants ready`;
-      const nextKey = active?.key || null;
-      const guard = state.google.transitionGuard;
-      if (nextKey !== state.google.activeParticipantKey) {
-        setOutputs(1, true);
-        state.google.activeParticipantKey = null;
-        state.google.appliedParticipantKey = null;
-        state.google.routingState = nextKey ? "transitioning" : speakers.length > 1 ? "ambiguous" : "idle";
-        if (nextKey !== guard.candidateParticipantKey) {
-          guard.candidateParticipantKey = nextKey;
-          guard.candidateSince = now;
-        } else if (nextKey && now - guard.candidateSince >= 50) {
-          state.google.activeParticipantKey = nextKey;
-          state.google.appliedParticipantKey = nextKey;
-          state.google.routingState = "confirmed-speaker";
-          guard.candidateParticipantKey = null;
-          guard.candidateSince = 0;
-          setOutputs(active.value, true);
-        }
-      } else if (active) {
-        state.google.routingState = "confirmed-speaker";
-        state.google.appliedParticipantKey = active.key;
-        setOutputs(active.value);
-      } else {
-        guard.candidateParticipantKey = null;
-        guard.candidateSince = 0;
-        state.google.routingState = speakers.length > 1 ? "ambiguous" : "idle";
-        state.google.appliedParticipantKey = null;
-        setOutputs(1);
-      }
+      const hidden = Boolean(globalThis.document?.hidden);
+      const routing = workletSpeakerTracker.update({ now, speakers, hidden });
+      const active = state.participants.get(routing.appliedParticipantKey) || null;
+      const status = !participants().length ? "Waiting for participants" : speakers.length > 1 ? "Overlapping speakers · using safe 100% volume" : hidden ? "Meet tab hidden · using safe 100% volume" : active ? `${active.name} · automatic routing` : `${participants().length} participants ready`;
+      const changed = routing.appliedParticipantKey !== state.google.appliedParticipantKey || routing.routingState !== state.google.routingState;
+      state.google.activeParticipantKey = routing.activeParticipantKey;
+      state.google.appliedParticipantKey = routing.appliedParticipantKey;
+      state.google.routingState = routing.routingState;
+      state.google.transitionGuard.candidateParticipantKey = routing.candidateParticipantKey;
+      state.google.transitionGuard.candidateSince = routing.candidateSince;
+      setOutputs(routing.multiplier, changed || routing.multiplier === 1);
       setStatus(status);
     }
     function routeMedia(now, speakers) {
@@ -815,6 +1096,23 @@
       setStatus(active ? `${active.name} · automatic routing` : labels[routing.routingState] || `${participants().length} participants ready`);
     }
     function route() {
+      if (state.google.localPresentationActive) {
+        for (const slot of state.google.slots) slot.release();
+        if (state.google.mode === "media") for (const pipeline of media.pipelines) pipeline.deactivate();
+        state.google.activeParticipantKey = null;
+        state.google.appliedParticipantKey = null;
+        state.google.routingState = "local-presentation-bypass";
+        state.google.transitionGuard.candidateParticipantKey = null;
+        state.google.transitionGuard.candidateSince = 0;
+        setStatus("Presenting · own presentation audio bypassed");
+        updateLiveUi();
+        return;
+      }
+      if (globalThis.document?.hidden) {
+        neutralizeHiddenTab();
+        updateLiveUi();
+        return;
+      }
       const now = Date.now();
       const speakers = currentUiSpeakers();
       if (state.google.mode === "media") routeMedia(now, speakers);
@@ -822,16 +1120,25 @@
       updateLiveUi();
     }
     function start() {
-      restoreHook = installAudioWorkletHook(registerSlot);
+      restoreCaptureHook = installLocalPresentationCaptureHook(setCapturePresentationActive);
+      restoreHook = installAudioWorkletHook(registerSlot, unregisterSlot);
       reconcile();
       scanMedia();
       observer = observeMeetParticipants(() => {
+        syncPresentationState();
         clearTimeout(mutationTimer);
         mutationTimer = setTimeout(reconcile, 80);
       });
       reconcileTimer = setInterval(reconcile, 750);
       mediaTimer = setInterval(scanMedia, 500);
       routingTimer = setInterval(route, 30);
+      visibilityHandler = () => {
+        if (document.hidden) {
+          neutralizeHiddenTab();
+          updateLiveUi();
+        } else route();
+      };
+      document.addEventListener("visibilitychange", visibilityHandler);
     }
     function stop() {
       observer?.disconnect();
@@ -839,11 +1146,17 @@
       clearInterval(reconcileTimer);
       clearInterval(mediaTimer);
       clearInterval(routingTimer);
+      if (visibilityHandler) document.removeEventListener("visibilitychange", visibilityHandler);
+      restoreCaptureHook?.();
       restoreHook?.();
-      setOutputs(1, true);
+      if (state.google.mode === "media") setOutputs(1, true);
+      for (const slot of state.google.slots) slot.destroy();
+      state.google.slots = [];
       media.destroy();
     }
     function applyParticipantGain(participant) {
+      if (syncPresentationState()) return;
+      if (globalThis.document?.hidden) return;
       if (state.google.activeParticipantKey === participant.key) setOutputs(participant.value, true);
     }
     return { start, stop, route, applyParticipantGain, setOutputs, get pipelines() {
@@ -1252,7 +1565,7 @@
       baseGain: slot.baseGain,
       appliedMultiplier: slot.appliedMultiplier,
       targetValue: slot.targetValue,
-      actualValue: Number(slot.gain?.gain?.value),
+      actualValue: Number(slot.actualValue),
       participantKey: null
     }));
     const mediaPipelines = state.google.mediaPipelines.map((pipeline) => {
@@ -1282,12 +1595,14 @@
       activeParticipantKey: state.google.activeParticipantKey,
       appliedParticipantKey: state.google.appliedParticipantKey,
       routingState: state.google.routingState,
+      localPresentationActive: Boolean(state.google.localPresentationActive),
       transitionGuard: state.google.transitionGuard,
       slots,
       mediaPipelines,
       google: {
         mode: state.google.mode,
         routingState: state.google.routingState,
+        localPresentationActive: Boolean(state.google.localPresentationActive),
         activeParticipantKey: state.google.activeParticipantKey,
         appliedParticipantKey: state.google.appliedParticipantKey,
         transitionGuard: state.google.transitionGuard,

@@ -1,8 +1,22 @@
-import { isSelfText, extractNameFromParticipantRoot, isRecognizedParticipantRoot } from '../../shared/dom.js'
+import { extractNameFromParticipantRoot, isRecognizedParticipantRoot } from '../../shared/dom.js'
+
+export function isLocalPresentationRoot(root) {
+  if (!root?.getAttribute?.('data-participant-id')) return false
+  if (extractNameFromParticipantRoot(root)) return false
+  const labels = [...(root.querySelectorAll?.('[aria-label]') || [])]
+    .map(element => element.getAttribute('aria-label') || '')
+  const text = `${root.innerText || root.textContent || ''} ${labels.join(' ')}`
+  return /\beveryone can see your annotations\b/i.test(text) &&
+    /\bscroll\s*(?:&|and)\s*zoom your presentation in meet\b/i.test(text)
+}
+
+export function hasLocalPresentation(root = document) {
+  return [...(root.querySelectorAll?.('[data-participant-id]') || [])].some(isLocalPresentationRoot)
+}
 
 export function isSelfParticipant(root) {
   const text = root?.innerText || root?.textContent || ''
-  if (isSelfText(text)) return true
+  if (/(^|\s)\(you\)(?=\s|$)/i.test(text)) return true
   const labels = [...(root?.querySelectorAll?.('[aria-label]') || [])]
     .map(element => element.getAttribute('aria-label') || '')
   if (labels.some(label => /^(Reframe|Backgrounds and effects)$/i.test(label))) return true
@@ -34,7 +48,7 @@ export function scanMeetParticipants(root = document) {
   const roots = new Map()
   for (const element of root.querySelectorAll?.('[data-participant-id]') || []) {
     const participantId = element.getAttribute('data-participant-id')
-    if (!participantId || !isRecognizedParticipantRoot(element)) continue
+    if (!participantId || !isRecognizedParticipantRoot(element) || isLocalPresentationRoot(element)) continue
     const current = roots.get(participantId)
     if (!current || scoreRoot(element) > scoreRoot(current)) roots.set(participantId, element)
   }

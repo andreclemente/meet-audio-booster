@@ -18,7 +18,7 @@ export function createDebugInfo(state, visibleParticipants) {
   }))
   const slots = state.google.slots.map(slot => ({
     id: slot.id, baseGain: slot.baseGain, appliedMultiplier: slot.appliedMultiplier,
-    targetValue: slot.targetValue, actualValue: Number(slot.gain?.gain?.value), participantKey: null
+    targetValue: slot.targetValue, actualValue: Number(slot.actualValue), participantKey: null
   }))
   const mediaPipelines = state.google.mediaPipelines.map(pipeline => {
     const track = pipeline.tracks?.[0]
@@ -47,12 +47,14 @@ export function createDebugInfo(state, visibleParticipants) {
     activeParticipantKey: state.google.activeParticipantKey,
     appliedParticipantKey: state.google.appliedParticipantKey,
     routingState: state.google.routingState,
+    localPresentationActive: Boolean(state.google.localPresentationActive),
     transitionGuard: state.google.transitionGuard,
     slots,
     mediaPipelines,
     google: {
       mode: state.google.mode,
       routingState: state.google.routingState,
+      localPresentationActive: Boolean(state.google.localPresentationActive),
       activeParticipantKey: state.google.activeParticipantKey,
       appliedParticipantKey: state.google.appliedParticipantKey,
       transitionGuard: state.google.transitionGuard,

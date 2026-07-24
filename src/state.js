@@ -16,7 +16,7 @@ export function createState(storage = globalThis.localStorage) {
       mode: 'detecting', modeStartedAt: performance.now(), slots: [], mediaPipelines: [],
       activeParticipantKey: null, appliedParticipantKey: null, routingState: 'idle',
       transitionGuard: { candidateParticipantKey: null, candidateSince: 0 },
-      routing: createRoutingState(), rosterSignature: ''
+      routing: createRoutingState(), rosterSignature: '', localPresentationActive: false
     },
     jitsi: { pipelines: [], keepAliveTimer: null }
   }
