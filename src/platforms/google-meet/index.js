@@ -106,6 +106,10 @@ export function activateMediaModePipelines(pipelines, routing) {
   applyMediaPipelineOutputs(pipelines, routing, routing?.multiplier ?? 1, true)
 }
 
+export function resolveLocalPresentationActive({ captureActive, domActive, captureLifecycleSeen }) {
+  return captureLifecycleSeen ? captureActive : (captureActive || domActive)
+}
+
 export function createGoogleMeetController({ state, context, setStatus, renderSoon, updateLiveUi }) {
   const learner = createAssociationLearner()
   const alignmentTracker = createFreshAlignmentTracker()
@@ -114,13 +118,18 @@ export function createGoogleMeetController({ state, context, setStatus, renderSo
   let restoreHook, restoreCaptureHook, observer, mutationTimer, reconcileTimer, mediaTimer, routingTimer, visibilityHandler, slotCounter = 0
   let capturePresentationActive = false
   let domPresentationActive = false
+  let captureLifecycleSeen = false
 
   function participants() { return visibleParticipants(state, 'google-meet') }
   function applyPresentationState() {
-    const presenting = capturePresentationActive || domPresentationActive
+    const presenting = resolveLocalPresentationActive({
+      captureActive: capturePresentationActive,
+      domActive: domPresentationActive,
+      captureLifecycleSeen
+    })
     if (presenting === state.google.localPresentationActive) return presenting
     state.google.localPresentationActive = presenting
-    if (presenting) {
+    if (presenting && state.google.mode === 'media') {
       workletSpeakerTracker.reset('local-presentation-bypass')
       for (const slot of state.google.slots) slot.release()
       for (const pipeline of media.pipelines) pipeline.deactivate()
@@ -134,6 +143,7 @@ export function createGoogleMeetController({ state, context, setStatus, renderSo
     return presenting
   }
   function setCapturePresentationActive(active) {
+    captureLifecycleSeen = true
     capturePresentationActive = active
     if (!active) domPresentationActive = hasLocalPresentation()
     return applyPresentationState()
@@ -258,7 +268,7 @@ export function createGoogleMeetController({ state, context, setStatus, renderSo
     setStatus(active ? `${active.name} · automatic routing` : labels[routing.routingState] || `${participants().length} participants ready`)
   }
   function route() {
-    if (state.google.localPresentationActive) {
+    if (state.google.localPresentationActive && state.google.mode === 'media') {
       for (const slot of state.google.slots) slot.release()
       if (state.google.mode === 'media') for (const pipeline of media.pipelines) pipeline.deactivate()
       state.google.activeParticipantKey = null
@@ -312,7 +322,7 @@ export function createGoogleMeetController({ state, context, setStatus, renderSo
     media.destroy()
   }
   function applyParticipantGain(participant) {
-    if (syncPresentationState()) return
+    if (syncPresentationState() && state.google.mode === 'media') return
     if (globalThis.document?.hidden) return
     // Pooled worklets expose no stable per-participant energy identity. Keep
     // the confirmed speaker latched through missing UI markers; concrete

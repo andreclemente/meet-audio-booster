@@ -26,9 +26,11 @@ export function installLocalPresentationCaptureHook(onActive, mediaDevices = glo
     const allTracks = stream?.getTracks?.() || []
     const tracks = allTracks.length ? allTracks : (stream?.getVideoTracks?.() || [])
     if (!tracks.length || tracks.every(track => track.readyState === 'ended')) return stream
-    const capture = { tracks, checkEnded: null }
+    const videoTracks = stream?.getVideoTracks?.() || []
+    const capture = { tracks, videoTracks, checkEnded: null }
     capture.checkEnded = () => {
-      if (tracks.length && tracks.every(track => track.readyState === 'ended')) removeCapture(capture)
+      const primaryTracks = videoTracks.length ? videoTracks : tracks
+      if (primaryTracks.every(track => track.readyState === 'ended')) removeCapture(capture)
     }
     captures.add(capture)
     for (const track of tracks) track.addEventListener?.('ended', capture.checkEnded)

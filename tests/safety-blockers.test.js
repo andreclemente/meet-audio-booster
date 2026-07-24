@@ -364,7 +364,7 @@ test('display capture bypass stays active until every overlapping capture ends',
   restore()
 })
 
-test('display capture bypass remains active while its audio track is still live', async () => {
+test('display capture ends when the captured display video ends even if an audio track stays live', async () => {
   const events = []
   const callbacks = new Map()
   const makeTrack = id => ({
@@ -383,7 +383,7 @@ test('display capture bypass remains active while its audio track is still live'
   assert.deepEqual(events, [true])
   video.readyState = 'ended'
   callbacks.get('video')()
-  assert.deepEqual(events, [true])
+  assert.deepEqual(events, [true, false])
   audio.readyState = 'ended'
   callbacks.get('audio')()
   assert.deepEqual(events, [true, false])

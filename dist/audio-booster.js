@@ -407,9 +407,11 @@
       const allTracks = stream?.getTracks?.() || [];
       const tracks = allTracks.length ? allTracks : stream?.getVideoTracks?.() || [];
       if (!tracks.length || tracks.every((track) => track.readyState === "ended")) return stream;
-      const capture = { tracks, checkEnded: null };
+      const videoTracks = stream?.getVideoTracks?.() || [];
+      const capture = { tracks, videoTracks, checkEnded: null };
       capture.checkEnded = () => {
-        if (tracks.length && tracks.every((track) => track.readyState === "ended")) removeCapture(capture);
+        const primaryTracks = videoTracks.length ? videoTracks : tracks;
+        if (primaryTracks.every((track) => track.readyState === "ended")) removeCapture(capture);
       };
       captures.add(capture);
       for (const track of tracks) track.addEventListener?.("ended", capture.checkEnded);
@@ -939,6 +941,9 @@
   function activateMediaModePipelines(pipelines, routing) {
     applyMediaPipelineOutputs(pipelines, routing, routing?.multiplier ?? 1, true);
   }
+  function resolveLocalPresentationActive({ captureActive, domActive, captureLifecycleSeen }) {
+    return captureLifecycleSeen ? captureActive : captureActive || domActive;
+  }
   function createGoogleMeetController({ state, context, setStatus, renderSoon, updateLiveUi }) {
     const learner = createAssociationLearner();
     const alignmentTracker = createFreshAlignmentTracker();
@@ -947,14 +952,19 @@
     let restoreHook, restoreCaptureHook, observer, mutationTimer, reconcileTimer, mediaTimer, routingTimer, visibilityHandler, slotCounter = 0;
     let capturePresentationActive = false;
     let domPresentationActive = false;
+    let captureLifecycleSeen = false;
     function participants() {
       return visibleParticipants(state, "google-meet");
     }
     function applyPresentationState() {
-      const presenting = capturePresentationActive || domPresentationActive;
+      const presenting = resolveLocalPresentationActive({
+        captureActive: capturePresentationActive,
+        domActive: domPresentationActive,
+        captureLifecycleSeen
+      });
       if (presenting === state.google.localPresentationActive) return presenting;
       state.google.localPresentationActive = presenting;
-      if (presenting) {
+      if (presenting && state.google.mode === "media") {
         workletSpeakerTracker.reset("local-presentation-bypass");
         for (const slot of state.google.slots) slot.release();
         for (const pipeline of media.pipelines) pipeline.deactivate();
@@ -968,6 +978,7 @@
       return presenting;
     }
     function setCapturePresentationActive(active) {
+      captureLifecycleSeen = true;
       capturePresentationActive = active;
       if (!active) domPresentationActive = hasLocalPresentation();
       return applyPresentationState();
@@ -1096,7 +1107,7 @@
       setStatus(active ? `${active.name} · automatic routing` : labels[routing.routingState] || `${participants().length} participants ready`);
     }
     function route() {
-      if (state.google.localPresentationActive) {
+      if (state.google.localPresentationActive && state.google.mode === "media") {
         for (const slot of state.google.slots) slot.release();
         if (state.google.mode === "media") for (const pipeline of media.pipelines) pipeline.deactivate();
         state.google.activeParticipantKey = null;
@@ -1155,7 +1166,7 @@
       media.destroy();
     }
     function applyParticipantGain(participant) {
-      if (syncPresentationState()) return;
+      if (syncPresentationState() && state.google.mode === "media") return;
       if (globalThis.document?.hidden) return;
       if (state.google.activeParticipantKey === participant.key) setOutputs(participant.value, true);
     }

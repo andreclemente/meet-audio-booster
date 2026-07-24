@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { collectCurrentUiSpeakers, collectCurrentUiSpeakersAcrossRoots, createGoogleMeetController, createWorkletSpeakerTracker } from '../src/platforms/google-meet/index.js'
+import { collectCurrentUiSpeakers, collectCurrentUiSpeakersAcrossRoots, createGoogleMeetController, createWorkletSpeakerTracker, resolveLocalPresentationActive } from '../src/platforms/google-meet/index.js'
 
 function fakeParticipantRoot(participantId, speaking = false) {
   return {
@@ -150,6 +150,60 @@ test('hidden Meet tab keeps media pipelines neutral across routing ticks', () =>
     assert.equal(state.google.routing.multiplier, 1)
     assert.deepEqual(writes, [1])
   } finally {
+    globalThis.document = originalDocument
+  }
+})
+
+test('completed capture lifecycle overrides a stale presentation DOM root', () => {
+  assert.equal(resolveLocalPresentationActive({ captureActive: true, domActive: false, captureLifecycleSeen: true }), true)
+  assert.equal(resolveLocalPresentationActive({ captureActive: false, domActive: true, captureLifecycleSeen: true }), false)
+  assert.equal(resolveLocalPresentationActive({ captureActive: false, domActive: true, captureLifecycleSeen: false }), true)
+})
+
+test('local presentation does not force worklet participant boost to 100 percent', () => {
+  const originalDocument = globalThis.document
+  const originalNow = Date.now
+  const speakingRoot = fakeParticipantRoot('device-a', true)
+  globalThis.document = {
+    hidden: false,
+    querySelectorAll(selector) { return selector === '[data-participant-id]' ? [speakingRoot] : [] }
+  }
+  let now = 0
+  Date.now = () => now
+  try {
+    const alice = {
+      key: 'A', platform: 'google-meet', participantId: 'device-a', name: 'Alice', present: true,
+      speaking: false, lastSpeakingAt: 0, value: 4.5, muted: false, element: speakingRoot
+    }
+    const writes = []
+    const slot = {
+      gain: {}, appliedMultiplier: 1,
+      set(value) { writes.push(value); this.appliedMultiplier = value },
+      release() { writes.push(1); this.appliedMultiplier = 1 }
+    }
+    const state = {
+      participants: new Map([['A', alice]]),
+      google: {
+        slots: [slot], mediaPipelines: [], mode: 'worklet', activeParticipantKey: null,
+        appliedParticipantKey: null, routingState: 'idle',
+        transitionGuard: { candidateParticipantKey: null, candidateSince: 0 },
+        routing: {}, rosterSignature: '', localPresentationActive: true
+      }
+    }
+    const controller = createGoogleMeetController({
+      state, context: {}, setStatus() {}, renderSoon() {}, updateLiveUi() {}
+    })
+
+    controller.route()
+    now = 60
+    controller.route()
+
+    assert.equal(state.google.routingState, 'confirmed-speaker')
+    assert.equal(state.google.appliedParticipantKey, 'A')
+    assert.equal(slot.appliedMultiplier, 4.5)
+    assert.equal(writes.at(-1), 4.5)
+  } finally {
+    Date.now = originalNow
     globalThis.document = originalDocument
   }
 })
