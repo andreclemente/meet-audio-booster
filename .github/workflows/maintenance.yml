@@ -1,0 +1,63 @@
+name: Maintenance
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    - cron: '23 8 * * 1'
+  workflow_dispatch:
+permissions:
+  contents: read
+# Share the main lock across push, schedule and manual dispatch to avoid issue races.
+concurrency:
+  group: maintenance-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - run: npm test
+      - name: Security audit including build dependencies
+        if: always() && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+        run: npm audit --audit-level=high
+  report:
+    if: >-
+      always() && github.ref == 'refs/heads/main' &&
+      (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') &&
+      (needs.verify.result == 'success' || needs.verify.result == 'failure')
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/github-script@v7
+        env:
+          VERIFY_RESULT: ${{ needs.verify.result }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.MAB_DISCORD_WEBHOOK_URL }}
+        with:
+          script: |
+            const reconcile = require('./scripts/maintenance.cjs')
+            const notify = require('./scripts/maintenance-discord.cjs')
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`
+            const issueUrl = await reconcile({ github, context,
+              status: process.env.VERIFY_RESULT, runUrl })
+            if (!issueUrl) return
+            const messageId = await notify({ issueUrl,
+              webhookUrl: process.env.DISCORD_WEBHOOK_URL })
+            if (messageId) core.notice(`Discord message verified: ${messageId}`)
+            else core.notice('Incident created; Discord integration is not configured.')
