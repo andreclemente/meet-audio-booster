@@ -24,7 +24,7 @@ jobs:
       artifact_id: ${{ steps.artifact.outputs.artifact-id }}
     steps:
       - name: Resolve trusted main and immutable release commit
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           ref: main
           fetch-depth: 0
@@ -36,7 +36,7 @@ jobs:
           RELEASE_EVENT_SHA: ${{ github.sha }}
         shell: bash
         run: python3 scripts/check_release.py >> "$GITHUB_OUTPUT"
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ steps.gate.outputs.release_sha }}
           persist-credentials: false
@@ -81,7 +81,7 @@ jobs:
     environment: chrome-web-store
     steps:
       - name: Trusted uploader only (no npm or release-code execution here)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           ref: ${{ needs.package.outputs.trusted_sha }}
           path: trusted
