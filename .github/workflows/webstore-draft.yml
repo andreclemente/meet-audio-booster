@@ -1,0 +1,133 @@
+name: Chrome Web Store draft
+on:
+  release:
+    types: [published]
+permissions:
+  contents: read
+# One store item: serialize releases, never cancel a running upload.
+# GitHub may replace a pending run; this is not a FIFO queue.
+concurrency:
+  group: chrome-web-store-draft
+  cancel-in-progress: false
+jobs:
+  package:
+    if: >-
+      github.event_name == 'release' &&
+      github.repository == 'andreclemente/meet-audio-booster' &&
+      !github.event.release.draft && !github.event.release.prerelease
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      trusted_sha: ${{ steps.gate.outputs.trusted_sha }}
+      tag: ${{ steps.gate.outputs.tag }}
+      sha256: ${{ steps.digest.outputs.sha256 }}
+      artifact_id: ${{ steps.artifact.outputs.artifact-id }}
+    steps:
+      - name: Resolve trusted main and immutable release commit
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Gate stable tag and main ancestry before executing release code
+        id: gate
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os, re
+          tag = os.environ['RELEASE_TAG']
+          if not re.fullmatch(r'v(0|[1-9][0-9]{0,4})(\.(0|[1-9][0-9]{0,4})){2}', tag, re.ASCII):
+              raise SystemExit('Expected stable tag vN.N.N')
+          parts = [int(p) for p in tag[1:].split('.')]
+          if max(parts) > 65535 or not any(parts):
+              raise SystemExit('Invalid Chrome version')
+          PY
+          trusted_sha=$(git rev-parse HEAD)
+          release_sha=$(git rev-parse --verify "refs/tags/$RELEASE_TAG^{commit}")
+          git merge-base --is-ancestor "$release_sha" origin/main
+          {
+            printf 'trusted_sha=%s\n' "$trusted_sha"
+            printf 'release_sha=%s\n' "$release_sha"
+            printf 'tag=%s\n' "$RELEASE_TAG"
+          } >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.gate.outputs.release_sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: npm ci
+      - run: npm run build
+      - run: npm test
+      - run: python3 -m unittest discover -s tests -p 'test_webstore_draft.py'
+      - name: Package dist contents offline
+        env:
+          RELEASE_TAG: ${{ steps.gate.outputs.tag }}
+        run: |
+          mkdir release-artifact
+          python3 scripts/webstore_draft.py package --tag "$RELEASE_TAG" --output release-artifact/extension.zip
+      - name: Record exact archive digest
+        id: digest
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha256=$(sha256sum release-artifact/extension.zip | cut -d ' ' -f 1)
+          printf 'sha256=%s\n' "$sha256" >> "$GITHUB_OUTPUT"
+          printf '%s  extension.zip\n' "$sha256" > release-artifact/extension.zip.sha256
+      - uses: actions/upload-artifact@v4
+        id: artifact
+        with:
+          name: chrome-web-store-draft-${{ github.run_id }}-${{ github.run_attempt }}
+          path: release-artifact/
+          if-no-files-found: error
+          retention-days: 30
+  upload:
+    needs: package
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    # Configure reviewers/branch restrictions in repository Settings; YAML alone
+    # does not establish environment protection. Approval uses captured main SHA.
+    environment: chrome-web-store
+    steps:
+      - name: Trusted uploader only (no npm or release-code execution here)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.package.outputs.trusted_sha }}
+          path: trusted
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      # v4.3.0 adds exact artifact-ID selection (older actionlint catalogs omit it).
+      - uses: actions/download-artifact@v4.3.0
+        with:
+          artifact-ids: ${{ needs.package.outputs.artifact_id }}
+          path: release-artifact
+          merge-multiple: true
+      - name: Independently validate exact artifact offline
+        env:
+          RELEASE_TAG: ${{ needs.package.outputs.tag }}
+          ARCHIVE_SHA256: ${{ needs.package.outputs.sha256 }}
+        run: >-
+          python3 trusted/scripts/webstore_draft.py check
+          --archive release-artifact/extension.zip --tag "$RELEASE_TAG" --sha256 "$ARCHIVE_SHA256"
+      - name: Upload draft only and read store status back
+        env:
+          RELEASE_TAG: ${{ needs.package.outputs.tag }}
+          ARCHIVE_SHA256: ${{ needs.package.outputs.sha256 }}
+          CWS_CLIENT_ID: ${{ secrets.CWS_CLIENT_ID }}
+          CWS_CLIENT_SECRET: ${{ secrets.CWS_CLIENT_SECRET }}
+          CWS_REFRESH_TOKEN: ${{ secrets.CWS_REFRESH_TOKEN }}
+          CWS_PUBLISHER_ID: ${{ vars.CWS_PUBLISHER_ID }}
+          CWS_EXTENSION_ID: ${{ vars.CWS_EXTENSION_ID }}
+        run: >-
+          python3 trusted/scripts/webstore_draft.py upload
+          --archive release-artifact/extension.zip --tag "$RELEASE_TAG" --sha256 "$ARCHIVE_SHA256"
