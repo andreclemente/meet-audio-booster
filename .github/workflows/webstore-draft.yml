@@ -33,26 +33,9 @@ jobs:
         id: gate
         env:
           RELEASE_TAG: ${{ github.event.release.tag_name }}
+          RELEASE_EVENT_SHA: ${{ github.sha }}
         shell: bash
-        run: |
-          set -euo pipefail
-          python3 - <<'PY'
-          import os, re
-          tag = os.environ['RELEASE_TAG']
-          if not re.fullmatch(r'v(0|[1-9][0-9]{0,4})(\.(0|[1-9][0-9]{0,4})){2}', tag, re.ASCII):
-              raise SystemExit('Expected stable tag vN.N.N')
-          parts = [int(p) for p in tag[1:].split('.')]
-          if max(parts) > 65535 or not any(parts):
-              raise SystemExit('Invalid Chrome version')
-          PY
-          trusted_sha=$(git rev-parse HEAD)
-          release_sha=$(git rev-parse --verify "refs/tags/$RELEASE_TAG^{commit}")
-          git merge-base --is-ancestor "$release_sha" origin/main
-          {
-            printf 'trusted_sha=%s\n' "$trusted_sha"
-            printf 'release_sha=%s\n' "$release_sha"
-            printf 'tag=%s\n' "$RELEASE_TAG"
-          } >> "$GITHUB_OUTPUT"
+        run: python3 scripts/check_release.py >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@v4
         with:
           ref: ${{ steps.gate.outputs.release_sha }}
@@ -67,7 +50,7 @@ jobs:
       - run: npm ci
       - run: npm run build
       - run: npm test
-      - run: python3 -m unittest discover -s tests -p 'test_webstore_draft.py'
+      - run: python3 -m unittest discover -s tests -p 'test_*.py'
       - name: Package dist contents offline
         env:
           RELEASE_TAG: ${{ steps.gate.outputs.tag }}

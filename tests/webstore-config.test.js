@@ -6,16 +6,35 @@ test('store upload is stable-release-only with main ancestry and immutable check
   const text = await readFile('.github/workflows/webstore-draft.yml', 'utf8')
   for (const value of ['types: [published]', "github.event_name == 'release'",
     "github.repository == 'andreclemente/meet-audio-booster'", '!github.event.release.draft',
-    '!github.event.release.prerelease', 'git merge-base --is-ancestor "$release_sha" origin/main',
+    '!github.event.release.prerelease', 'RELEASE_EVENT_SHA: ${{ github.sha }}',
+    'run: python3 scripts/check_release.py >> "$GITHUB_OUTPUT"',
     'ref: ${{ steps.gate.outputs.release_sha }}', 'ref: ${{ needs.package.outputs.trusted_sha }}',
     'persist-credentials: false', "node-version: '22'", 'npm ci', 'npm run build', 'npm test',
-    "python3 -m unittest discover -s tests -p 'test_webstore_draft.py'", 'contents: read']) {
+    "python3 -m unittest discover -s tests -p 'test_*.py'", 'contents: read']) {
     assert.ok(text.includes(value), `Missing release gate: ${value}`)
   }
   assert.doesNotMatch(text, /workflow_dispatch:|pull_request|^  push:|continue-on-error|secrets: inherit/m)
   assert.match(text, /group: chrome-web-store-draft\s+cancel-in-progress: false/)
   assert.ok(text.indexOf('run: npm run build') < text.indexOf('run: npm test'))
-  assert.match(text, /git rev-parse --verify "refs\/tags\/\$RELEASE_TAG\^\{commit\}"/)
+  assert.ok(text.indexOf('scripts/check_release.py') < text.indexOf('ref: ${{ steps.gate.outputs.release_sha }}'))
+})
+
+test('maintenance verify runs every Python test in a dedicated unconditional step', async () => {
+  const text = await readFile('.github/workflows/maintenance.yml', 'utf8')
+  const verify = text.split('\n  verify:\n')[1].split('\n  report:\n')[0]
+  const steps = verify.split(/^      - /m).slice(1)
+  const setup = steps.find(step => step.startsWith('uses: actions/setup-python@v5\n'))
+  assert.ok(setup, 'Python setup must be an actual verify step')
+  assert.match(setup, /python-version: '3\.12'/)
+  assert.doesNotMatch(setup, /^\s*if:/m)
+  const tests = steps.find(step => step.startsWith('name: Run all offline Python tests\n'))
+  assert.ok(tests, 'Python tests must have a dedicated verify step')
+  assert.match(tests, /^        run: python3 -m unittest discover -s tests -p 'test_\*\.py'$/m)
+  assert.doesNotMatch(tests, /^\s*(?:if:|continue-on-error:)/m)
+  assert.doesNotMatch(verify.split('    steps:')[0], /^\s*if:/m)
+  assert.match(text, /^  pull_request:$/m)
+  assert.match(text, /^  push:\n    branches: \[main\]$/m)
+  assert.match(text, /^  schedule:$/m)
 })
 
 test('credentials only reach trusted uploader, with exact artifact and offline checks', async () => {

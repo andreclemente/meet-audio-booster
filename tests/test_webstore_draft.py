@@ -140,6 +140,12 @@ class DraftTests(unittest.TestCase):
         self.assertEqual(self.calls[2][3], self.archive.read_bytes())
         self.assertTrue(all(c[4] == 30 for c in self.calls))
 
+    def test_sync_success_rejects_failed_readback(self):
+        for state in ('FAILED', 'NOT_FOUND', 'UPLOAD_STATE_UNSPECIFIED'):
+            with self.subTest(state=state), self.assertRaises(draft.DraftError):
+                self.run_upload([{'access_token': 'secret'}, self.status, self.response,
+                                 dict(self.status, lastAsyncUploadState=state)])
+
     def test_preflight_rejections_do_not_upload(self):
         cases = []
         for field, value in [('name', 'other'), ('itemId', 'b' * 32), ('warned', True), ('takenDown', True),
@@ -176,6 +182,8 @@ class DraftTests(unittest.TestCase):
         success = dict(self.status, lastAsyncUploadState='SUCCEEDED')
         result = self.run_upload([{'access_token': 'secret'}, self.status, reply, pending, success], polls=2)
         self.assertFalse(result['upload_response_version_verified'])
+        self.assertTrue(result['item_level_completion_observed'])
+        self.assertFalse(result['upload_operation_correlation_verified'])
         self.assertEqual(len(self.sleeps), 2)
         for state in ('FAILED', 'NOT_FOUND', 'UPLOAD_STATE_UNSPECIFIED', 'NEW_STATE', None):
             status = dict(self.status, lastAsyncUploadState=state)

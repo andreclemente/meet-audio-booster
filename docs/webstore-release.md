@@ -41,8 +41,10 @@ are deliberately absent from the uploader's endpoint allowlist.
    does not bump any version.
 2. Merge the release commit into main, create its tag, then publish the stable
    GitHub release. There is no push, PR, or arbitrary manual-ref upload trigger.
-   The workflow resolves the tag to an immutable commit and checks its ancestry
-   against the fetched main before running release code. Lightweight and annotated
+   The offline gate peels the tag to a commit, requires it to equal the exact
+   original release event `github.sha` (`RELEASE_EVENT_SHA`), and checks its ancestry
+   against fetched main before running release code. A moved tag is rejected even
+   if its new target is on main, including on full reruns. Lightweight and annotated
    tags work. Old releases lacking this workflow/helper cannot use the new path.
 3. The unprivileged job runs Node 22 `npm ci`, build, all Node tests, and Python
    unittest. It packages **dist contents**, not the dist directory: manifest is
@@ -53,8 +55,14 @@ are deliberately absent from the uploader's endpoint allowlist.
    Environment files, credentials, sources and dependencies cannot be extra ZIP
    entries. The allowlist is not a secret scanner inside approved file contents;
    source review remains required.
-4. Download the retained `chrome-web-store-draft-<run>-<attempt>` artifact if needed:
-   `extension.zip` and `extension.zip.sha256` are retained for 30 days. The privileged
+4. Testers must download the exact `chrome-web-store-draft-<run>-<attempt>` workflow
+   artifact for the intended release attempt (not a source archive or another run).
+   Extract the artifact wrapper to obtain `extension.zip` and `extension.zip.sha256`,
+   retained for 30 days. In that directory run `sha256sum -c extension.zip.sha256`
+   and compare the digest to that run's recorded archive SHA256. Unzip this verified
+   **extension.zip** into a clean directory and use Chrome's **Load unpacked** on
+   that directory for testing. Load this ZIP's contents, **not a locally rebuilt
+   equivalent**, even if versions match. The privileged
    job downloads the exact immutable artifact ID from this run, validates the SHA256
    and manifest again, and runs only the uploader from the **captured main SHA**.
    It never runs npm, artifact code, or the release's uploader with credentials.
@@ -67,14 +75,22 @@ are deliberately absent from the uploader's endpoint allowlist.
    The only other requests are OAuth token refresh and exact-item `:fetchStatus`.
 6. Upload success always requires exact-target status readback with unchanged
    published/submitted revision snapshots. Synchronous `SUCCEEDED` also requires
-   matching response name, item ID and `crxVersion`. Async `IN_PROGRESS` polls at
+   matching response name, item ID and `crxVersion`. Its readback permits only an
+   absent async state or `SUCCEEDED`; explicit `FAILED`, `NOT_FOUND`, unspecified
+   or conflicting in-progress states fail closed. Pre-existing stale async metadata
+   may therefore cause a false alarm after synchronous success: inspect the
+   dashboard manually rather than automatically retrying. Async `IN_PROGRESS` polls at
    five-second intervals (30 attempts by default, hard cap 60, each request timeout
    30 seconds). Only `SUCCEEDED` completes processing. Unknown, failed, unavailable
    or timed-out responses fail closed; no automatic POST retries occur.
 7. **Manually verify the draft's version and package in the developer dashboard**,
-   especially for async success: `fetchStatus` has no draft-version field, and
-   async upload has no synchronous `crxVersion` guarantee. Status readback can prove
-   processing and detect revision changes, not prove the stored draft's version.
+   especially for async success: `fetchStatus` has neither an operation ID nor a
+   draft-version field. Item-level observed completion is **not correlation to this
+   upload or a version guarantee**; a stale/unrelated completion can be observed.
+   Output `upload_processed`/`item_level_completion_observed` describes this limited
+   observation; `upload_operation_correlation_verified` remains false, and async
+   `upload_response_version_verified` is false. Readback detects revision changes,
+   but cannot prove this upload's stored draft version.
    Run **manual real-call tests** on Google Meet and Jitsi (participant association,
    per-person gain/mute, navigation, reconnection and audio lifecycle). Only after
    those pass should a maintainer **manually submit store review** in the dashboard.
@@ -87,7 +103,7 @@ Python standard library only; no Google credentials are read for package/check:
 npm ci
 npm run build
 npm test
-python3 -m unittest discover -s tests -p 'test_webstore_draft.py'
+python3 -m unittest discover -s tests -p 'test_*.py'
 python3 scripts/webstore_draft.py package --tag v1.2.1 --output extension.zip
 sha256sum extension.zip
 python3 scripts/webstore_draft.py check --archive extension.zip --tag v1.2.1 --sha256 <64-hex-digest>
@@ -107,7 +123,8 @@ effect even if readback failed. Also inspect any prior draft before intentionall
 replacing it; the API does not expose its version in fetchStatus. There is no
 automatic upload retry or duplicate-upload guarantee. A maintainer can rerun the
 failed release job through GitHub Actions once safe; do not create a manual-ref
-upload workflow. Rerunning all jobs resolves main again; rerunning only the upload
+upload workflow. Rerunning all jobs resolves main again but retains the original
+release event SHA: the current peeled tag must still equal that SHA. Rerunning only the upload
 job retains the original dependency outputs and captured uploader SHA. Releases
 share one static concurrency group and running uploads are not cancelled; GitHub
 can replace an older pending run, so serialization is **not** FIFO delivery.
@@ -116,6 +133,8 @@ Unchanged published/submitted snapshots detect some concurrent manual changes bu
 are not a transactional lock: avoid dashboard/API writes while this runs. Live
 Google authorization, environment approvals, artifact transport and store behavior
 must still be verified by a configured release; offline tests do not establish them.
+Actions currently use reviewed major-version refs (artifact download uses v4.3.0);
+full commit-SHA action pinning is deferred to a separate hardening change.
 
 API contract: [v2 discovery](https://chromewebstore.googleapis.com/$discovery/rest?version=v2)
 (checked 2026-10-27). Exact upload enum is `SUCCEEDED`, `IN_PROGRESS`, `FAILED`,

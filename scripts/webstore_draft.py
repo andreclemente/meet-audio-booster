@@ -255,14 +255,17 @@ def upload(path, tag, sha256, env, *, transport=http_request, sleep=time.sleep, 
                 'Published/submitted store status changed concurrently; inspect store manually.')
         last = after.get('lastAsyncUploadState')
         if verified:
-            require(last != 'IN_PROGRESS', 'Conflicting upload in progress; inspect store manually.')
+            # Stale async metadata can cause a false alarm; prefer manual inspection.
+            require(last in {None, 'SUCCEEDED'}, 'Conflicting or failed upload status; inspect store manually.')
             break
         require(last in {'IN_PROGRESS', 'SUCCEEDED'}, 'Async upload failed or status is unknown; inspect store manually.')
         if last == 'SUCCEEDED':
             break
     else:
         raise DraftError('Async upload polling timed out; inspect store manually before retry.')
+    # Async fetchStatus is item-level: no operation ID or draft-version correlation.
     return {'upload_processed': True, 'upload_response_version_verified': verified,
+            'item_level_completion_observed': True, 'upload_operation_correlation_verified': False,
             'manual_dashboard_verification_required': True, 'published_and_submitted_status_unchanged': True}
 
 
