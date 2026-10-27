@@ -11,25 +11,53 @@ are deliberately absent from the uploader's endpoint allowlist.
    Confirm the intended publisher and extension IDs there. Set repository Actions
    variables `CWS_PUBLISHER_ID` and `CWS_EXTENSION_ID` (not secrets). These IDs have
    been configured externally; the workflow never hardcodes their values.
-2. In the publisher's Google Cloud project enable **Chrome Web Store API**.
-   Configure the OAuth consent screen and an OAuth client for the account with
-   access to this publisher/item. Use consent-screen **Production** status:
-   External apps left in Testing generally receive refresh tokens that expire
-   after seven days. Complete any Google verification requirements applicable to
-   your project. Request offline access and scope
-   `https://www.googleapis.com/auth/chromewebstore`; obtain a refresh token through
-   Google's authorized OAuth flow. This scope can publish too: code isolation and
-   environment protections, not OAuth scope, enforce this workflow's draft-only use.
-3. Enter `CWS_CLIENT_ID`, `CWS_CLIENT_SECRET`, and `CWS_REFRESH_TOKEN` securely in
-   GitHub Settings → Secrets and variables → Actions, preferably as secrets of
-   the `chrome-web-store` environment. **Never paste credentials in chat, issues,
-   source, logs, shell history, or artifacts.** No service account or WIF setup is
-   required. Credentials are still missing; live authentication/upload is unverified.
+2. Enable **Chrome Web Store API** in the service account's Google Cloud project.
+   Use the existing Google **service account JSON key** (`type: service_account`),
+   not an unrelated OAuth user credential. In Chrome Web Store developer dashboard
+   → **Account → API access**, add/link its `client_email` to the intended publisher.
+   A successful Google token exchange alone does not grant publisher access:
+   `fetchStatus` can still return 403 until this linkage is correct. Do not grant
+   broad Google Cloud IAM roles to fix Chrome Web Store publisher authorization.
+3. Store the complete JSON securely as **environment-scoped** secret
+   `CWS_SERVICE_ACCOUNT_JSON` in GitHub Settings → Environments →
+   `chrome-web-store` → Environment secrets. An empty repository-secrets list does
+   not mean this environment secret is missing. Do not overwrite an existing key
+   merely because it is not listed at repository scope. The secret is exposed only
+   to the trusted draft-upload step, not packaging, tests, or offline checks.
+   **Never paste credentials in chat, issues, source, logs, shell history, or artifacts.**
+   The service account requests `https://www.googleapis.com/auth/chromewebstore`;
+   this scope can publish too: endpoint isolation and environment protections,
+   not the auth method or scope, enforce this workflow's draft-only behavior.
 4. Create/configure environment `chrome-web-store` with required reviewers and
    suitable deployment restrictions. Ensure release tag deployments are allowed
    (a main-only deployment restriction may block tag events). Protect main,
    release tags, workflow edits, and environment configuration. Merely referencing
    an environment in YAML does **not** prove reviewers/protections are configured.
+
+## Authentication boundaries
+
+Service-account auth validates the JSON type, Google token URI, service-account
+email and unencrypted PKCS#8 PEM shape before signing an RS256 JWT with a one-hour
+expiry, fixed Google audience and Chrome Web Store scope. It uses trusted
+`/usr/bin/openssl` (RSA PKCS#1 v1.5/SHA-256), Linux `memfd_create` and `/proc/self/fd`;
+Python has no extra pip dependencies. The private key stays in process/anonymous
+memory, never in a disk file, command-line argument, log or artifact. The signing
+child receives only a minimal environment, not the CI secrets; stderr is suppressed
+and the memory descriptor is closed on success or failure. The runner must remain
+trusted: same-user/root process inspection and memory access are not prevented.
+No `GOOGLE_APPLICATION_CREDENTIALS` file or `.env` is loaded by this script.
+
+OAuth refresh credentials remain an **optional alternative**, not a prerequisite:
+leave `CWS_SERVICE_ACCOUNT_JSON` unset/empty and configure all three
+`CWS_CLIENT_ID`, `CWS_CLIENT_SECRET`, `CWS_REFRESH_TOKEN` as environment secrets.
+Obtain offline access for the same Chrome Web Store scope through Google's
+OAuth flow, using a production consent screen where appropriate (External Testing
+refresh tokens generally expire after seven days). Complete applicable Google
+verification requirements. **Never configure both auth methods**: even partial
+OAuth credentials alongside service-account JSON fail closed before network I/O.
+Invalid/missing credentials fail explicitly; there is no silent fallback from a
+malformed service-account key. IDs remain independent non-secret configuration.
+Both methods use only the fixed `https://oauth2.googleapis.com/token` endpoint.
 
 ## Release procedure
 
@@ -68,11 +96,12 @@ are deliberately absent from the uploader's endpoint allowlist.
    It never runs npm, artifact code, or the release's uploader with credentials.
    Approval does not silently switch to a newer main uploader revision.
 5. If reviewers are configured, approve the environment deployment. The script
-   refreshes OAuth credentials, fetches exact item status, rejects active review/
+   exchanges service-account JWT credentials (or refreshes optional OAuth credentials),
+   fetches exact item status, rejects active review/
    staged submission, warning/takedown, unknown states, concurrent async upload,
    and non-increasing versions, then makes **one** raw ZIP upload request:
    `POST https://chromewebstore.googleapis.com/upload/v2/publishers/{publisher}/items/{item}:upload`.
-   The only other requests are OAuth token refresh and exact-item `:fetchStatus`.
+   The only other requests are Google token exchange and exact-item `:fetchStatus`.
 6. Upload success always requires exact-target status readback with unchanged
    published/submitted revision snapshots. Synchronous `SUCCEEDED` also requires
    matching response name, item ID and `crxVersion`. Its readback permits only an
@@ -97,7 +126,8 @@ are deliberately absent from the uploader's endpoint allowlist.
 
 ## Offline use and recovery
 
-Python standard library only; no Google credentials are read for package/check:
+Python standard library for package/check; service-account upload additionally
+requires Linux and `/usr/bin/openssl`. No Google credentials are read for package/check:
 
 ```sh
 npm ci

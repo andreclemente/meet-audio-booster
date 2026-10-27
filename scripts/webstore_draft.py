@@ -5,6 +5,7 @@ No publish, submission, cancellation or rollout operations exist here. Network
 responses/errors are untrusted: never print their contents, URLs or credentials.
 """
 import argparse
+import base64
 import hashlib
 import io
 import json
@@ -12,6 +13,7 @@ import os
 from pathlib import Path
 import re
 import stat
+import subprocess
 import sys
 import time
 import urllib.parse
@@ -148,11 +150,74 @@ def check_archive(path, tag, sha256):
 
 
 def config(env):
-    keys = ('CWS_CLIENT_ID', 'CWS_CLIENT_SECRET', 'CWS_REFRESH_TOKEN', 'CWS_PUBLISHER_ID', 'CWS_EXTENSION_ID')
+    keys = ('CWS_PUBLISHER_ID', 'CWS_EXTENSION_ID')
     require(all(isinstance(env.get(k), str) and env[k].strip() for k in keys), 'Missing required CWS configuration.')
     require(re.fullmatch('[A-Za-z0-9_-]{1,128}', env['CWS_PUBLISHER_ID']), 'Invalid publisher ID.')
     require(re.fullmatch('[a-p]{32}', env['CWS_EXTENSION_ID']), 'Invalid extension ID.')
     return 'publishers/' + env['CWS_PUBLISHER_ID'] + '/items/' + env['CWS_EXTENSION_ID']
+
+
+def sign_rs256(private_key, message):
+    """Linux only: OpenSSL sees an anonymous memory fd, never a key file/argv value."""
+    fd = None
+    try:
+        fd = os.memfd_create('cws-signing-key', os.MFD_CLOEXEC)
+        with os.fdopen(os.dup(fd), 'wb') as stream:
+            stream.write(private_key.encode('ascii'))
+        os.lseek(fd, 0, os.SEEK_SET)
+        signed = subprocess.run(
+            ['/usr/bin/openssl', 'dgst', '-sha256', '-sign', '/proc/self/fd/' + str(fd),
+             '-sigopt', 'rsa_padding_mode:pkcs1'],
+            input=message, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            pass_fds=(fd,), env={'PATH': '/usr/bin:/bin'}, timeout=30, check=True)
+        require(bool(signed.stdout), 'Service account signing failed.')
+        return signed.stdout
+    except Exception:
+        raise DraftError('Service account signing failed.') from None
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
+def authentication_form(env, *, signer=sign_rs256, now=time.time):
+    oauth_keys = ('CWS_CLIENT_ID', 'CWS_CLIENT_SECRET', 'CWS_REFRESH_TOKEN')
+    service = env.get('CWS_SERVICE_ACCOUNT_JSON')
+    has_service = service is not None and service != ''
+    has_oauth = any(env.get(k) not in (None, '') for k in oauth_keys)
+    require(not (has_service and has_oauth), 'Ambiguous CWS authentication; configure only one method.')
+    if not has_service:
+        require(all(isinstance(env.get(k), str) and env[k].strip() for k in oauth_keys),
+                'Missing CWS authentication: configure service account JSON or complete OAuth credentials.')
+        return urllib.parse.urlencode({'client_id': env['CWS_CLIENT_ID'], 'client_secret': env['CWS_CLIENT_SECRET'],
+                                       'refresh_token': env['CWS_REFRESH_TOKEN'], 'grant_type': 'refresh_token'}).encode()
+    try:
+        require(isinstance(service, str) and len(service) <= 65536, 'Invalid service account configuration.')
+        account = decode_json(service)
+        require(account.get('type') == 'service_account' and account.get('token_uri') == TOKEN_URL,
+                'Invalid service account configuration.')
+        email, key = account.get('client_email'), account.get('private_key')
+        require(isinstance(email, str) and len(email) <= 254 and re.fullmatch(
+            r'[A-Za-z0-9][A-Za-z0-9._-]{0,63}@(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+gserviceaccount\.com', email),
+            'Invalid service account configuration.')
+        require(isinstance(key, str) and re.fullmatch(
+            r'-----BEGIN PRIVATE KEY-----\n[A-Za-z0-9+/=\n]+\n-----END PRIVATE KEY-----\n?', key),
+            'Invalid service account configuration.')
+        base64.b64decode(''.join(key.splitlines()[1:-1]), validate=True)
+        issued = int(now())
+        def encode(value):
+            return base64.urlsafe_b64encode(value).rstrip(b'=')
+        header = encode(b'{"alg":"RS256","typ":"JWT"}')
+        claims = encode(json.dumps({'iss': email, 'scope': 'https://www.googleapis.com/auth/chromewebstore',
+                                    'aud': TOKEN_URL, 'iat': issued, 'exp': issued + 3600},
+                                   separators=(',', ':')).encode('ascii'))
+        unsigned = header + b'.' + claims
+        signature = signer(key, unsigned)
+        require(isinstance(signature, bytes) and bool(signature), 'Service account signing failed.')
+        assertion = unsigned + b'.' + encode(signature)
+        return urllib.parse.urlencode({'grant_type': 'urn:ietf:params:oauth:grant-type:jwt-bearer',
+                                       'assertion': assertion.decode('ascii')}).encode('ascii')
+    except Exception:
+        raise DraftError('Invalid service account configuration or signing failed.') from None
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -209,7 +274,8 @@ def status_check(response, name, item, proposed):
     return {key: response.get(key) for key in REVISION_FIELDS}
 
 
-def upload(path, tag, sha256, env, *, transport=http_request, sleep=time.sleep, polls=30):
+def upload(path, tag, sha256, env, *, transport=http_request, sleep=time.sleep, polls=30,
+           signer=sign_rs256, now=time.time):
     require(type(polls) is int and 1 <= polls <= 60, 'Polling limit must be between 1 and 60.')
     data = archive_bytes(path, tag, sha256)
     expected = tag_version(tag)
@@ -224,8 +290,7 @@ def upload(path, tag, sha256, env, *, transport=http_request, sleep=time.sleep, 
         require(isinstance(response, dict) and 'error' not in response, 'API request failed; inspect store manually before retry.')
         return response
 
-    form = urllib.parse.urlencode({'client_id': env['CWS_CLIENT_ID'], 'client_secret': env['CWS_CLIENT_SECRET'],
-                                  'refresh_token': env['CWS_REFRESH_TOKEN'], 'grant_type': 'refresh_token'}).encode()
+    form = authentication_form(env, signer=signer, now=now)
     token = request('POST', TOKEN_URL, {'Content-Type': 'application/x-www-form-urlencoded'}, form)
     access = token.get('access_token')
     require(isinstance(access, str) and access and not any(c in access for c in '\r\n'), 'OAuth response has no valid access token.')

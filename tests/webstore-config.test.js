@@ -41,7 +41,10 @@ test('credentials only reach trusted uploader, with exact artifact and offline c
   const text = await readFile('.github/workflows/webstore-draft.yml', 'utf8')
   const [build, upload] = text.split('\n  upload:\n')
   assert.ok(upload)
-  assert.doesNotMatch(build, /secrets\.|CWS_CLIENT|CWS_REFRESH/)
+  assert.doesNotMatch(build, /secrets\.|CWS_CLIENT|CWS_REFRESH|CWS_SERVICE_ACCOUNT/)
+  assert.equal(text.match(/CWS_SERVICE_ACCOUNT_JSON:/g)?.length, 1)
+  const uploadStep = upload.split('      - name: Upload draft only and read store status back')[1]
+  assert.ok(uploadStep.includes('CWS_SERVICE_ACCOUNT_JSON: ${{ secrets.CWS_SERVICE_ACCOUNT_JSON }}'))
   assert.doesNotMatch(upload, /run:.*(?:npm |node )|release_sha/)
   for (const value of ['environment: chrome-web-store', 'actions/download-artifact@v4',
     'artifact-ids: ${{ needs.package.outputs.artifact_id }}', 'merge-multiple: true',

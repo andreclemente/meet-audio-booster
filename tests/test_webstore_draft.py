@@ -1,5 +1,9 @@
 """Offline release packaging and draft-only API contract tests."""
+import base64
 import copy
+import os
+import subprocess
+from urllib.parse import parse_qs
 import hashlib
 import importlib.util
 import json
@@ -77,6 +81,145 @@ class DraftTests(unittest.TestCase):
         self.assertEqual(first, draft.check_archive(second, 'v1.2.1', first))
         with self.assertRaises(draft.DraftError):
             self.pack()
+
+    def service_env(self):
+        self.env = {k: v for k, v in self.env.items() if k in ('CWS_PUBLISHER_ID', 'CWS_EXTENSION_ID')}
+        self.account = {'type': 'service_account', 'client_email': 'fixture@offline.iam.gserviceaccount.com',
+                        'token_uri': draft.TOKEN_URL,
+                        'private_key': '-----BEGIN PRIVATE KEY-----\nZml4dHVyZQ==\n-----END PRIVATE KEY-----\n'}
+        self.env['CWS_SERVICE_ACCOUNT_JSON'] = json.dumps(self.account)
+
+    def test_service_account_assertion_and_draft_boundaries(self):
+        self.service_env()
+        signed = []
+        def signer(key, message):
+            self.assertEqual(key, self.account['private_key'])
+            signed.append(message)
+            return b'fixture-signature'
+        result = self.run_upload(signer=signer, now=lambda: 1700000000)
+        self.assertTrue(result['manual_dashboard_verification_required'])
+        form = parse_qs(self.calls[0][3].decode())
+        self.assertEqual(set(form), {'grant_type', 'assertion'})
+        self.assertEqual(form['grant_type'], ['urn:ietf:params:oauth:grant-type:jwt-bearer'])
+        parts = form['assertion'][0].split('.')
+        decode = lambda part: base64.urlsafe_b64decode(part + '=' * (-len(part) % 4))
+        self.assertEqual(json.loads(decode(parts[0])), {'alg': 'RS256', 'typ': 'JWT'})
+        self.assertEqual(json.loads(decode(parts[1])), {
+            'iss': self.account['client_email'], 'scope': 'https://www.googleapis.com/auth/chromewebstore',
+            'aud': draft.TOKEN_URL, 'iat': 1700000000, 'exp': 1700003600})
+        self.assertEqual(decode(parts[2]), b'fixture-signature')
+        self.assertEqual(signed, ['.'.join(parts[:2]).encode('ascii')])
+        self.assertEqual([c[0] for c in self.calls], ['POST', 'GET', 'POST', 'GET'])
+        self.assertEqual(self.calls[0][1], draft.TOKEN_URL)
+        self.assertTrue(self.calls[2][1].endswith(':upload'))
+
+    def test_service_account_invalid_or_ambiguous_auth_never_networks(self):
+        self.service_env()
+        valid = self.env.copy()
+        for field, value in [('type', 'authorized_user'), ('token_uri', 'https://evil.invalid/token'),
+                             ('client_email', 'bad\r\nemail'), ('client_email', []),
+                             ('client_email', 'fixture@bad..gserviceaccount.com'),
+                             ('client_email', 'fixture@-bad.gserviceaccount.com'),
+                             ('private_key', 'SECRET'), ('private_key', '-----BEGIN RSA PRIVATE KEY-----\nSECRET')]:
+            account = dict(self.account, **{field: value})
+            self.env = dict(valid, CWS_SERVICE_ACCOUNT_JSON=json.dumps(account))
+            with self.subTest(field=field, value=value), self.assertRaises(draft.DraftError) as ctx:
+                self.run_upload(signer=lambda *_: self.fail('must not sign'))
+            self.assertNotIn('SECRET', str(ctx.exception))
+        for value in ('[]', '{broken-SECRET', 'null', '   '):
+            self.env = dict(valid, CWS_SERVICE_ACCOUNT_JSON=value)
+            with self.subTest(value=value), self.assertRaises(draft.DraftError):
+                self.run_upload()
+        for key in ('CWS_CLIENT_ID', 'CWS_CLIENT_SECRET', 'CWS_REFRESH_TOKEN'):
+            self.env = dict(valid, **{key: 'oauth-SECRET'})
+            with self.subTest(key=key), self.assertRaises(draft.DraftError):
+                self.run_upload()
+        self.env = {k: v for k, v in valid.items() if k != 'CWS_SERVICE_ACCOUNT_JSON'}
+        with self.assertRaisesRegex(draft.DraftError, 'authentication'):
+            self.run_upload()
+        self.assertEqual(self.calls, [])
+
+    def test_optional_oauth_missing_fields_fail_before_network(self):
+        for key in ('CWS_CLIENT_ID', 'CWS_CLIENT_SECRET', 'CWS_REFRESH_TOKEN'):
+            original = self.env[key]
+            self.env[key] = ''
+            with self.subTest(key=key), self.assertRaisesRegex(draft.DraftError, 'authentication'):
+                self.run_upload()
+            self.env[key] = original
+        self.assertEqual(self.calls, [])
+        self.env['CWS_SERVICE_ACCOUNT_JSON'] = ''
+        self.run_upload()  # workflow passes an empty missing alternative secret
+
+    def test_service_signer_failure_sanitized_before_network(self):
+        self.service_env()
+        with self.assertRaises(draft.DraftError) as ctx:
+            self.run_upload(signer=mock.Mock(side_effect=RuntimeError('private-key-SECRET')))
+        self.assertNotIn('SECRET', str(ctx.exception))
+        self.assertEqual(self.calls, [])
+
+    def test_real_openssl_rsa_signing_and_fd_cleanup(self):
+        # Ephemeral, generated fixture only. No live credentials or key files.
+        key = subprocess.run(['/usr/bin/openssl', 'genpkey', '-algorithm', 'RSA',
+                              '-pkeyopt', 'rsa_keygen_bits:2048'], capture_output=True, check=True).stdout
+        message = b'offline signing fixture'
+        signature = draft.sign_rs256(key.decode(), message)
+        public = subprocess.run(['/usr/bin/openssl', 'pkey', '-pubout'], input=key,
+                                capture_output=True, check=True).stdout
+        public_path = self.root / 'fixture-public.pem'
+        signature_path = self.root / 'fixture-signature'
+        public_path.write_bytes(public)
+        signature_path.write_bytes(signature)
+        verified = subprocess.run(['/usr/bin/openssl', 'dgst', '-sha256', '-verify', str(public_path),
+                                   '-signature', str(signature_path)], input=message, capture_output=True)
+        self.assertEqual(verified.returncode, 0)
+        self.assertEqual(verified.stdout.strip(), b'Verified OK')
+        original_key = key
+        for key in (key, b'not-a-private-key', subprocess.run(
+                ['/usr/bin/openssl', 'genpkey', '-algorithm', 'EC', '-pkeyopt', 'ec_paramgen_curve:P-256'],
+                capture_output=True, check=True).stdout):
+            with mock.patch.object(draft.os, 'memfd_create', wraps=os.memfd_create) as create, \
+                    mock.patch.object(draft.os, 'close', wraps=os.close) as close:
+                if key != original_key:
+                    with self.assertRaises(draft.DraftError):
+                        draft.sign_rs256(key.decode(), message)
+                else:
+                    draft.sign_rs256(key.decode(), message)
+                # Capture the real descriptor without assuming subprocess's own fd count.
+                self.assertEqual(create.call_count, 1)
+                fd = close.call_args.args[0]  # signer's finally is the last close
+                close.assert_any_call(fd)
+                with self.assertRaises(OSError):
+                    os.fstat(fd)
+        with self.assertRaises(draft.DraftError):
+            draft.sign_rs256('invalid-SECRET', message)
+
+    def test_signer_uses_memory_fd_minimal_environment_and_safe_failure(self):
+        descriptors = []
+        # Keep the original function before patching the shared os module.
+        real_create = os.memfd_create
+        def memory_fd(*args):
+            fd = real_create(*args)
+            descriptors.append(fd)
+            return fd
+        key = 'fixture-private-key-SECRET'
+        def openssl(args, **kwargs):
+            self.assertEqual(args[0], '/usr/bin/openssl')
+            self.assertNotIn(key, ' '.join(args))
+            fd = descriptors[-1]
+            self.assertEqual(kwargs['pass_fds'], (fd,))
+            self.assertEqual(os.read(fd, 4096), key.encode())
+            self.assertEqual(kwargs['input'], b'unsigned-jwt')
+            self.assertEqual(kwargs['env'], {'PATH': '/usr/bin:/bin'})
+            self.assertEqual(kwargs['stderr'], subprocess.DEVNULL)
+            self.assertEqual(kwargs['timeout'], 30)
+            raise subprocess.TimeoutExpired(args, 30, stderr=b'private-key-SECRET')
+        with mock.patch.object(draft.os, 'memfd_create', side_effect=memory_fd), \
+                mock.patch.object(draft.subprocess, 'run', side_effect=openssl):
+            with self.assertRaises(draft.DraftError) as ctx:
+                draft.sign_rs256(key, b'unsigned-jwt')
+        self.assertNotIn('SECRET', str(ctx.exception))
+        with self.assertRaises(OSError):
+            os.fstat(descriptors[0])
 
     def test_invalid_versions(self):
         for version in ('01.2.1', '1.2', '1.2.3.4', '1.2.65536', '1.2.3-beta', '0.0.0', '1.2.-1', '１.2.3'):
@@ -200,7 +343,7 @@ class DraftTests(unittest.TestCase):
                 self.run_upload(polls=count)
 
     def test_config_and_network_errors_are_sanitized(self):
-        for key in self.env:
+        for key in ('CWS_PUBLISHER_ID', 'CWS_EXTENSION_ID'):
             env = self.env.copy()
             env[key] = ''
             with self.subTest(key=key), self.assertRaises(draft.DraftError):
