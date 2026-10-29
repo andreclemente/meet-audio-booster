@@ -6,7 +6,8 @@ function sanitize(value) {
   if (!value || typeof value !== 'object') return defaults()
   return {
     gains: value.gains && typeof value.gains === 'object' ? value.gains : {},
-    position: value.position && typeof value.position === 'object' ? value.position : null,
+    position: value.position && Number.isFinite(value.position.left) && Number.isFinite(value.position.top)
+      ? { left: value.position.left, top: value.position.top } : null,
     collapsed: value.collapsed === true
   }
 }

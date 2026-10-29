@@ -8,7 +8,7 @@ const root = path.resolve(import.meta.dirname, '..')
 test('production entry does not import the legacy root bundle', async () => {
   const source = await readFile(path.join(root, 'src/main.js'), 'utf8')
   assert.doesNotMatch(source, /(?:from\s*|import\s*)['"]\.\.\/audio-booster\.js['"]/)
-  for (const modulePath of ['./storage.js', './ui/panel.js', './platforms/google-meet/index.js', './platforms/jitsi/index.js']) {
+  for (const modulePath of ['./storage.js', './ui/panel.js', './platforms/google-meet/index.js']) {
     assert.match(source, new RegExp(modulePath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')))
   }
 })
@@ -22,7 +22,7 @@ test('generated root and dist bundles are identical modular boot artifacts', asy
   assert.match(distBundle, /modular-v1/)
   assert.match(distBundle, /__meetingAudioBoosterShow/)
   assert.match(distBundle, /createGoogleMeetController/)
-  assert.match(distBundle, /createJitsiController/)
+  assert.doesNotMatch(distBundle, /jitsi|jit\.si/i)
   assert.doesNotMatch(distBundle, /compatibility source/)
 })
 
