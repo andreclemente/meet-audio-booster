@@ -128,6 +128,7 @@
       status: "Starting…",
       audioUnavailable: false,
       closed: false,
+      panelCollapsed: false,
       panel: null,
       renderTimer: null,
       sharedCtx: null,
@@ -1475,7 +1476,7 @@
       const header = document.createElement("div");
       Object.assign(header.style, headerStyles);
       const titleWrap = document.createElement("div");
-      titleWrap.style.minWidth = "0";
+      Object.assign(titleWrap.style, { minWidth: "0", flex: "1 1 auto" });
       const title = document.createElement("div");
       title.textContent = state.platform === "google-meet" ? "Google Meet Audio Booster" : "Jitsi Audio Booster";
       Object.assign(title.style, { fontWeight: "700", fontSize: "13px", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" });
@@ -1484,10 +1485,33 @@
       subtitle.textContent = state.platform === "google-meet" ? `${listItems.length} participant${listItems.length === 1 ? "" : "s"} · ${outputCount} ${state.google.mode === "media" ? "media stream" : "audio slot"}${outputCount === 1 ? "" : "s"}` : `${listItems.length} remote audio track${listItems.length === 1 ? "" : "s"}`;
       Object.assign(subtitle.style, { opacity: "0.68", fontSize: "11px", marginTop: "2px" });
       titleWrap.append(title, subtitle);
+      const body = document.createElement("div");
+      body.id = `${PANEL_ID}_body`;
+      const collapse = makeButton("", () => {
+        state.panelCollapsed = !state.panelCollapsed;
+        updateCollapsedUi();
+      });
+      collapse.type = "button";
+      collapse.setAttribute("aria-controls", body.id);
+      Object.assign(collapse.style, { width: "26px", height: "26px", padding: "0", fontSize: "16px", lineHeight: "16px", flex: "0 0 auto" });
+      function updateCollapsedUi() {
+        body.hidden = state.panelCollapsed;
+        body.style.display = state.panelCollapsed ? "none" : "block";
+        header.style.marginBottom = state.panelCollapsed ? "0" : headerStyles.marginBottom;
+        const label = state.panelCollapsed ? "Expand panel" : "Collapse panel";
+        collapse.textContent = state.panelCollapsed ? "+" : "−";
+        collapse.title = label;
+        collapse.setAttribute("aria-label", label);
+        collapse.setAttribute("aria-expanded", String(!state.panelCollapsed));
+      }
+      updateCollapsedUi();
       const close = makeButton("×", hide);
       Object.assign(close.style, { width: "26px", height: "26px", padding: "0", fontSize: "16px", lineHeight: "16px", flex: "0 0 auto" });
-      header.append(titleWrap, close);
-      panel.append(header);
+      const controls = document.createElement("div");
+      Object.assign(controls.style, { display: "flex", gap: "4px", flex: "0 0 56px" });
+      controls.append(collapse, close);
+      header.append(titleWrap, controls);
+      panel.append(header, body);
       makeDraggable(panel, header, onSave);
       const list = document.createElement("div");
       Object.assign(list.style, { maxHeight: "310px", overflowY: "auto", paddingRight: "4px" });
@@ -1498,19 +1522,19 @@
         list.append(empty);
       }
       for (const participant of listItems) list.append(renderParticipantRow(participant, onGain));
-      panel.append(list);
+      body.append(list);
       const footer = document.createElement("div");
       Object.assign(footer.style, { display: "flex", justifyContent: "flex-end", alignItems: "center", gap: "6px", marginTop: "9px", paddingTop: "8px", borderTop: "1px solid #3c4043" });
       footer.append(makeButton("Reset all", () => {
         for (const participant of listItems) onGain(participant, 1);
         render();
       }));
-      panel.append(footer);
+      body.append(footer);
       const status = document.createElement("div");
       status.id = `${PANEL_ID}_status`;
       status.textContent = state.status;
       Object.assign(status.style, { minHeight: "14px", marginTop: "7px", color: "#bdc1c6", fontSize: "11px", lineHeight: "14px" });
-      panel.append(status);
+      body.append(status);
       state.panel = panel;
       updateLiveUi();
     }

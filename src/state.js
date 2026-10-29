@@ -9,6 +9,7 @@ export function createState(storage = globalThis.localStorage) {
     status: 'Starting…',
     audioUnavailable: false,
     closed: false,
+    panelCollapsed: false,
     panel: null,
     renderTimer: null,
     sharedCtx: null,

@@ -7,6 +7,7 @@ Per-participant playback volume controls for Google Meet and Jitsi Meet. Prefere
 - Per-participant 0–600% controls, mute, and presets
 - Compatible storage under `__meeting_audio_booster_v15`, including panel position
 - Draggable panel that can be restored with the extension toolbar button
+- Collapse button immediately left of × hides the participant controls, reset footer, and status while keeping the header visible. Collapse state lasts only for the current page session (including toolbar hide/show); reloading starts expanded.
 - Google Meet MAIN-world AudioWorklet interception (including Brave's pooled nodes) and Chromium media-element replay fallback
 - Jitsi remote WebRTC track replay with an independent gain node per track
 - JSON-serializable diagnostics from `window.__meetingAudioBoosterDebug()`
