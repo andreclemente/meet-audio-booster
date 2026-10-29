@@ -30,12 +30,15 @@ export function renderParticipantRow(participant, onGain) {
   const slider = document.createElement('input')
   Object.assign(slider, { type: 'range', min: '0', max: '6', step: '0.05', value: String(participant.value) })
   slider.dataset.role = 'slider'
+  slider.setAttribute('aria-label', `Volume for ${participant.name}`)
   Object.assign(slider.style, { width: '100%', margin: '0' })
   slider.oninput = () => { const next = Number(slider.value); onGain(participant, next); value.textContent = `${Math.round(next * 100)}%` }
   const presets = document.createElement('div')
   Object.assign(presets.style, { display: 'flex', gap: '5px', marginTop: '7px', flexWrap: 'wrap' })
   for (const [text, gain] of [['Mute', 0], ['50%', 0.5], ['100%', 1], ['250%', 2.5]]) {
-    presets.append(makeButton(text, () => { slider.value = String(gain); onGain(participant, gain); value.textContent = `${Math.round(gain * 100)}%` }))
+    const button = makeButton(text, () => { slider.value = String(gain); onGain(participant, gain); value.textContent = `${Math.round(gain * 100)}%` })
+    button.setAttribute('aria-label', `${text} for ${participant.name}`)
+    presets.append(button)
   }
   row.append(top, slider, presets)
   return row

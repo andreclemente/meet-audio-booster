@@ -2,13 +2,12 @@ import { createState, visibleParticipants } from './state.js'
 import { saveSettings, setParticipantGain } from './storage.js'
 import { detectPlatform } from './platforms/google-meet/platform.js'
 import { createGoogleMeetController } from './platforms/google-meet/index.js'
-import { createJitsiController } from './platforms/jitsi/index.js'
 import { createPanelController } from './ui/panel.js'
 import { installDebugApi } from './shared/debug.js'
 import { PANEL_ID } from './shared/constants.js'
 import { createAudioContext } from './shared/audio.js'
 
-if (!globalThis.__meetingAudioBoosterInstalled) {
+if (detectPlatform() === 'google-meet' && !globalThis.__meetingAudioBoosterInstalled) {
   globalThis.__meetingAudioBoosterInstalled = true
   const state = createState()
   let platformController = null
@@ -52,7 +51,7 @@ if (!globalThis.__meetingAudioBoosterInstalled) {
   // modular entry without exposing mutable implementation internals.
   Object.defineProperty(globalThis, '__meetingAudioBoosterModules', {
     configurable: true,
-    value: Object.freeze({ bootApi: 'modular-v1', platforms: Object.freeze(['google-meet', 'jitsi']), storageKey: '__meeting_audio_booster_v15' })
+    value: Object.freeze({ bootApi: 'modular-v1', platforms: Object.freeze(['google-meet']), storageKey: '__meeting_audio_booster_v15' })
   })
 
   function boot() {
@@ -61,9 +60,7 @@ if (!globalThis.__meetingAudioBoosterInstalled) {
     const context = getContext()
     state.audioUnavailable = !context
     const common = { state, context, setStatus, renderSoon, updateLiveUi: panel.updateLiveUi }
-    platformController = state.platform === 'google-meet'
-      ? createGoogleMeetController(common)
-      : createJitsiController(common)
+    platformController = createGoogleMeetController(common)
     platformController.start()
     if (!context) setStatus('Audio unavailable · controls are inactive')
     panel.render()

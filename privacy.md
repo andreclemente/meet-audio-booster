@@ -6,7 +6,7 @@ Meet Audio Booster does not collect, transmit, sell, or store personal informati
 
 ## What the extension does
 
-The extension runs only on `https://meet.google.com/*` and `https://meet.jit.si/*`. It reads the meeting page's participant and audio state to provide local per-participant playback volume controls. It does not support arbitrary or self-hosted meeting sites.
+The extension runs only on `https://meet.google.com/*`. It reads the meeting page's participant and audio state to provide local per-participant playback volume controls. It does not support arbitrary or self-hosted meeting sites.
 
 ## Local data
 
@@ -27,6 +27,10 @@ Meet Audio Booster:
 - Does not share information with third parties
 - Does not load remote code
 
+## Optional external support
+
+The optional Support development link opens `https://buymeacoffee.com/andreclemente` in a new tab only when clicked. No support widget, background request, or remote code is loaded by this link before a click. The URL includes no participant or meeting data; the link uses `noopener noreferrer` and `referrerPolicy="no-referrer"`. Once opened, Buy Me a Coffee handles the visit under its own privacy policy and terms. All extension features remain free, and local settings remain in your browser.
+
 ## Permissions
 
-Access to Google Meet and `meet.jit.si` lets the extension discover remote participants and adjust local audio playback. The `scripting` permission lets the toolbar action call the already-installed MAIN-world panel show API. No other host permissions are requested.
+Access to Google Meet lets the extension discover remote participants and adjust local audio playback. The `scripting` permission lets the toolbar action call the already-installed MAIN-world panel show API. No other host permissions are requested.

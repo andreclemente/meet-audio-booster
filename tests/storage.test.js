@@ -54,7 +54,7 @@ test('collapsed preference roundtrips booleans and fresh state loads settings on
     assert.equal(reads, 1)
     assert.deepEqual(state.settings, settings)
     assert.equal(state.panelCollapsed, collapsed)
-    setParticipantGain(state.settings, { platform: 'jitsi', participantId: 'p1' }, 2.5)
+    setParticipantGain(state.settings, { platform: 'google-meet', participantId: 'p1' }, 2.5)
     state.settings.position = { left: 30, top: 40 }
     saveSettings(storage, state.settings)
     assert.equal(loadSettings(storage).collapsed, collapsed)
