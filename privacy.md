@@ -1,6 +1,6 @@
 # Privacy Policy
 
-Last updated: 2026-07-22
+Last updated: 2026-10-29
 
 Meet Audio Booster does not collect, transmit, sell, or store personal information outside your browser.
 
@@ -14,6 +14,7 @@ The following preferences are stored in browser `localStorage`:
 
 - Per-participant volume preferences
 - Floating panel position
+- Whether the panel is collapsed or expanded
 
 Participant names or platform IDs may form local preference keys. This information remains on your computer and can be removed by clearing site data or uninstalling the extension.
 
