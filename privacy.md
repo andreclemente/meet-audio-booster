@@ -16,7 +16,7 @@ The following preferences are stored in browser `localStorage`:
 - Floating panel position
 - Whether the panel is collapsed or expanded
 
-Participant names or platform IDs may form local preference keys. This information remains on your computer and can be removed by clearing site data or uninstalling the extension.
+Participant names or platform IDs may form local preference keys. This information remains in your browser's site storage. Clear site data for the supported meeting sites to remove it; uninstalling the extension does not necessarily clear site storage.
 
 ## Data collection
 
