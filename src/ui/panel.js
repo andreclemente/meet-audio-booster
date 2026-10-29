@@ -2,7 +2,7 @@ import { PANEL_ID } from '../shared/constants.js'
 import { panelStyles, headerStyles } from './styles.js'
 import { makeButton, renderParticipantRow } from './participant-row.js'
 
-export function createPanelController(state, { participants, onGain, onSave }) {
+export function createPanelController(state, { participants, onGain, onSave, onCollapse }) {
   function updateLiveUi() {
     if (!state.panel?.isConnected) return
     for (const participant of participants()) {
@@ -48,6 +48,7 @@ export function createPanelController(state, { participants, onGain, onSave }) {
     const collapse = makeButton('', () => {
       state.panelCollapsed = !state.panelCollapsed
       updateCollapsedUi()
+      onCollapse?.(state.panelCollapsed)
     })
     collapse.type = 'button'
     collapse.setAttribute('aria-controls', body.id)

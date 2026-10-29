@@ -93,3 +93,46 @@ test('moving an owned element restores it before the new pipeline records origin
   assert.equal(moving.volume, 0.7)
   manager.destroy()
 })
+
+for (const keepDuplicate of [false, true]) for (const multiplier of [0, 2.5]) {
+  test(`reattached media element rejoins a live pipeline (duplicate retained: ${keepDuplicate}, gain: ${multiplier})`, () => {
+    const { context, audio } = fixture()
+    audio.isConnected = true
+    const duplicate = { srcObject: audio.srcObject, muted: false, volume: 0.6, isConnected: true }
+    let elements = keepDuplicate ? [audio, duplicate] : [audio]
+    const root = { querySelectorAll: () => elements }
+    const manager = createMediaPipelineManager(context)
+    manager.scan(root)
+    const original = manager.pipelines[0]
+    original.set(multiplier, true)
+    assert.equal(audio.muted, true)
+
+    for (let cycle = 0; cycle < 2; cycle++) {
+      audio.isConnected = false
+      elements = keepDuplicate ? [duplicate] : []
+      manager.scan(root)
+      assert.equal(audio.muted, false, 'detached element native mute must be restored')
+      assert.equal(audio.volume, 0.7, 'detached element native volume must be restored')
+      assert.equal(manager.pipelines.length, keepDuplicate ? 1 : 0)
+
+      audio.isConnected = true
+      elements = keepDuplicate ? [audio, duplicate] : [audio]
+      manager.scan(root)
+      assert.equal(manager.pipelines.length, 1, 'same live stream must be rediscovered')
+      const current = manager.pipelines[0]
+      assert.equal(current.elements.has(audio), true, 'reattached element must rejoin pipeline ownership')
+      if (keepDuplicate) assert.equal(current, original, 'duplicate stream must not create a second replay')
+      else assert.notEqual(current, original, 'removed replay graph must not be reused')
+      current.set(multiplier, true)
+      assert.equal(audio.muted, true, 'native playback must not bypass mute or double the boosted replay')
+      assert.equal(audio.volume, 0)
+      assert.equal(current.gain.gain.value, multiplier)
+    }
+
+    manager.destroy()
+    assert.equal(audio.muted, false)
+    assert.equal(audio.volume, 0.7)
+    assert.equal(duplicate.muted, false)
+    assert.equal(duplicate.volume, 0.6)
+  })
+}

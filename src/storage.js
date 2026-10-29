@@ -1,12 +1,13 @@
 import { LEGACY_STORAGE_KEYS, STORAGE_KEY } from './shared/constants.js'
 
-const defaults = () => ({ gains: {}, position: null })
+const defaults = () => ({ gains: {}, position: null, collapsed: false })
 
 function sanitize(value) {
   if (!value || typeof value !== 'object') return defaults()
   return {
     gains: value.gains && typeof value.gains === 'object' ? value.gains : {},
-    position: value.position && typeof value.position === 'object' ? value.position : null
+    position: value.position && typeof value.position === 'object' ? value.position : null,
+    collapsed: value.collapsed === true
   }
 }
 
