@@ -59,10 +59,4 @@ Meet's pooled AudioWorklet outputs are deliberately never permanently assigned t
 
 ## Privacy
 
-Only gain preferences and panel position are stored locally. See [privacy.md](privacy.md).
-
-## Maintenance
-
-Automated checks and weekly dependency proposals are described in
-[docs/maintenance.md](docs/maintenance.md). Passing CI does not replace a
-real-call check before releasing Meet/Jitsi compatibility changes.
+Volume preferences, panel position and the collapsed/expanded preference are stored locally. See [privacy.md](privacy.md).
