@@ -840,7 +840,10 @@
       }
       for (const pipeline of [...pipelines]) {
         for (const element of [...pipeline.elements]) {
-          if (!element.isConnected || mediaStreamKey(element.srcObject) !== pipeline.streamKey) pipeline.releaseElement(element);
+          if (!element.isConnected || mediaStreamKey(element.srcObject) !== pipeline.streamKey) {
+            pipeline.releaseElement(element);
+            byElement.delete(element);
+          }
         }
         const live = pipeline.tracks.some((track) => track.readyState !== "ended");
         if (!seen.has(pipeline.streamKey) || !pipeline.elements.size || !live) remove(pipeline);
@@ -848,6 +851,7 @@
       return pipelines;
     }
     function remove(pipeline) {
+      for (const element of pipeline.elements) byElement.delete(element);
       pipeline.destroy();
       pipelines = pipelines.filter((item) => item !== pipeline);
     }
