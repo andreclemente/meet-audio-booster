@@ -2,6 +2,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { createState } from '../src/state.js'
 import { createPanelController } from '../src/ui/panel.js'
+import { saveSettings } from '../src/storage.js'
 
 // Minimal DOM surface used by the production panel; no UI implementation is mocked.
 class Element {
@@ -42,15 +43,15 @@ function fixture(t) {
   state.platform = 'google-meet'
   const alice = { key: 'alice', name: 'Alice', platform: 'google-meet', value: 2.5 }
   const people = [alice]
-  const gains = [], saves = []
-  const controller = createPanelController(state, { participants: () => people, onGain: (person, value) => { gains.push([person.key, value]); person.value = value }, onSave: position => saves.push(position) })
+  const gains = [], saves = [], collapses = []
+  const controller = createPanelController(state, { participants: () => people, onGain: (person, value) => { gains.push([person.key, value]); person.value = value }, onSave: position => saves.push(position), onCollapse: value => collapses.push(value) })
   controller.render()
   const parts = () => {
     const [header, body] = state.panel.children
     const buttons = header.querySelectorAll('button')
     return { header, body, collapse: buttons[0], close: buttons[1] }
   }
-  return { state, controller, parts, document, events, gains, saves, people, alice }
+  return { state, controller, parts, document, events, gains, saves, collapses, people, alice }
 }
 
 function assertExpanded({ header, body, collapse }, expanded) {
@@ -80,8 +81,8 @@ test('panel starts expanded with collapse immediately left of close and one comp
   assertExpanded(parts(), true)
 })
 
-test('collapse toggles twice in place, preserves focus and never starts drag or gain/save callbacks', t => {
-  const { state, parts, document, events, gains, saves } = fixture(t)
+test('collapse toggles in place, preserves focus and only calls dedicated collapse callback', t => {
+  const { state, parts, document, events, gains, saves, collapses } = fixture(t)
   const original = parts()
   original.collapse.focus()
   original.header.onmousedown({ target: original.collapse, preventDefault() { assert.fail('button must not start drag') } })
@@ -101,6 +102,7 @@ test('collapse toggles twice in place, preserves focus and never starts drag or 
   assert.equal(parts().collapse, original.collapse)
   assert.deepEqual(gains, [])
   assert.deepEqual(saves, [])
+  assert.deepEqual(collapses, [true, false])
 })
 
 test('rerender, live updates and toolbar hide/show retain collapse; reset and close still work', t => {
@@ -132,4 +134,40 @@ test('rerender, live updates and toolbar hide/show retain collapse; reset and cl
   assert.equal(state.closed, true)
   assert.equal(state.panel.style.display, 'none')
   assert.equal(createState({ getItem: () => null }).panelCollapsed, false)
+})
+
+test('collapse callback is optional and storage failure cannot block immediate UI or focus', t => {
+  const { state, parts, people, document } = fixture(t)
+  for (const storage of [null, { setItem() { throw new Error('quota') } }]) {
+    const controller = createPanelController(state, {
+      participants: () => people, onGain() { assert.fail('no gain changes') }, onSave() { assert.fail('no position saves') },
+      onCollapse: collapsed => {
+        assertExpanded(parts(), !collapsed)
+        state.settings.collapsed = collapsed
+        assert.equal(saveSettings(storage, state.settings), false)
+      }
+    })
+    controller.render()
+    const original = parts()
+    original.collapse.focus()
+    original.collapse.click()
+    assert.equal(document.activeElement, original.collapse)
+    assert.equal(parts().body, original.body)
+    assert.equal(state.settings.collapsed, state.panelCollapsed)
+  }
+  const controller = createPanelController(state, { participants: () => people, onGain() {}, onSave() {} })
+  controller.render()
+  const before = state.panelCollapsed
+  parts().collapse.click()
+  assert.equal(state.panelCollapsed, !before)
+  assertExpanded(parts(), before)
+})
+
+test('only dragging calls position save, not collapse callback', t => {
+  const { parts, events, saves, collapses } = fixture(t)
+  parts().header.onmousedown({ target: parts().header, clientX: 10, clientY: 20, preventDefault() {} })
+  events.mousemove({ clientX: 40, clientY: 60 })
+  events.mouseup()
+  assert.deepEqual(saves, [{ left: 12, top: 72 }])
+  assert.deepEqual(collapses, [])
 })

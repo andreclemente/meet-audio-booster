@@ -38,6 +38,7 @@ if (!globalThis.__meetingAudioBoosterInstalled) {
   const panel = createPanelController(state, {
     participants: () => visibleParticipants(state),
     onGain: applyGain,
+    onCollapse: collapsed => { state.settings.collapsed = collapsed; saveSettings(globalThis.localStorage, state.settings) },
     onSave: position => { state.settings.position = position; saveSettings(globalThis.localStorage, state.settings) }
   })
 

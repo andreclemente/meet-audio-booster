@@ -10,12 +10,13 @@
   var ASSOCIATION_CONFIRMATIONS = 3;
 
   // src/storage.js
-  var defaults = () => ({ gains: {}, position: null });
+  var defaults = () => ({ gains: {}, position: null, collapsed: false });
   function sanitize(value) {
     if (!value || typeof value !== "object") return defaults();
     return {
       gains: value.gains && typeof value.gains === "object" ? value.gains : {},
-      position: value.position && typeof value.position === "object" ? value.position : null
+      position: value.position && typeof value.position === "object" ? value.position : null,
+      collapsed: value.collapsed === true
     };
   }
   function loadSettings(storage = globalThis.localStorage) {
@@ -121,14 +122,15 @@
 
   // src/state.js
   function createState(storage = globalThis.localStorage) {
+    const settings = loadSettings(storage);
     return {
       platform: null,
       participants: /* @__PURE__ */ new Map(),
-      settings: loadSettings(storage),
+      settings,
       status: "Starting…",
       audioUnavailable: false,
       closed: false,
-      panelCollapsed: false,
+      panelCollapsed: settings.collapsed,
       panel: null,
       renderTimer: null,
       sharedCtx: null,
@@ -1445,7 +1447,7 @@
   }
 
   // src/ui/panel.js
-  function createPanelController(state, { participants, onGain, onSave }) {
+  function createPanelController(state, { participants, onGain, onSave, onCollapse }) {
     function updateLiveUi() {
       if (!state.panel?.isConnected) return;
       for (const participant of participants()) {
@@ -1494,6 +1496,7 @@
       const collapse = makeButton("", () => {
         state.panelCollapsed = !state.panelCollapsed;
         updateCollapsedUi();
+        onCollapse?.(state.panelCollapsed);
       });
       collapse.type = "button";
       collapse.setAttribute("aria-controls", body.id);
@@ -1694,6 +1697,10 @@
     const panel = createPanelController(state, {
       participants: () => visibleParticipants(state),
       onGain: applyGain,
+      onCollapse: (collapsed) => {
+        state.settings.collapsed = collapsed;
+        saveSettings(globalThis.localStorage, state.settings);
+      },
       onSave: (position) => {
         state.settings.position = position;
         saveSettings(globalThis.localStorage, state.settings);

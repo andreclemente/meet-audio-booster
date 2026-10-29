@@ -2,14 +2,15 @@ import { loadSettings, getParticipantGain } from './storage.js'
 import { createRoutingState } from './platforms/google-meet/router.js'
 
 export function createState(storage = globalThis.localStorage) {
+  const settings = loadSettings(storage)
   return {
     platform: null,
     participants: new Map(),
-    settings: loadSettings(storage),
+    settings,
     status: 'Starting…',
     audioUnavailable: false,
     closed: false,
-    panelCollapsed: false,
+    panelCollapsed: settings.collapsed,
     panel: null,
     renderTimer: null,
     sharedCtx: null,
