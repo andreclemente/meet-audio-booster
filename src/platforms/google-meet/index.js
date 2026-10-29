@@ -115,6 +115,7 @@ export function createGoogleMeetController({ state, context, setStatus, renderSo
   const alignmentTracker = createFreshAlignmentTracker()
   const media = createMediaPipelineManager(context)
   const workletSpeakerTracker = createWorkletSpeakerTracker()
+  const selfIds = new Set()
   let restoreHook, restoreCaptureHook, observer, mutationTimer, reconcileTimer, mediaTimer, routingTimer, visibilityHandler, slotCounter = 0
   let capturePresentationActive = false
   let domPresentationActive = false
@@ -178,7 +179,7 @@ export function createGoogleMeetController({ state, context, setStatus, renderSo
     const now = Date.now()
     syncPresentationState()
     const found = new Set()
-    for (const data of scanMeetParticipants()) {
+    for (const data of scanMeetParticipants(document, selfIds)) {
       found.add(data.key)
       upsertParticipant(state, {
         ...data, platform: 'google-meet', present: true, lastSeenAt: now,
@@ -188,7 +189,23 @@ export function createGoogleMeetController({ state, context, setStatus, renderSo
     for (const participant of state.participants.values()) {
       if (participant.platform !== 'google-meet' || found.has(participant.key)) continue
       participant.speaking = false
-      if (now - participant.lastSeenAt > 8000) participant.present = false
+      // Verified self is not a temporarily missing remote: remove it now.
+      if (selfIds.has(participant.participantId) || now - participant.lastSeenAt > 8000) participant.present = false
+    }
+    const isSelfKey = key => selfIds.has(state.participants.get(key)?.participantId)
+    if ([state.google.activeParticipantKey, state.google.appliedParticipantKey,
+      state.google.transitionGuard.candidateParticipantKey, state.google.routing?.appliedParticipantKey,
+      state.google.routing?.lastConfirmedParticipantKey, state.google.routing?.candidateParticipantKey].some(isSelfKey)) {
+      // Invalidate only routing that referenced the newly verified local ID.
+      // In particular, silence must not keep the worklet's former self latched.
+      workletSpeakerTracker.reset()
+      state.google.routing = createRoutingState()
+      state.google.activeParticipantKey = null
+      state.google.appliedParticipantKey = null
+      state.google.routingState = 'idle'
+      state.google.transitionGuard.candidateParticipantKey = null
+      state.google.transitionGuard.candidateSince = 0
+      setOutputs(1, true)
     }
     const signature = participants().map(item => `${item.key}:${item.name}`).join('|')
     if (signature !== state.google.rosterSignature) { state.google.rosterSignature = signature; renderSoon() }
@@ -320,6 +337,8 @@ export function createGoogleMeetController({ state, context, setStatus, renderSo
     for (const slot of state.google.slots) slot.destroy()
     state.google.slots = []
     media.destroy()
+    selfIds.clear()
+    workletSpeakerTracker.reset()
   }
   function applyParticipantGain(participant) {
     if (syncPresentationState() && state.google.mode === 'media') return

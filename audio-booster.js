@@ -282,10 +282,45 @@
   function hasLocalPresentation(root = document) {
     return [...root.querySelectorAll?.("[data-participant-id]") || []].some(isLocalPresentationRoot);
   }
+  var BUTTON_SELECTOR = 'button, [role="button"]';
+  var MATERIAL_ICON_SELECTOR = [
+    ...[
+      "google-symbols",
+      "material-icons",
+      "material-icons-outlined",
+      "material-icons-round",
+      "material-icons-sharp",
+      "material-icons-two-tone",
+      "material-symbols-outlined",
+      "material-symbols-rounded",
+      "material-symbols-sharp"
+    ].flatMap((className) => [`i.${className}`, `span.${className}`])
+  ].join(", ");
+  function hasOwnSelfControls(root) {
+    const icons = /* @__PURE__ */ new Set();
+    for (const button of root?.querySelectorAll?.(BUTTON_SELECTOR) || []) {
+      if (button.closest?.("[data-participant-id]") !== root) continue;
+      for (const icon of button.querySelectorAll?.(MATERIAL_ICON_SELECTOR) || []) {
+        if (icon.closest?.("[data-participant-id]") !== root || icon.closest?.(BUTTON_SELECTOR) !== button) continue;
+        icons.add((icon.textContent || "").trim());
+      }
+    }
+    return icons.has("frame_person") && icons.has("visual_effects");
+  }
+  function ownParticipantText(root) {
+    if (!root?.childNodes) return root?.innerText || root?.textContent || "";
+    function read(node) {
+      if (node !== root && node.hasAttribute?.("data-participant-id")) return "";
+      if (node.nodeType === 3) return node.textContent || "";
+      return [...node.childNodes || []].map(read).join(" ");
+    }
+    return read(root);
+  }
   function isSelfParticipant(root) {
-    const text = root?.innerText || root?.textContent || "";
+    if (hasOwnSelfControls(root)) return true;
+    const text = ownParticipantText(root);
     if (/(^|\s)\(you\)(?=\s|$)/i.test(text)) return true;
-    const labels = [...root?.querySelectorAll?.("[aria-label]") || []].map((element) => element.getAttribute("aria-label") || "");
+    const labels = [...root?.querySelectorAll?.("[aria-label]") || []].filter((element) => !element.closest || element.closest("[data-participant-id]") === root).map((element) => element.getAttribute("aria-label") || "");
     if (labels.some((label) => /^(Reframe|Backgrounds and effects)$/i.test(label))) return true;
     return labels.some((label) => /^your\b|\byou are\b|\byou\s+\(/i.test(label) || /^(mute|unmute|turn (?:on|off)) your (?:microphone|camera)$/i.test(label));
   }
@@ -304,17 +339,19 @@
   function scoreRoot(element) {
     return Math.min((element.innerText || "").length, 500) + Math.min(element.querySelectorAll?.("*").length || 0, 500);
   }
-  function scanMeetParticipants(root = document) {
+  function scanMeetParticipants(root = document, selfIds = /* @__PURE__ */ new Set()) {
     const roots = /* @__PURE__ */ new Map();
     for (const element of root.querySelectorAll?.("[data-participant-id]") || []) {
       const participantId = element.getAttribute("data-participant-id");
-      if (!participantId || !isRecognizedParticipantRoot(element) || isLocalPresentationRoot(element)) continue;
+      if (!participantId) continue;
+      if (isSelfParticipant(element)) selfIds.add(participantId);
+      if (!isRecognizedParticipantRoot(element) || isLocalPresentationRoot(element)) continue;
       const current = roots.get(participantId);
       if (!current || scoreRoot(element) > scoreRoot(current)) roots.set(participantId, element);
     }
     const found = [];
     for (const [participantId, element] of roots) {
-      if (isSelfParticipant(element)) continue;
+      if (selfIds.has(participantId)) continue;
       const name = extractGoogleName(element);
       if (!name) continue;
       found.push({ key: `id:${participantId}`, participantId, name, element, speaking: isGoogleParticipantSpeaking(element) });
@@ -956,6 +993,7 @@
     const alignmentTracker = createFreshAlignmentTracker();
     const media = createMediaPipelineManager(context);
     const workletSpeakerTracker = createWorkletSpeakerTracker();
+    const selfIds = /* @__PURE__ */ new Set();
     let restoreHook, restoreCaptureHook, observer, mutationTimer, reconcileTimer, mediaTimer, routingTimer, visibilityHandler, slotCounter = 0;
     let capturePresentationActive = false;
     let domPresentationActive = false;
@@ -1020,7 +1058,7 @@
       const now = Date.now();
       syncPresentationState();
       const found = /* @__PURE__ */ new Set();
-      for (const data of scanMeetParticipants()) {
+      for (const data of scanMeetParticipants(document, selfIds)) {
         found.add(data.key);
         upsertParticipant(state, {
           ...data,
@@ -1033,7 +1071,25 @@
       for (const participant of state.participants.values()) {
         if (participant.platform !== "google-meet" || found.has(participant.key)) continue;
         participant.speaking = false;
-        if (now - participant.lastSeenAt > 8e3) participant.present = false;
+        if (selfIds.has(participant.participantId) || now - participant.lastSeenAt > 8e3) participant.present = false;
+      }
+      const isSelfKey = (key) => selfIds.has(state.participants.get(key)?.participantId);
+      if ([
+        state.google.activeParticipantKey,
+        state.google.appliedParticipantKey,
+        state.google.transitionGuard.candidateParticipantKey,
+        state.google.routing?.appliedParticipantKey,
+        state.google.routing?.lastConfirmedParticipantKey,
+        state.google.routing?.candidateParticipantKey
+      ].some(isSelfKey)) {
+        workletSpeakerTracker.reset();
+        state.google.routing = createRoutingState();
+        state.google.activeParticipantKey = null;
+        state.google.appliedParticipantKey = null;
+        state.google.routingState = "idle";
+        state.google.transitionGuard.candidateParticipantKey = null;
+        state.google.transitionGuard.candidateSince = 0;
+        setOutputs(1, true);
       }
       const signature = participants().map((item) => `${item.key}:${item.name}`).join("|");
       if (signature !== state.google.rosterSignature) {
@@ -1171,6 +1227,8 @@
       for (const slot of state.google.slots) slot.destroy();
       state.google.slots = [];
       media.destroy();
+      selfIds.clear();
+      workletSpeakerTracker.reset();
     }
     function applyParticipantGain(participant) {
       if (syncPresentationState() && state.google.mode === "media") return;
