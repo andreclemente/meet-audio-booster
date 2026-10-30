@@ -1,6 +1,6 @@
 import { scanMeetParticipants, observeMeetParticipants, isGoogleParticipantSpeaking, hasLocalPresentation } from './participants.js'
 import { createAssociationLearner, createFreshAlignmentTracker } from './association.js'
-import { createRoutingState, routeGoogleAudio } from './router.js'
+import { createRoutingState, routeGoogleAudio, isQuietMediaTransition } from './router.js'
 import { installLocalPresentationCaptureHook } from './presentation.js'
 import { installAudioWorkletHook, createPooledSlot } from './audio-worklet.js'
 import { createMediaPipelineManager } from './media-elements.js'
@@ -96,14 +96,18 @@ export function createWorkletSpeakerTracker({ confirmMs = 50 } = {}) {
 export function applyMediaPipelineOutputs(pipelines, routing, multiplier, immediate = false) {
   const selectedId = routing?.routingState === 'confirmed-speaker' ? routing.appliedPipelineId : null
   const selectedKey = routing?.appliedParticipantKey
+  const quiet = isQuietMediaTransition(pipelines, routing)
   for (const pipeline of pipelines) {
     const selected = pipeline.id === selectedId && pipeline.associationReliable && pipeline.participantKey === selectedKey
-    pipeline.set(selected ? multiplier : 1, immediate)
+    const quietOwner = quiet && routing.quietIdentity.pipeline === pipeline
+    pipeline.set(selected ? multiplier : 1, immediate || (!selected && !quietOwner) || !pipeline.connected)
   }
 }
 
 export function activateMediaModePipelines(pipelines, routing) {
-  applyMediaPipelineOutputs(pipelines, routing, routing?.multiplier ?? 1, true)
+  // Validate against the whole pool: a newly active second stream must cancel
+  // a quiet fade even if this scan runs before the next routing tick.
+  applyMediaPipelineOutputs(pipelines, routing, routing?.multiplier ?? 1)
 }
 
 export function resolveLocalPresentationActive({ captureActive, domActive, captureLifecycleSeen }) {
@@ -247,14 +251,13 @@ export function createGoogleMeetController({ state, context, setStatus, renderSo
       : speakers.length > 1 ? 'Overlapping speakers · using safe 100% volume'
       : hidden ? 'Meet tab hidden · using safe 100% volume'
       : active ? `${active.name} · automatic routing` : `${participants().length} participants ready`
-    const changed = routing.appliedParticipantKey !== state.google.appliedParticipantKey ||
-      routing.routingState !== state.google.routingState
+
     state.google.activeParticipantKey = routing.activeParticipantKey
     state.google.appliedParticipantKey = routing.appliedParticipantKey
     state.google.routingState = routing.routingState
     state.google.transitionGuard.candidateParticipantKey = routing.candidateParticipantKey
     state.google.transitionGuard.candidateSince = routing.candidateSince
-    setOutputs(routing.multiplier, changed || routing.multiplier === 1)
+    setOutputs(routing.multiplier, routing.routingState !== 'confirmed-speaker')
     setStatus(status)
   }
   function routeMedia(now, speakers) {
@@ -346,7 +349,7 @@ export function createGoogleMeetController({ state, context, setStatus, renderSo
     // Pooled worklets expose no stable per-participant energy identity. Keep
     // the confirmed speaker latched through missing UI markers; concrete
     // speaker changes, overlap, presentation, and hidden tabs neutralize it.
-    if (state.google.activeParticipantKey === participant.key) setOutputs(participant.value, true)
+    if (state.google.activeParticipantKey === participant.key) setOutputs(participant.value)
   }
   return { start, stop, route, applyParticipantGain, setOutputs, get pipelines() { return media.pipelines } }
 }

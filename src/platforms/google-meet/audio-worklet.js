@@ -95,7 +95,7 @@ export function installAudioWorkletHook(onSlot, onRemove = () => {}) {
     for (const mapping of [...mappings]) {
       // The direct route is connected before the owned route is removed. Make
       // that synchronous overlap neutral even if the slot was boosted.
-      try { writeAudioParam(mapping.booster.gain, 1) } catch {}
+      try { writeAudioParam(mapping.booster.gain, 1, { context: mapping.booster.context }) } catch {}
       let restored = false
       try {
         originalConnect.apply(mapping.source, mapping.originalArgs)
@@ -116,6 +116,7 @@ export function installAudioWorkletHook(onSlot, onRemove = () => {}) {
 
 export function createPooledSlot(gain, id) {
   const baseGain = readAudioParam(gain.gain)
+  let neutralized = true
   return {
     id,
     gain,
@@ -125,17 +126,19 @@ export function createPooledSlot(gain, id) {
     targetValue: baseGain,
     participantKey: null,
     get actualValue() { return readAudioParam(gain.gain) },
-    set(multiplier) {
+    set(multiplier, immediate = false) {
       const safe = Number.isFinite(multiplier) ? Math.max(0, multiplier) : 1
-      if (safe === this.appliedMultiplier) return
-      writeAudioParam(gain.gain, safe)
+      if (safe === this.appliedMultiplier && !immediate) return
+      writeAudioParam(gain.gain, safe, { context: gain.context, immediate })
+      neutralized = immediate && safe === 1
       this.appliedMultiplier = safe
       this.targetValue = safe
       this.participantKey = null
     },
     release() {
-      if (this.appliedMultiplier === 1) return
-      writeAudioParam(gain.gain, 1)
+      if (neutralized) return
+      writeAudioParam(gain.gain, 1, { context: gain.context })
+      neutralized = true
       this.appliedMultiplier = 1
       this.targetValue = 1
       this.participantKey = null

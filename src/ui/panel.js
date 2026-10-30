@@ -47,11 +47,13 @@ export function createPanelController(state, { participants, onGain, onSave, onC
     titleWrap.append(title, subtitle)
     const body = document.createElement('div')
     body.id = `${PANEL_ID}_body`
-    const collapse = makeButton('', () => {
+    function toggleCollapsed() {
       state.panelCollapsed = !state.panelCollapsed
       updateCollapsedUi()
       onCollapse?.(state.panelCollapsed)
-    })
+    }
+    title.ondblclick = toggleCollapsed
+    const collapse = makeButton('', toggleCollapsed)
     collapse.type = 'button'
     collapse.setAttribute('aria-controls', body.id)
     Object.assign(collapse.style, { width: '26px', height: '26px', padding: '0', fontSize: '16px', lineHeight: '16px', flex: '0 0 auto' })
