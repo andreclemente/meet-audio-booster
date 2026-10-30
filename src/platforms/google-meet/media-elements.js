@@ -41,6 +41,9 @@ export function createMediaElementPipeline(context, audio, id) {
       return true
     },
     deactivate() {
+      writeAudioParam(gain.gain, 1, { context })
+      this.appliedMultiplier = 1
+      this.targetValue = 1
       if (this.connected) { try { gain.disconnect() } catch {}; this.connected = false }
       for (const [element, original] of this.originalStates) {
         element.muted = original.muted
@@ -61,7 +64,9 @@ export function createMediaElementPipeline(context, audio, id) {
       const safe = Number.isFinite(multiplier) ? Math.max(0, multiplier) : 1
       this.appliedMultiplier = safe
       this.targetValue = safe
-      if ((this.connected || immediate) && this.activate()) writeAudioParam(gain.gain, safe)
+      // Activation is immediate, but a normal selected gain is still ramped.
+      // Repeated scans/route ticks must not restart or snap that ramp.
+      if ((this.connected || immediate) && this.activate()) writeAudioParam(gain.gain, safe, { context, immediate: immediate && safe === 1 })
     },
     destroy() {
       this.deactivate()

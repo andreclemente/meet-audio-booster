@@ -85,8 +85,18 @@
       appliedPipelineId: null,
       candidateParticipantKey: candidate,
       candidateSince: candidate === state.candidateParticipantKey ? state.candidateSince : now,
-      multiplier: 1
+      multiplier: 1,
+      confirmedIdentity: null,
+      quietIdentity: null
     };
+  }
+  function isQuietMediaTransition(pipelines, routing) {
+    const identity = routing?.quietIdentity;
+    if (!identity || routing.routingState !== "energy-idle") return false;
+    const { pipeline, streamKey, stream, participant, participantKey } = identity;
+    if (!stream || !pipeline.tracks?.length || !pipeline.elements?.size) return false;
+    const currentTracks = stream.getAudioTracks?.() || [];
+    return pipelines.includes(pipeline) && !pipelines.some((item) => item.activeByEnergy) && pipeline.streamKey === streamKey && pipeline.stream === stream && pipeline.associationReliable && pipeline.participantKey === participantKey && participant.present !== false && pipeline.tracks.every((track) => track.readyState === "live") && [...pipeline.elements].every((element) => element.isConnected !== false && element.srcObject === stream) && currentTracks.length === pipeline.tracks.length && pipeline.tracks.every((track) => currentTracks.includes(track));
   }
   function routeGoogleAudio(previous = createRoutingState(), observation = {}) {
     const now = observation.now ?? Date.now();
@@ -95,7 +105,12 @@
     const active = (observation.pipelines || []).filter((pipeline2) => pipeline2.activeByEnergy);
     if (active.length > 1) return neutral(previous, "multiple-active-streams", null, now);
     if (ui.length > 1) return neutral(previous, "ambiguous", null, now);
-    if (!active.length) return neutral(previous, ui.length ? "stale-ui-speaker" : "idle", null, now);
+    if (!active.length) {
+      const identity = previous.routingState === "confirmed-speaker" ? previous.confirmedIdentity : previous.quietIdentity;
+      const quiet = { ...neutral(previous, "energy-idle", null, now), quietIdentity: identity };
+      if (identity && participants[identity.participantKey] === identity.participant && (!ui.length || ui[0] === identity.participantKey) && isQuietMediaTransition(observation.pipelines || [], quiet)) return quiet;
+      return neutral(previous, ui.length ? "stale-ui-speaker" : "idle", null, now);
+    }
     const pipeline = active[0];
     const energyKey = pipeline.associationReliable ? pipeline.participantKey : null;
     if (!energyKey) return neutral(previous, "no-reliable-association", null, now);
@@ -116,6 +131,8 @@
       lastConfirmedParticipantKey: energyKey,
       candidateParticipantKey: null,
       candidateSince: 0,
+      quietIdentity: null,
+      confirmedIdentity: { pipeline, streamKey: pipeline.streamKey, stream: pipeline.stream, participant, participantKey: energyKey },
       multiplier: participant.muted ? 0 : Math.max(0, Number(participant.value) || 0)
     };
   }
@@ -476,19 +493,45 @@
     const value = Number(param?.value);
     return Number.isFinite(value) ? value : fallback;
   }
-  function writeAudioParam(param, value) {
+  var gainSchedules = /* @__PURE__ */ new WeakMap();
+  var GAIN_RAMP_SECONDS = 0.01;
+  function writeAudioParam(param, value, { context, immediate = true } = {}) {
     if (!param) return false;
     const safe = Number.isFinite(value) ? Math.max(0, value) : 1;
+    const now = Number.isFinite(context?.currentTime) ? context.currentTime : 0;
+    const previous = gainSchedules.get(param);
+    if (!immediate && previous?.target === safe) return true;
+    const current = previous ? previous.from + (previous.target - previous.from) * Math.min(1, Math.max(0, (now - previous.start) / GAIN_RAMP_SECONDS)) : readAudioParam(param);
     try {
-      param.setValueAtTime(safe, param.context?.currentTime || 0);
+      if (immediate || !context) {
+        param.cancelScheduledValues?.(0);
+        param.setValueAtTime(safe, now);
+        gainSchedules.set(param, { from: safe, target: safe, start: now });
+      } else {
+        try {
+          if (typeof param.cancelAndHoldAtTime !== "function") throw new Error("No hold API");
+          param.cancelAndHoldAtTime(now);
+        } catch {
+          param.cancelScheduledValues?.(0);
+        }
+        param.setValueAtTime(current, now);
+        param.linearRampToValueAtTime(safe, now + GAIN_RAMP_SECONDS);
+        gainSchedules.set(param, { from: current, target: safe, start: now });
+      }
+      return true;
     } catch {
+      try {
+        param.cancelScheduledValues?.(0);
+      } catch {
+      }
+      try {
+        param.value = safe;
+      } catch {
+        return false;
+      }
+      gainSchedules.set(param, { from: safe, target: safe, start: now });
+      return true;
     }
-    try {
-      param.value = safe;
-    } catch {
-      return false;
-    }
-    return true;
   }
   function createAudioContext() {
     const Context = globalThis.AudioContext || globalThis.webkitAudioContext;
@@ -609,7 +652,7 @@
       disposed = true;
       for (const mapping of [...mappings]) {
         try {
-          writeAudioParam(mapping.booster.gain, 1);
+          writeAudioParam(mapping.booster.gain, 1, { context: mapping.booster.context });
         } catch {
         }
         let restored = false;
@@ -641,6 +684,7 @@
   }
   function createPooledSlot(gain, id) {
     const baseGain = readAudioParam(gain.gain);
+    let neutralized = true;
     return {
       id,
       gain,
@@ -652,17 +696,19 @@
       get actualValue() {
         return readAudioParam(gain.gain);
       },
-      set(multiplier) {
+      set(multiplier, immediate = false) {
         const safe = Number.isFinite(multiplier) ? Math.max(0, multiplier) : 1;
-        if (safe === this.appliedMultiplier) return;
-        writeAudioParam(gain.gain, safe);
+        if (safe === this.appliedMultiplier && !immediate) return;
+        writeAudioParam(gain.gain, safe, { context: gain.context, immediate });
+        neutralized = immediate && safe === 1;
         this.appliedMultiplier = safe;
         this.targetValue = safe;
         this.participantKey = null;
       },
       release() {
-        if (this.appliedMultiplier === 1) return;
-        writeAudioParam(gain.gain, 1);
+        if (neutralized) return;
+        writeAudioParam(gain.gain, 1, { context: gain.context });
+        neutralized = true;
         this.appliedMultiplier = 1;
         this.targetValue = 1;
         this.participantKey = null;
@@ -804,6 +850,9 @@
         return true;
       },
       deactivate() {
+        writeAudioParam(gain.gain, 1, { context });
+        this.appliedMultiplier = 1;
+        this.targetValue = 1;
         if (this.connected) {
           try {
             gain.disconnect();
@@ -831,7 +880,7 @@
         const safe = Number.isFinite(multiplier) ? Math.max(0, multiplier) : 1;
         this.appliedMultiplier = safe;
         this.targetValue = safe;
-        if ((this.connected || immediate) && this.activate()) writeAudioParam(gain.gain, safe);
+        if ((this.connected || immediate) && this.activate()) writeAudioParam(gain.gain, safe, { context, immediate: immediate && safe === 1 });
       },
       destroy() {
         this.deactivate();
@@ -976,13 +1025,15 @@
   function applyMediaPipelineOutputs(pipelines, routing, multiplier, immediate = false) {
     const selectedId = routing?.routingState === "confirmed-speaker" ? routing.appliedPipelineId : null;
     const selectedKey = routing?.appliedParticipantKey;
+    const quiet = isQuietMediaTransition(pipelines, routing);
     for (const pipeline of pipelines) {
       const selected = pipeline.id === selectedId && pipeline.associationReliable && pipeline.participantKey === selectedKey;
-      pipeline.set(selected ? multiplier : 1, immediate);
+      const quietOwner = quiet && routing.quietIdentity.pipeline === pipeline;
+      pipeline.set(selected ? multiplier : 1, immediate || !selected && !quietOwner || !pipeline.connected);
     }
   }
   function activateMediaModePipelines(pipelines, routing) {
-    applyMediaPipelineOutputs(pipelines, routing, routing?.multiplier ?? 1, true);
+    applyMediaPipelineOutputs(pipelines, routing, routing?.multiplier ?? 1);
   }
   function resolveLocalPresentationActive({ captureActive, domActive, captureLifecycleSeen }) {
     return captureLifecycleSeen ? captureActive : captureActive || domActive;
@@ -1130,13 +1181,12 @@
       const routing = workletSpeakerTracker.update({ now, speakers, hidden });
       const active = state.participants.get(routing.appliedParticipantKey) || null;
       const status = !participants().length ? "Waiting for participants" : speakers.length > 1 ? "Overlapping speakers · using safe 100% volume" : hidden ? "Meet tab hidden · using safe 100% volume" : active ? `${active.name} · automatic routing` : `${participants().length} participants ready`;
-      const changed = routing.appliedParticipantKey !== state.google.appliedParticipantKey || routing.routingState !== state.google.routingState;
       state.google.activeParticipantKey = routing.activeParticipantKey;
       state.google.appliedParticipantKey = routing.appliedParticipantKey;
       state.google.routingState = routing.routingState;
       state.google.transitionGuard.candidateParticipantKey = routing.candidateParticipantKey;
       state.google.transitionGuard.candidateSince = routing.candidateSince;
-      setOutputs(routing.multiplier, changed || routing.multiplier === 1);
+      setOutputs(routing.multiplier, routing.routingState !== "confirmed-speaker");
       setStatus(status);
     }
     function routeMedia(now, speakers) {
@@ -1232,7 +1282,7 @@
     function applyParticipantGain(participant) {
       if (syncPresentationState() && state.google.mode === "media") return;
       if (globalThis.document?.hidden) return;
-      if (state.google.activeParticipantKey === participant.key) setOutputs(participant.value, true);
+      if (state.google.activeParticipantKey === participant.key) setOutputs(participant.value);
     }
     return { start, stop, route, applyParticipantGain, setOutputs, get pipelines() {
       return media.pipelines;
@@ -1381,11 +1431,13 @@
       titleWrap.append(title, subtitle);
       const body = document.createElement("div");
       body.id = `${PANEL_ID}_body`;
-      const collapse = makeButton("", () => {
+      function toggleCollapsed() {
         state.panelCollapsed = !state.panelCollapsed;
         updateCollapsedUi();
         onCollapse?.(state.panelCollapsed);
-      });
+      }
+      title.ondblclick = toggleCollapsed;
+      const collapse = makeButton("", toggleCollapsed);
       collapse.type = "button";
       collapse.setAttribute("aria-controls", body.id);
       Object.assign(collapse.style, { width: "26px", height: "26px", padding: "0", fontSize: "16px", lineHeight: "16px", flex: "0 0 auto" });

@@ -317,6 +317,78 @@ test('departed participant focus never falls back to support or same-name partic
   assert.notEqual(document.activeElement, state.panel.querySelector('[data-role="slider"]'))
 })
 
+function doubleClick(element) {
+  const event = { target: element }
+  for (let node = element; node; node = node.parentElement) {
+    node.ondblclick?.(event)
+    for (const listener of node.listeners.dblclick ?? []) listener(event)
+  }
+}
+
+test('title double-click shares collapse state, UI and exactly one save per gesture without stealing focus', t => {
+  const { state, parts, document, collapses, gains } = fixture(t)
+  const external = document.createElement('input')
+  document.documentElement.append(external)
+  external.focus()
+  const original = parts()
+  const title = original.header.children[0].children[0]
+  for (const collapsed of [true, false]) {
+    doubleClick(title)
+    assert.equal(state.panelCollapsed, collapsed)
+    assertExpanded(parts(), !collapsed)
+    assert.equal(parts().body.style.display, collapsed ? 'none' : 'block')
+    assert.equal(parts().collapse.textContent, collapsed ? '+' : '−')
+    assert.equal(parts().body, original.body)
+    assert.equal(document.activeElement, external)
+  }
+  assert.deepEqual(collapses, [true, false])
+  assert.deepEqual(gains, [])
+})
+
+test('title-only gesture ignores subtitle, wrappers, controls, body and close', t => {
+  const { parts, collapses, state } = fixture(t)
+  const { header, body, collapse, close } = parts()
+  for (const region of [header, header.children[0], header.children[0].children[1], header.children[1], collapse, close, body]) {
+    doubleClick(region)
+    assert.equal(state.panelCollapsed, false)
+    assert.equal(state.closed, false)
+    assertExpanded(parts(), true)
+  }
+  assert.deepEqual(collapses, [])
+})
+
+test('title toggle persists restored state and survives roster, reset, toolbar and drag', t => {
+  const { state, parts, controller, people, events, saves, gains, document } = fixture(t)
+  let saved
+  const storage = { getItem: () => saved ?? null, setItem: (key, value) => { saved = value } }
+  const restoredController = createPanelController(state, {
+    participants: () => people,
+    onGain: (person, value) => gains.push([person.key, value]),
+    onSave: position => saves.push(position),
+    onCollapse: collapsed => { state.settings.collapsed = collapsed; saveSettings(storage, state.settings) }
+  })
+  restoredController.render()
+  doubleClick(parts().header.children[0].children[0])
+  assert.equal(createState(storage).panelCollapsed, true)
+  people.push({ key: 'bob', name: 'Bob', value: 1 })
+  restoredController.render()
+  assertExpanded(parts(), false)
+  restoredController.toggle(); restoredController.toggle()
+  assertExpanded(parts(), false)
+  doubleClick(parts().header.children[0].children[0])
+  assert.equal(createState(storage).panelCollapsed, false)
+  parts().body.children[1].querySelector('button').click()
+  assert.deepEqual(gains, [['alice', 1], ['bob', 1]])
+  doubleClick(parts().header.children[0].children[0])
+  assertExpanded(parts(), false)
+  const title = parts().header.children[0].children[0]
+  parts().header.onmousedown({ target: title, clientX: 10, clientY: 20, preventDefault() {} })
+  events.mousemove({ clientX: 40, clientY: 60 }); events.mouseup()
+  assert.deepEqual(saves, [{ left: 42, top: 112 }])
+  assertExpanded(parts(), false)
+  assert.notEqual(document.activeElement, title)
+})
+
 test('only dragging calls position save, not collapse callback', t => {
   const { parts, events, saves, collapses } = fixture(t)
   parts().header.onmousedown({ target: parts().header, clientX: 10, clientY: 20, preventDefault() {} })
