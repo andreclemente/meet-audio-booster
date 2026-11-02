@@ -992,13 +992,23 @@
     return holders.filter(isObject);
   }
   function findActivityGetterName(root) {
-    for (const element of elementsOf(root, "[jscontroller]")) {
-      const controller = element?.__jscontroller?.pending?.value;
-      if (!isObject(controller)) continue;
-      for (const [, fn] of ownMethods(controller)) {
-        const source = sourceOf(fn);
-        const match = source.match(RING_RENDERER);
-        if (match && />\s*0/.test(source.slice(match.index))) return match[1];
+    let elements = [];
+    try {
+      elements = elementsOf(root, "[jscontroller]");
+    } catch {
+      return null;
+    }
+    for (const element of elements) {
+      try {
+        const controller = element?.__jscontroller?.pending?.value;
+        if (!isObject(controller)) continue;
+        for (const [name, fn] of ownMethods(controller)) {
+          if (name === "constructor") continue;
+          const source = sourceOf(fn);
+          const match = source.match(RING_RENDERER);
+          if (match && />\s*0/.test(source.slice(match.index))) return match[1];
+        }
+      } catch {
       }
     }
     return null;
@@ -1081,7 +1091,7 @@
     let getter = null;
     let lastGetterAttempt = -Infinity;
     let lastConfirmedAt = 0;
-    const identityCache = /* @__PURE__ */ new WeakMap();
+    let identityCache = /* @__PURE__ */ new WeakMap();
     const entries = /* @__PURE__ */ new Map();
     function rootsFor(participant, rootsByParticipantId) {
       const roots = rootsByParticipantId.get(participant.participantId) || [];
@@ -1112,6 +1122,7 @@
       if (getter && participants.length && now - lastConfirmedAt > GETTER_STALE_MS) {
         getter = null;
         entries.clear();
+        identityCache = /* @__PURE__ */ new WeakMap();
       }
       if (!getter && now - lastGetterAttempt >= GETTER_RETRY_MS) {
         lastGetterAttempt = now;

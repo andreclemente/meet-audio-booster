@@ -278,3 +278,38 @@ test('controller neutralizes when Meet objects make the read fail mid-call', () 
     assert.equal(f.slot.appliedMultiplier, 1)
   })
 })
+
+test('an unreadable controller before the ring renderer does not hide it', () => {
+  const a = nativeRoot('device-a', { level: { value: 0.6 } })
+  const ring = a.root.querySelectorAll()[0]
+  const hostile = { getAttribute: () => 'x', get __jscontroller() { throw new Error('controller') } }
+  a.root.querySelectorAll = () => [hostile, ring]
+  assert.equal(findActivityGetterName(a.root), 'oa')
+  const result = createNativeActivitySource().read([participant('A', 'device-a', a.root)], documentWith(a.root), 0)
+  assert.equal(result.available, true)
+})
+
+test('identity cache is rebuilt when a stale getter is rediscovered', () => {
+  const level = { value: 0.6 }
+  const a = nativeRoot('device-a', { level })
+  const source = createNativeActivitySource()
+  const alice = participant('A', 'device-a', a.root)
+  assert.equal(source.read([alice], documentWith(a.root), 0).available, true)
+  // Meet ships a build where the ring now uses a different getter name.
+  const originalRing = BuildOneRing.prototype.Cbc
+  const originalOa = BuildOneModel.prototype.oa
+  BuildOneModel.prototype.qb = ({qb(){return this.Xa.Yec()}}).qb
+  BuildOneRing.prototype.Cbc = ({Cbc(){var a=Math.round(this.di.Aa.qb()*5);this.element.Ga=a>0}}).Cbc
+  delete BuildOneModel.prototype.oa
+  try {
+    assert.equal(source.read([alice], documentWith(a.root), 100).available, false)
+    const later = source.read([alice], documentWith(a.root), 20000)
+    assert.equal(source.activityGetter, 'qb')
+    assert.equal(later.available, true)
+    assert.equal(later.levels.get('A'), 0.6)
+  } finally {
+    BuildOneModel.prototype.oa = originalOa
+    BuildOneRing.prototype.Cbc = originalRing
+    delete BuildOneModel.prototype.qb
+  }
+})
