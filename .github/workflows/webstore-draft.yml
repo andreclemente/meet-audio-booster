@@ -44,7 +44,7 @@ jobs:
         with:
           node-version: '22'
           cache: npm
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
       - run: npm ci
@@ -86,7 +86,7 @@ jobs:
           ref: ${{ needs.package.outputs.trusted_sha }}
           path: trusted
           persist-credentials: false
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
       # v4.3.0 adds exact artifact-ID selection (older actionlint catalogs omit it).
