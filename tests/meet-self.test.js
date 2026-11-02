@@ -8,14 +8,24 @@ import { createState } from '../src/state.js'
 // Names, IDs, labels and DOM wrappers are synthetic. Icons/disabled flags follow
 // the user's selected-self and remote groups. Real-DOM coverage lives in evidence.
 const BUTTONS = 'button, [role="button"]'
+// Synthetic stand-in for Meet's per-participant activity model; the tile's
+// `matches()` flag doubles as "speaking" so tests can toggle activity.
+class ActivityModel { constructor(id, root) { this.Xa = { Yc: () => id, Yec: () => root.matches('.BlxGDf') ? 0.8 : 0 } }
+  isDisposed() { return false }
+  Yc(){return this.Xa.Yc()}
+  oa(){return this.Xa.Yec()} }
+class RingRenderer { constructor(holder) { this.di = holder; this.element = {} }
+  Cbc(){var a=Math.round(this.di.Aa.oa()*5);this.element.Ga=a>0} }
 function tile(id, { name = '同名', icons = [], labels = [], rich = false, requested = true, disabled = false } = {}) {
   const root = {
+    isConnected: true,
     innerText: name + (rich ? ' '.repeat(400) : ''), textContent: name,
     getAttribute(attr) {
       return attr === 'data-participant-id' ? id : attr === 'data-requested-participant-id' && requested ? id : null
     },
     matches() { return false }, querySelector() { return null },
     querySelectorAll(selector) {
+      if (selector.includes('jscontroller')) return [ring]
       if (selector === BUTTONS) return buttons
       if (selector === '[aria-label]') return labelNodes
       if (selector.includes('data-self-name')) return name ? [nameNode] : []
@@ -23,6 +33,9 @@ function tile(id, { name = '同名', icons = [], labels = [], rich = false, requ
       return []
     }
   }
+  const model = new ActivityModel(id, root)
+  root.__jsmodel = { A0Tiaf: { pending: { value: { wy: model } } } }
+  const ring = { getAttribute: () => 'ring', __jscontroller: { pending: { value: new RingRenderer({ Aa: model }) } } }
   const nameNode = {
     textContent: name, children: [],
     matches: selector => selector.includes('data-self-name'),

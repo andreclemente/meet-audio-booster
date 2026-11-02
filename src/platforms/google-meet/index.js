@@ -4,6 +4,7 @@ import { createRoutingState, routeGoogleAudio, isQuietMediaTransition } from './
 import { installLocalPresentationCaptureHook } from './presentation.js'
 import { installAudioWorkletHook, createPooledSlot } from './audio-worklet.js'
 import { createMediaPipelineManager } from './media-elements.js'
+import { createNativeActivitySource } from './native-activity.js'
 import { upsertParticipant, visibleParticipants } from '../../state.js'
 
 export function collectCurrentUiSpeakers(participants, isSpeaking = participant => isGoogleParticipantSpeaking(participant.element)) {
@@ -53,8 +54,9 @@ export function createWorkletSpeakerTracker({ confirmMs = 50 } = {}) {
     return result(routingState)
   }
 
-  function update({ now, speakers = [], hidden = false }) {
-    if (hidden) return reset('hidden-tab')
+  // Speaker evidence comes from Meet's own activity model, which keeps
+  // updating while the tab is hidden, so visibility is not a routing input.
+  function update({ now, speakers = [] }) {
     if (speakers.length > 1) return reset('ambiguous')
 
     const speaker = speakers[0] || null
@@ -82,10 +84,10 @@ export function createWorkletSpeakerTracker({ confirmMs = 50 } = {}) {
 
     candidateKey = null
     candidateSince = 0
-    // Meet's visual speaking marker is intermittent and can disappear for
-    // arbitrary periods during one person's turn. Do not pulse a confirmed
-    // gain back to unity merely because the marker is absent. Concrete safety
-    // events above (another/overlapping speaker or hidden tab) still reset it.
+    // Meet's activity is quantized and drops to zero between words. Do not
+    // pulse a confirmed gain back to unity merely because it is quiet.
+    // Concrete safety events (another or overlapping speaker, unknown
+    // speaker data) still reset it.
     if (confirmed) return result('confirmed-speaker', confirmed, confirmed.value)
     return reset('idle')
   }
@@ -119,6 +121,7 @@ export function createGoogleMeetController({ state, context, setStatus, renderSo
   const alignmentTracker = createFreshAlignmentTracker()
   const media = createMediaPipelineManager(context)
   const workletSpeakerTracker = createWorkletSpeakerTracker()
+  const nativeActivity = createNativeActivitySource()
   const selfIds = new Set()
   let restoreHook, restoreCaptureHook, observer, mutationTimer, reconcileTimer, mediaTimer, routingTimer, visibilityHandler, slotCounter = 0
   let capturePresentationActive = false
@@ -229,27 +232,33 @@ export function createGoogleMeetController({ state, context, setStatus, renderSo
     if (state.google.mode === 'media') applyMediaPipelineOutputs(media.pipelines, state.google.routing, multiplier, immediate)
     else for (const slot of state.google.slots) slot.set(multiplier, immediate)
   }
-  function currentUiSpeakers() {
-    return collectCurrentUiSpeakersAcrossRoots(participants())
+  function currentSpeakers(now) {
+    const list = participants()
+    const activity = nativeActivity.read(list, globalThis.document, now)
+    for (const participant of list) {
+      participant.speaking = activity.available && activity.speakers.includes(participant)
+      if (participant.speaking) participant.lastSpeakingAt = now
+    }
+    state.google.speakerSource = activity.available ? 'meet-activity' : 'unavailable'
+    state.google.unknownSpeakerCount = activity.unknown.length
+    return activity
   }
-  function neutralizeHiddenTab() {
-    workletSpeakerTracker.reset('hidden-tab')
-    state.google.routing = { ...createRoutingState(), routingState: 'hidden-tab' }
+  function neutralize(routingState, status) {
+    workletSpeakerTracker.reset(routingState)
+    state.google.routing = { ...createRoutingState(), routingState }
     state.google.activeParticipantKey = null
     state.google.appliedParticipantKey = null
-    state.google.routingState = 'hidden-tab'
+    state.google.routingState = routingState
     state.google.transitionGuard.candidateParticipantKey = null
     state.google.transitionGuard.candidateSince = 0
     setOutputs(1, true)
-    setStatus('Meet tab hidden · using safe 100% volume')
+    setStatus(status)
   }
   function routeWorklet(now, speakers) {
-    const hidden = Boolean(globalThis.document?.hidden)
-    const routing = workletSpeakerTracker.update({ now, speakers, hidden })
+    const routing = workletSpeakerTracker.update({ now, speakers })
     const active = state.participants.get(routing.appliedParticipantKey) || null
     const status = !participants().length ? 'Waiting for participants'
       : speakers.length > 1 ? 'Overlapping speakers · using safe 100% volume'
-      : hidden ? 'Meet tab hidden · using safe 100% volume'
       : active ? `${active.name} · automatic routing` : `${participants().length} participants ready`
 
     state.google.activeParticipantKey = routing.activeParticipantKey
@@ -300,13 +309,16 @@ export function createGoogleMeetController({ state, context, setStatus, renderSo
       updateLiveUi()
       return
     }
-    if (globalThis.document?.hidden) {
-      neutralizeHiddenTab()
+    const now = Date.now()
+    const activity = currentSpeakers(now)
+    if (!activity.available) {
+      neutralize('speaker-data-unavailable', participants().length
+        ? 'Speaker data unavailable · using safe 100% volume'
+        : 'Waiting for participants')
       updateLiveUi()
       return
     }
-    const now = Date.now()
-    const speakers = currentUiSpeakers()
+    const speakers = activity.speakers
     if (state.google.mode === 'media') routeMedia(now, speakers)
     else routeWorklet(now, speakers)
     updateLiveUi()
@@ -323,12 +335,7 @@ export function createGoogleMeetController({ state, context, setStatus, renderSo
     reconcileTimer = setInterval(reconcile, 750)
     mediaTimer = setInterval(scanMedia, 500)
     routingTimer = setInterval(route, 30)
-    visibilityHandler = () => {
-      if (document.hidden) {
-        neutralizeHiddenTab()
-        updateLiveUi()
-      } else route()
-    }
+    visibilityHandler = () => route()
     document.addEventListener('visibilitychange', visibilityHandler)
   }
   function stop() {
@@ -342,13 +349,13 @@ export function createGoogleMeetController({ state, context, setStatus, renderSo
     media.destroy()
     selfIds.clear()
     workletSpeakerTracker.reset()
+    nativeActivity.reset()
   }
   function applyParticipantGain(participant) {
     if (syncPresentationState() && state.google.mode === 'media') return
-    if (globalThis.document?.hidden) return
     // Pooled worklets expose no stable per-participant energy identity. Keep
-    // the confirmed speaker latched through missing UI markers; concrete
-    // speaker changes, overlap, presentation, and hidden tabs neutralize it.
+    // the confirmed speaker latched through quiet activity; concrete speaker
+    // changes, overlap, presentation and unknown speaker data neutralize it.
     if (state.google.activeParticipantKey === participant.key) setOutputs(participant.value)
   }
   return { start, stop, route, applyParticipantGain, setOutputs, get pipelines() { return media.pipelines } }

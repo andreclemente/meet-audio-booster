@@ -951,27 +951,217 @@
     } };
   }
 
-  // src/platforms/google-meet/index.js
-  function collectCurrentUiSpeakers(participants, isSpeaking = (participant) => isGoogleParticipantSpeaking(participant.element)) {
-    return participants.filter((participant) => {
-      participant.speaking = isSpeaking(participant);
-      if (participant.speaking) participant.lastSpeakingAt = Date.now();
-      return participant.speaking;
-    });
+  // src/platforms/google-meet/native-activity.js
+  var RING_RENDERER = /Math\.round\([^;]*?\.([A-Za-z_$][\w$]*)\(\)\*5\)/;
+  var DELEGATING_GETTER = /^[A-Za-z_$][\w$]*\(\)\{return this\.[A-Za-z_$][\w$]*\.[A-Za-z_$][\w$]*\(\)\}$/;
+  var MAX_ELEMENTS_PER_ROOT = 256;
+  var MAX_MODELS_PER_ROOT = 16;
+  var REDISCOVER_MS = 1e3;
+  var GETTER_RETRY_MS = 1e3;
+  var GETTER_STALE_MS = 1e4;
+  function isObject(value) {
+    return value !== null && typeof value === "object" && !Array.isArray(value) && !(typeof Node === "function" && value instanceof Node) && typeof value.nodeType !== "number";
   }
-  function collectCurrentUiSpeakersAcrossRoots(participants, root = globalThis.document) {
-    const rootsByParticipantId = /* @__PURE__ */ new Map();
-    for (const element of root?.querySelectorAll?.("[data-participant-id]") || []) {
-      const participantId = element.getAttribute?.("data-participant-id");
-      if (!participantId) continue;
-      if (!rootsByParticipantId.has(participantId)) rootsByParticipantId.set(participantId, []);
-      rootsByParticipantId.get(participantId).push(element);
+  function ownMethods(object, depth = 2) {
+    const methods = [];
+    let proto = Object.getPrototypeOf(object);
+    for (let level = 0; level < depth && proto && proto !== Object.prototype; level++, proto = Object.getPrototypeOf(proto)) {
+      for (const name of Object.getOwnPropertyNames(proto)) {
+        const descriptor = Object.getOwnPropertyDescriptor(proto, name);
+        if (typeof descriptor?.value === "function") methods.push([name, descriptor.value]);
+      }
     }
-    return collectCurrentUiSpeakers(participants, (participant) => {
-      const roots = rootsByParticipantId.get(participant.participantId);
-      return roots?.length ? roots.some(isGoogleParticipantSpeaking) : isGoogleParticipantSpeaking(participant.element);
-    });
+    return methods;
   }
+  function sourceOf(fn) {
+    try {
+      return Function.prototype.toString.call(fn);
+    } catch {
+      return "";
+    }
+  }
+  function elementsOf(root, selector) {
+    const nested = [...root?.querySelectorAll?.(selector) || []];
+    return [root, ...nested].slice(0, MAX_ELEMENTS_PER_ROOT);
+  }
+  function holdersOf(element) {
+    const holders = [];
+    const models = element?.__jsmodel;
+    if (isObject(models)) for (const entry of Object.values(models)) holders.push(entry?.pending?.value);
+    holders.push(element?.__jscontroller?.pending?.value);
+    return holders.filter(isObject);
+  }
+  function findActivityGetterName(root) {
+    for (const element of elementsOf(root, "[jscontroller]")) {
+      const controller = element?.__jscontroller?.pending?.value;
+      if (!isObject(controller)) continue;
+      for (const [, fn] of ownMethods(controller)) {
+        const source = sourceOf(fn);
+        const match = source.match(RING_RENDERER);
+        if (match && />\s*0/.test(source.slice(match.index))) return match[1];
+      }
+    }
+    return null;
+  }
+  function isParticipantSourceModel(value, participantId, activityGetter, identityCache = /* @__PURE__ */ new WeakMap()) {
+    try {
+      if (!isObject(value) || typeof value.isDisposed !== "function" || typeof value[activityGetter] !== "function") return false;
+      const proto = Object.getPrototypeOf(value);
+      if (!proto || proto === Object.prototype) return false;
+      let candidates = identityCache.get(proto);
+      if (!candidates) {
+        const shaped = DELEGATING_GETTER.test(sourceOf(proto[activityGetter]));
+        candidates = shaped ? ownMethods(value, 1).filter(([name, fn]) => name !== activityGetter && fn.length === 0 && DELEGATING_GETTER.test(sourceOf(fn))).map(([name]) => name) : [];
+        identityCache.set(proto, candidates);
+      }
+      if (!candidates.length || value.isDisposed()) return false;
+      for (const name of candidates) {
+        try {
+          if (value[name]() === participantId) return true;
+        } catch {
+        }
+      }
+    } catch {
+    }
+    return false;
+  }
+  function valuesOf(object) {
+    try {
+      return Object.values(object);
+    } catch {
+      return [];
+    }
+  }
+  function discoverParticipantSourceModels(root, participantId, activityGetter, identityCache) {
+    const found = [];
+    const seen = /* @__PURE__ */ new Set();
+    const consider = (value) => {
+      let object = false;
+      try {
+        object = isObject(value);
+      } catch {
+      }
+      if (!object || seen.has(value)) return false;
+      seen.add(value);
+      if (!isParticipantSourceModel(value, participantId, activityGetter, identityCache)) return false;
+      found.push(value);
+      return true;
+    };
+    for (const element of elementsOf(root, "[jsmodel],[jscontroller]")) {
+      let holders = [];
+      try {
+        holders = holdersOf(element);
+      } catch {
+      }
+      for (const holder of holders) {
+        for (const value of valuesOf(holder)) {
+          if (found.length >= MAX_MODELS_PER_ROOT) return found;
+          if (consider(value) || !seen.has(value)) continue;
+          for (const nested of valuesOf(value)) {
+            if (found.length >= MAX_MODELS_PER_ROOT) return found;
+            consider(nested);
+          }
+        }
+      }
+    }
+    return found;
+  }
+  function readLevel(model, getter) {
+    try {
+      const level = model[getter]();
+      return typeof level === "number" && Number.isFinite(level) && level >= 0 && level <= 1 ? level : null;
+    } catch {
+      return null;
+    }
+  }
+  function isSpeakingLevel(level) {
+    return Number.isFinite(level) && Math.round(level * 5) > 0;
+  }
+  function createNativeActivitySource({ rediscoverMs = REDISCOVER_MS } = {}) {
+    let getter = null;
+    let lastGetterAttempt = -Infinity;
+    let lastConfirmedAt = 0;
+    const identityCache = /* @__PURE__ */ new WeakMap();
+    const entries = /* @__PURE__ */ new Map();
+    function rootsFor(participant, rootsByParticipantId) {
+      const roots = rootsByParticipantId.get(participant.participantId) || [];
+      if (participant.element && !roots.includes(participant.element)) roots.push(participant.element);
+      return roots.filter((root) => root && root.isConnected !== false);
+    }
+    function modelsFor(participant, roots, now) {
+      const cached = entries.get(participant.key);
+      const valid = cached?.models.filter((model) => isParticipantSourceModel(model, participant.participantId, getter, identityCache));
+      if (cached && cached.participantId === participant.participantId && valid.length === cached.models.length && now - cached.discoveredAt < rediscoverMs) return valid;
+      const models = [];
+      for (const root of roots) {
+        for (const model of discoverParticipantSourceModels(root, participant.participantId, getter, identityCache)) {
+          if (!models.includes(model)) models.push(model);
+        }
+      }
+      entries.set(participant.key, { participantId: participant.participantId, models, discoveredAt: now });
+      return models;
+    }
+    function readUnsafe(participants, root, now) {
+      const rootsByParticipantId = /* @__PURE__ */ new Map();
+      for (const element of root?.querySelectorAll?.("[data-participant-id]") || []) {
+        const id = element.getAttribute?.("data-participant-id");
+        if (!id) continue;
+        if (!rootsByParticipantId.has(id)) rootsByParticipantId.set(id, []);
+        rootsByParticipantId.get(id).push(element);
+      }
+      if (getter && participants.length && now - lastConfirmedAt > GETTER_STALE_MS) {
+        getter = null;
+        entries.clear();
+      }
+      if (!getter && now - lastGetterAttempt >= GETTER_RETRY_MS) {
+        lastGetterAttempt = now;
+        for (const roots of rootsByParticipantId.values()) {
+          for (const candidate of roots) {
+            getter = findActivityGetterName(candidate);
+            if (getter) break;
+          }
+          if (getter) break;
+        }
+        if (getter) lastConfirmedAt = now;
+      }
+      const levels = /* @__PURE__ */ new Map();
+      const unknown = [];
+      for (const key of entries.keys()) if (!participants.some((participant) => participant.key === key)) entries.delete(key);
+      if (!getter) return { available: false, levels, unknown: participants.map((participant) => participant.key), speakers: [] };
+      for (const participant of participants) {
+        const roots = rootsFor(participant, rootsByParticipantId);
+        const models = roots.length ? modelsFor(participant, roots, now) : [];
+        let level = null;
+        for (const model of models) {
+          const value = readLevel(model, getter);
+          if (value !== null) level = Math.max(level ?? 0, value);
+        }
+        if (level === null) {
+          unknown.push(participant.key);
+          continue;
+        }
+        levels.set(participant.key, level);
+      }
+      const speakers = participants.filter((participant) => isSpeakingLevel(levels.get(participant.key)));
+      if (levels.size) lastConfirmedAt = now;
+      return { available: participants.length > 0 && unknown.length === 0, levels, unknown, speakers };
+    }
+    function read(participants, root = globalThis.document, now = Date.now()) {
+      try {
+        return readUnsafe(participants, root, now);
+      } catch {
+        return { available: false, levels: /* @__PURE__ */ new Map(), unknown: participants.map((participant) => participant.key), speakers: [] };
+      }
+    }
+    function reset() {
+      entries.clear();
+    }
+    return { read, reset, get activityGetter() {
+      return getter;
+    } };
+  }
+
+  // src/platforms/google-meet/index.js
   function createWorkletSpeakerTracker({ confirmMs = 50 } = {}) {
     let confirmed = null;
     let candidateKey = null;
@@ -992,8 +1182,7 @@
       candidateSince = 0;
       return result(routingState);
     }
-    function update({ now, speakers = [], hidden = false }) {
-      if (hidden) return reset("hidden-tab");
+    function update({ now, speakers = [] }) {
       if (speakers.length > 1) return reset("ambiguous");
       const speaker = speakers[0] || null;
       if (speaker) {
@@ -1043,6 +1232,7 @@
     const alignmentTracker = createFreshAlignmentTracker();
     const media = createMediaPipelineManager(context);
     const workletSpeakerTracker = createWorkletSpeakerTracker();
+    const nativeActivity = createNativeActivitySource();
     const selfIds = /* @__PURE__ */ new Set();
     let restoreHook, restoreCaptureHook, observer, mutationTimer, reconcileTimer, mediaTimer, routingTimer, visibilityHandler, slotCounter = 0;
     let capturePresentationActive = false;
@@ -1162,25 +1352,32 @@
       if (state.google.mode === "media") applyMediaPipelineOutputs(media.pipelines, state.google.routing, multiplier, immediate);
       else for (const slot of state.google.slots) slot.set(multiplier, immediate);
     }
-    function currentUiSpeakers() {
-      return collectCurrentUiSpeakersAcrossRoots(participants());
+    function currentSpeakers(now) {
+      const list = participants();
+      const activity = nativeActivity.read(list, globalThis.document, now);
+      for (const participant of list) {
+        participant.speaking = activity.available && activity.speakers.includes(participant);
+        if (participant.speaking) participant.lastSpeakingAt = now;
+      }
+      state.google.speakerSource = activity.available ? "meet-activity" : "unavailable";
+      state.google.unknownSpeakerCount = activity.unknown.length;
+      return activity;
     }
-    function neutralizeHiddenTab() {
-      workletSpeakerTracker.reset("hidden-tab");
-      state.google.routing = { ...createRoutingState(), routingState: "hidden-tab" };
+    function neutralize(routingState, status) {
+      workletSpeakerTracker.reset(routingState);
+      state.google.routing = { ...createRoutingState(), routingState };
       state.google.activeParticipantKey = null;
       state.google.appliedParticipantKey = null;
-      state.google.routingState = "hidden-tab";
+      state.google.routingState = routingState;
       state.google.transitionGuard.candidateParticipantKey = null;
       state.google.transitionGuard.candidateSince = 0;
       setOutputs(1, true);
-      setStatus("Meet tab hidden · using safe 100% volume");
+      setStatus(status);
     }
     function routeWorklet(now, speakers) {
-      const hidden = Boolean(globalThis.document?.hidden);
-      const routing = workletSpeakerTracker.update({ now, speakers, hidden });
+      const routing = workletSpeakerTracker.update({ now, speakers });
       const active = state.participants.get(routing.appliedParticipantKey) || null;
-      const status = !participants().length ? "Waiting for participants" : speakers.length > 1 ? "Overlapping speakers · using safe 100% volume" : hidden ? "Meet tab hidden · using safe 100% volume" : active ? `${active.name} · automatic routing` : `${participants().length} participants ready`;
+      const status = !participants().length ? "Waiting for participants" : speakers.length > 1 ? "Overlapping speakers · using safe 100% volume" : active ? `${active.name} · automatic routing` : `${participants().length} participants ready`;
       state.google.activeParticipantKey = routing.activeParticipantKey;
       state.google.appliedParticipantKey = routing.appliedParticipantKey;
       state.google.routingState = routing.routingState;
@@ -1231,13 +1428,14 @@
         updateLiveUi();
         return;
       }
-      if (globalThis.document?.hidden) {
-        neutralizeHiddenTab();
+      const now = Date.now();
+      const activity = currentSpeakers(now);
+      if (!activity.available) {
+        neutralize("speaker-data-unavailable", participants().length ? "Speaker data unavailable · using safe 100% volume" : "Waiting for participants");
         updateLiveUi();
         return;
       }
-      const now = Date.now();
-      const speakers = currentUiSpeakers();
+      const speakers = activity.speakers;
       if (state.google.mode === "media") routeMedia(now, speakers);
       else routeWorklet(now, speakers);
       updateLiveUi();
@@ -1255,12 +1453,7 @@
       reconcileTimer = setInterval(reconcile, 750);
       mediaTimer = setInterval(scanMedia, 500);
       routingTimer = setInterval(route, 30);
-      visibilityHandler = () => {
-        if (document.hidden) {
-          neutralizeHiddenTab();
-          updateLiveUi();
-        } else route();
-      };
+      visibilityHandler = () => route();
       document.addEventListener("visibilitychange", visibilityHandler);
     }
     function stop() {
@@ -1278,10 +1471,10 @@
       media.destroy();
       selfIds.clear();
       workletSpeakerTracker.reset();
+      nativeActivity.reset();
     }
     function applyParticipantGain(participant) {
       if (syncPresentationState() && state.google.mode === "media") return;
-      if (globalThis.document?.hidden) return;
       if (state.google.activeParticipantKey === participant.key) setOutputs(participant.value);
     }
     return { start, stop, route, applyParticipantGain, setOutputs, get pipelines() {
