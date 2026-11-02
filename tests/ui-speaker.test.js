@@ -95,7 +95,7 @@ test('a different visible speaker neutralizes a held gain immediately', () => {
   assert.equal(changed.multiplier, 1)
 })
 
-test('hiding the Meet tab neutralizes and clears a confirmed worklet gain', () => {
+test('tab visibility is not a tracker input: a confirmed gain survives hiding', () => {
   const tracker = createWorkletSpeakerTracker()
   const alice = { key: 'A', name: 'Alice', value: 4.5 }
 
@@ -103,18 +103,14 @@ test('hiding the Meet tab neutralizes and clears a confirmed worklet gain', () =
   tracker.update({ now: 60, speakers: [alice], hidden: false })
 
   const hidden = tracker.update({ now: 70, speakers: [alice], hidden: true })
-  assert.equal(hidden.routingState, 'hidden-tab')
-  assert.equal(hidden.appliedParticipantKey, null)
-  assert.equal(hidden.multiplier, 1)
-
-  const visibleAgain = tracker.update({ now: 1000, speakers: [alice], hidden: false })
-  assert.equal(visibleAgain.routingState, 'transitioning')
-  assert.equal(visibleAgain.multiplier, 1)
+  assert.equal(hidden.routingState, 'confirmed-speaker')
+  assert.equal(hidden.appliedParticipantKey, 'A')
+  assert.equal(hidden.multiplier, 4.5)
 })
 
-test('hidden Meet tab keeps media pipelines neutral across routing ticks', () => {
+test('media pipelines stay neutral while speaker data is unavailable', () => {
   const originalDocument = globalThis.document
-  globalThis.document = { hidden: true }
+  globalThis.document = { hidden: false, querySelectorAll: () => [] }
   try {
     const participant = {
       key: 'A', platform: 'google-meet', name: 'Alice', present: true,
@@ -145,7 +141,7 @@ test('hidden Meet tab keeps media pipelines neutral across routing ticks', () =>
 
     controller.route()
 
-    assert.equal(state.google.routingState, 'hidden-tab')
+    assert.equal(state.google.routingState, 'speaker-data-unavailable')
     assert.equal(state.google.appliedParticipantKey, null)
     assert.equal(state.google.routing.multiplier, 1)
     assert.deepEqual(writes, [1])
@@ -163,7 +159,17 @@ test('completed capture lifecycle overrides a stale presentation DOM root', () =
 test('local presentation does not force worklet participant boost to 100 percent', () => {
   const originalDocument = globalThis.document
   const originalNow = Date.now
-  const speakingRoot = fakeParticipantRoot('device-a', true)
+  class Model { constructor() { this.Xa = { Yc: () => 'device-a', Yec: () => 0.8 } } isDisposed() { return false }
+    Yc(){return this.Xa.Yc()}
+    oa(){return this.Xa.Yec()} }
+  class Ring { constructor(holder) { this.di = holder; this.element = {} }
+    Cbc(){var a=Math.round(this.di.Aa.oa()*5);this.element.Ga=a>0} }
+  const model = new Model()
+  const speakingRoot = {
+    ...fakeParticipantRoot('device-a', true), isConnected: true,
+    __jsmodel: { A0Tiaf: { pending: { value: { wy: model } } } },
+    querySelectorAll: () => [{ getAttribute: () => 'ring', __jscontroller: { pending: { value: new Ring({ Aa: model }) } } }]
+  }
   globalThis.document = {
     hidden: false,
     querySelectorAll(selector) { return selector === '[data-participant-id]' ? [speakingRoot] : [] }
