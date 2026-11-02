@@ -65,7 +65,7 @@ jobs:
           sha256=$(sha256sum release-artifact/extension.zip | cut -d ' ' -f 1)
           printf 'sha256=%s\n' "$sha256" >> "$GITHUB_OUTPUT"
           printf '%s  extension.zip\n' "$sha256" > release-artifact/extension.zip.sha256
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         id: artifact
         with:
           name: chrome-web-store-draft-${{ github.run_id }}-${{ github.run_attempt }}
