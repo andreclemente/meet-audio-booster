@@ -52,14 +52,22 @@ function holdersOf(element) {
 }
 
 export function findActivityGetterName(root) {
-  for (const element of elementsOf(root, '[jscontroller]')) {
-    const controller = element?.__jscontroller?.pending?.value
-    if (!isObject(controller)) continue
-    for (const [, fn] of ownMethods(controller)) {
-      const source = sourceOf(fn)
-      const match = source.match(RING_RENDERER)
-      if (match && />\s*0/.test(source.slice(match.index))) return match[1]
-    }
+  let elements = []
+  try { elements = elementsOf(root, '[jscontroller]') } catch { return null }
+  for (const element of elements) {
+    // One unreadable controller must not hide the ring renderer after it.
+    try {
+      const controller = element?.__jscontroller?.pending?.value
+      if (!isObject(controller)) continue
+      for (const [name, fn] of ownMethods(controller)) {
+        // A class constructor's source is the whole class body, including
+        // methods that may since have been replaced.
+        if (name === 'constructor') continue
+        const source = sourceOf(fn)
+        const match = source.match(RING_RENDERER)
+        if (match && />\s*0/.test(source.slice(match.index))) return match[1]
+      }
+    } catch {}
   }
   return null
 }
@@ -142,7 +150,9 @@ export function createNativeActivitySource({ rediscoverMs = REDISCOVER_MS } = {}
   let getter = null
   let lastGetterAttempt = -Infinity
   let lastConfirmedAt = 0
-  const identityCache = new WeakMap()
+  // Identity candidates depend on the activity getter, so the cache is
+  // replaced whenever the getter is rediscovered.
+  let identityCache = new WeakMap()
   const entries = new Map()
 
   function rootsFor(participant, rootsByParticipantId) {
@@ -181,6 +191,7 @@ export function createNativeActivitySource({ rediscoverMs = REDISCOVER_MS } = {}
       // match from an unrelated renderer: rediscover rather than stay dead.
       getter = null
       entries.clear()
+      identityCache = new WeakMap()
     }
     if (!getter && now - lastGetterAttempt >= GETTER_RETRY_MS) {
       lastGetterAttempt = now
