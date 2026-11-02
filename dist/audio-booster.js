@@ -957,6 +957,8 @@
   var MAX_ELEMENTS_PER_ROOT = 256;
   var MAX_MODELS_PER_ROOT = 16;
   var REDISCOVER_MS = 1e3;
+  var GETTER_RETRY_MS = 1e3;
+  var GETTER_STALE_MS = 1e4;
   function isObject(value) {
     return value !== null && typeof value === "object" && !Array.isArray(value) && !(typeof Node === "function" && value instanceof Node) && typeof value.nodeType !== "number";
   }
@@ -1002,42 +1004,60 @@
     return null;
   }
   function isParticipantSourceModel(value, participantId, activityGetter, identityCache = /* @__PURE__ */ new WeakMap()) {
-    if (!isObject(value) || typeof value.isDisposed !== "function" || typeof value[activityGetter] !== "function") return false;
     try {
-      if (value.isDisposed()) return false;
-    } catch {
-      return false;
-    }
-    const proto = Object.getPrototypeOf(value);
-    let candidates = identityCache.get(proto);
-    if (!candidates) {
-      candidates = ownMethods(value, 1).filter(([name, fn]) => name !== activityGetter && fn.length === 0 && DELEGATING_GETTER.test(sourceOf(fn))).map(([name]) => name);
-      identityCache.set(proto, candidates);
-    }
-    for (const name of candidates) {
-      try {
-        if (value[name]() === participantId) return true;
-      } catch {
+      if (!isObject(value) || typeof value.isDisposed !== "function" || typeof value[activityGetter] !== "function") return false;
+      const proto = Object.getPrototypeOf(value);
+      if (!proto || proto === Object.prototype) return false;
+      let candidates = identityCache.get(proto);
+      if (!candidates) {
+        const shaped = DELEGATING_GETTER.test(sourceOf(proto[activityGetter]));
+        candidates = shaped ? ownMethods(value, 1).filter(([name, fn]) => name !== activityGetter && fn.length === 0 && DELEGATING_GETTER.test(sourceOf(fn))).map(([name]) => name) : [];
+        identityCache.set(proto, candidates);
       }
+      if (!candidates.length || value.isDisposed()) return false;
+      for (const name of candidates) {
+        try {
+          if (value[name]() === participantId) return true;
+        } catch {
+        }
+      }
+    } catch {
     }
     return false;
+  }
+  function valuesOf(object) {
+    try {
+      return Object.values(object);
+    } catch {
+      return [];
+    }
   }
   function discoverParticipantSourceModels(root, participantId, activityGetter, identityCache) {
     const found = [];
     const seen = /* @__PURE__ */ new Set();
     const consider = (value) => {
-      if (!isObject(value) || seen.has(value)) return false;
+      let object = false;
+      try {
+        object = isObject(value);
+      } catch {
+      }
+      if (!object || seen.has(value)) return false;
       seen.add(value);
       if (!isParticipantSourceModel(value, participantId, activityGetter, identityCache)) return false;
       found.push(value);
       return true;
     };
     for (const element of elementsOf(root, "[jsmodel],[jscontroller]")) {
-      for (const holder of holdersOf(element)) {
-        for (const value of Object.values(holder)) {
+      let holders = [];
+      try {
+        holders = holdersOf(element);
+      } catch {
+      }
+      for (const holder of holders) {
+        for (const value of valuesOf(holder)) {
           if (found.length >= MAX_MODELS_PER_ROOT) return found;
-          if (consider(value) || !isObject(value)) continue;
-          for (const nested of Object.values(value)) {
+          if (consider(value) || !seen.has(value)) continue;
+          for (const nested of valuesOf(value)) {
             if (found.length >= MAX_MODELS_PER_ROOT) return found;
             consider(nested);
           }
@@ -1046,8 +1066,7 @@
     }
     return found;
   }
-  function readLevel(model, participantId, getter, identityCache) {
-    if (!isParticipantSourceModel(model, participantId, getter, identityCache)) return null;
+  function readLevel(model, getter) {
     try {
       const level = model[getter]();
       return typeof level === "number" && Number.isFinite(level) && level >= 0 && level <= 1 ? level : null;
@@ -1060,6 +1079,8 @@
   }
   function createNativeActivitySource({ rediscoverMs = REDISCOVER_MS } = {}) {
     let getter = null;
+    let lastGetterAttempt = -Infinity;
+    let lastConfirmedAt = 0;
     const identityCache = /* @__PURE__ */ new WeakMap();
     const entries = /* @__PURE__ */ new Map();
     function rootsFor(participant, rootsByParticipantId) {
@@ -1070,7 +1091,7 @@
     function modelsFor(participant, roots, now) {
       const cached = entries.get(participant.key);
       const valid = cached?.models.filter((model) => isParticipantSourceModel(model, participant.participantId, getter, identityCache));
-      if (cached && cached.participantId === participant.participantId && valid.length === cached.models.length && valid.length && now - cached.discoveredAt < rediscoverMs) return valid;
+      if (cached && cached.participantId === participant.participantId && valid.length === cached.models.length && now - cached.discoveredAt < rediscoverMs) return valid;
       const models = [];
       for (const root of roots) {
         for (const model of discoverParticipantSourceModels(root, participant.participantId, getter, identityCache)) {
@@ -1080,7 +1101,7 @@
       entries.set(participant.key, { participantId: participant.participantId, models, discoveredAt: now });
       return models;
     }
-    function read(participants, root = globalThis.document, now = Date.now()) {
+    function readUnsafe(participants, root, now) {
       const rootsByParticipantId = /* @__PURE__ */ new Map();
       for (const element of root?.querySelectorAll?.("[data-participant-id]") || []) {
         const id = element.getAttribute?.("data-participant-id");
@@ -1088,7 +1109,12 @@
         if (!rootsByParticipantId.has(id)) rootsByParticipantId.set(id, []);
         rootsByParticipantId.get(id).push(element);
       }
-      if (!getter) {
+      if (getter && participants.length && now - lastConfirmedAt > GETTER_STALE_MS) {
+        getter = null;
+        entries.clear();
+      }
+      if (!getter && now - lastGetterAttempt >= GETTER_RETRY_MS) {
+        lastGetterAttempt = now;
         for (const roots of rootsByParticipantId.values()) {
           for (const candidate of roots) {
             getter = findActivityGetterName(candidate);
@@ -1096,6 +1122,7 @@
           }
           if (getter) break;
         }
+        if (getter) lastConfirmedAt = now;
       }
       const levels = /* @__PURE__ */ new Map();
       const unknown = [];
@@ -1106,7 +1133,7 @@
         const models = roots.length ? modelsFor(participant, roots, now) : [];
         let level = null;
         for (const model of models) {
-          const value = readLevel(model, participant.participantId, getter, identityCache);
+          const value = readLevel(model, getter);
           if (value !== null) level = Math.max(level ?? 0, value);
         }
         if (level === null) {
@@ -1116,7 +1143,15 @@
         levels.set(participant.key, level);
       }
       const speakers = participants.filter((participant) => isSpeakingLevel(levels.get(participant.key)));
+      if (levels.size) lastConfirmedAt = now;
       return { available: participants.length > 0 && unknown.length === 0, levels, unknown, speakers };
+    }
+    function read(participants, root = globalThis.document, now = Date.now()) {
+      try {
+        return readUnsafe(participants, root, now);
+      } catch {
+        return { available: false, levels: /* @__PURE__ */ new Map(), unknown: participants.map((participant) => participant.key), speakers: [] };
+      }
     }
     function reset() {
       entries.clear();
@@ -1325,7 +1360,7 @@
         if (participant.speaking) participant.lastSpeakingAt = now;
       }
       state.google.speakerSource = activity.available ? "meet-activity" : "unavailable";
-      state.google.unknownSpeakerKeys = activity.unknown;
+      state.google.unknownSpeakerCount = activity.unknown.length;
       return activity;
     }
     function neutralize(routingState, status) {

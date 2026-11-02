@@ -220,3 +220,61 @@ test('visibility changes alone never change the applied gain', () => {
     }
   })
 })
+
+test('hostile Meet objects (throwing getters, proxies, null prototypes) never escape the read', () => {
+  const a = nativeRoot('device-a', { level: { value: 0.6 } })
+  const holder = a.root.__jsmodel.A0Tiaf.pending.value
+  Object.defineProperty(holder, 'boom', { enumerable: true, get() { throw new Error('getter') } })
+  holder.proxy = new Proxy({}, { get() { throw new Error('proxy') }, ownKeys() { throw new Error('keys') } })
+  holder.bare = Object.assign(Object.create(null), { isDisposed: () => false, oa: () => 1 })
+  const source = createNativeActivitySource()
+  const result = source.read([participant('A', 'device-a', a.root)], documentWith(a.root), 0)
+  assert.equal(result.available, true)
+  assert.equal(result.levels.get('A'), 0.6)
+})
+
+test('a read that throws reports unavailable instead of throwing', () => {
+  const source = createNativeActivitySource()
+  const doc = { querySelectorAll() { throw new Error('dom') } }
+  const result = source.read([participant('A', 'device-a', null)], doc, 0)
+  assert.equal(result.available, false)
+  assert.deepEqual(result.unknown, ['A'])
+})
+
+test('objects without the source-model shape are never probed with getters', () => {
+  let called = 0
+  class Disposable { constructor() { this.Xa = { start: () => { called++; return 'device-a' } } }
+    isDisposed() { return false }
+    oa() { return 0.5 }
+    start(){return this.Xa.start()} }
+  const a = nativeRoot('device-a', { level: { value: 0 } })
+  a.root.__jsmodel.A0Tiaf.pending.value.other = new Disposable()
+  createNativeActivitySource().read([participant('A', 'device-a', a.root)], documentWith(a.root), 0)
+  assert.equal(called, 0)
+})
+
+test('getter discovery is retried at most once per second while unavailable', () => {
+  let scans = 0
+  const root = { isConnected: true, getAttribute: () => 'device-a', querySelectorAll: () => { scans++; return [] } }
+  const source = createNativeActivitySource()
+  const alice = participant('A', 'device-a', root)
+  for (let t = 0; t < 990; t += 30) source.read([alice], documentWith(root), t)
+  assert.equal(scans, 1)
+  source.read([alice], documentWith(root), 1000)
+  assert.equal(scans, 2)
+})
+
+test('controller neutralizes when Meet objects make the read fail mid-call', () => {
+  const a = nativeRoot('device-a', { level: { value: 0.6 } })
+  const alice = participant('A', 'device-a', a.root, 1.5)
+  const f = controllerFixture([a.root], [alice], true)
+  withClock(f.doc, setNow => {
+    setNow(0); f.controller.route()
+    setNow(60); f.controller.route()
+    assert.equal(f.slot.appliedMultiplier, 1.5)
+    f.doc.querySelectorAll = () => { throw new Error('dom') }
+    setNow(100); f.controller.route()
+    assert.equal(f.state.google.routingState, 'speaker-data-unavailable')
+    assert.equal(f.slot.appliedMultiplier, 1)
+  })
+})

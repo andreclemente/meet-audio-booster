@@ -240,7 +240,7 @@ export function createGoogleMeetController({ state, context, setStatus, renderSo
       if (participant.speaking) participant.lastSpeakingAt = now
     }
     state.google.speakerSource = activity.available ? 'meet-activity' : 'unavailable'
-    state.google.unknownSpeakerKeys = activity.unknown
+    state.google.unknownSpeakerCount = activity.unknown.length
     return activity
   }
   function neutralize(routingState, status) {
