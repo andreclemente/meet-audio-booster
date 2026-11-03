@@ -12,3 +12,17 @@ export const buttonStyles = {
 export const headerStyles = {
   display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '8px', marginBottom: '8px'
 }
+
+export const levelTrackStyles = {
+  position: 'relative', height: '3px', borderRadius: '999px', background: '#3c4043', margin: '1px 2px 5px'
+}
+
+export const levelFillStyles = {
+  position: 'absolute', left: '0', top: '0', height: '100%', width: '0%', borderRadius: '999px',
+  background: '#8ab4f8', opacity: '.9'
+}
+
+export const levelTickStyles = {
+  position: 'absolute', top: '-3px', left: '0%', width: '2px', height: '9px', marginLeft: '-1px',
+  borderRadius: '1px', background: '#e8eaed', display: 'none'
+}

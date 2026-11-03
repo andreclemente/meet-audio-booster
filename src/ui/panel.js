@@ -1,10 +1,90 @@
 import { PANEL_ID } from '../shared/constants.js'
-import { panelStyles, headerStyles } from './styles.js'
+import { panelStyles, headerStyles, buttonStyles } from './styles.js'
 import { makeButton, renderParticipantRow } from './participant-row.js'
+import { planBalance, isBalanceEligible, postVolumeDb, dbToScale } from './balance.js'
 
-export function createPanelController(state, { participants, onGain, onSave, onCollapse }) {
+const NOTICE_MS = 4000
+const BALANCE_LABEL = 'Balance volumes of participants already heard'
+const UNDO_LABEL = 'Undo balance'
+
+// A short action notice (e.g. "Balanced 3 voices") briefly takes precedence
+// over the routing status, which is rewritten on every routing tick.
+export function statusText(state, now = Date.now()) {
+  const notice = state.statusNotice
+  return notice && now < notice.until ? notice.message : state.status
+}
+
+function setStyle(element, name, value) {
+  if (element && element.style[name] !== value) element.style[name] = value
+}
+
+function updateLevelMeter(row, participant, levels) {
+  const track = row.querySelector('[data-role="level-track"]')
+  if (!track) return
+  const level = levels?.(participant.key) || null
+  const live = postVolumeDb(level?.liveDb, participant.value)
+  const typical = postVolumeDb(level?.typicalDb, participant.value)
+  const [fill, tick] = track.children
+  setStyle(fill, 'width', live === null ? '0%' : `${(dbToScale(live) * 100).toFixed(2)}%`)
+  setStyle(tick, 'display', typical === null ? 'none' : 'block')
+  if (typical !== null) setStyle(tick, 'left', `${(dbToScale(typical) * 100).toFixed(2)}%`)
+  const title = Number.isFinite(level?.typicalDb) ? 'Typical speaking level after your volume' : 'Not heard yet'
+  if (track.title !== title) track.title = title
+}
+
+export function createPanelController(state, { participants, levels = () => null, onGain, onSave, onCollapse }) {
+  // Volumes before the last Balance, kept only until any other volume change.
+  let balanceUndo = null
+  let balanceButton = null
+  function notify(message) {
+    state.statusNotice = { message, until: Date.now() + NOTICE_MS }
+    const status = document.getElementById(`${PANEL_ID}_status`)
+    if (status) status.textContent = message
+  }
+  function updateBalanceButton() {
+    const button = balanceButton
+    if (!button) return
+    const undo = Boolean(balanceUndo)
+    const eligible = undo ? 2 : participants().filter(participant => isBalanceEligible(participant, levels)).length
+    const text = undo ? 'Undo' : 'Balance'
+    if (button.textContent !== text) button.textContent = text
+    if (button.getAttribute('aria-label') !== (undo ? UNDO_LABEL : BALANCE_LABEL)) button.setAttribute('aria-label', undo ? UNDO_LABEL : BALANCE_LABEL)
+    setStyle(button, 'color', undo ? buttonStyles.color : '#8ab4f8')
+    setStyle(button, 'borderColor', undo ? '#5f6368' : '#8ab4f8')
+    const disabled = eligible < 2
+    if (button.disabled !== disabled) button.disabled = disabled
+    setStyle(button, 'opacity', disabled ? '.5' : '1')
+    setStyle(button, 'cursor', disabled ? 'default' : 'pointer')
+  }
+  function clearUndo() {
+    if (!balanceUndo) return
+    balanceUndo = null
+    updateBalanceButton()
+  }
+  function manualGain(participant, value) {
+    clearUndo()
+    onGain(participant, value)
+  }
+  function balanceOrUndo() {
+    if (balanceUndo) {
+      const previous = balanceUndo
+      balanceUndo = null
+      for (const participant of participants()) if (previous.has(participant.key)) onGain(participant, previous.get(participant.key))
+      updateBalanceButton()
+      return
+    }
+    const plan = planBalance(participants(), levels)
+    if (plan.eligible.length < 2) { notify('Not enough voices heard yet'); return }
+    if (plan.changes.every(change => change.to === change.from)) { notify('Volumes already balanced'); return }
+    const previous = new Map(plan.changes.map(change => [change.participant.key, change.from]))
+    for (const change of plan.changes) if (change.to !== change.from) onGain(change.participant, change.to)
+    balanceUndo = previous
+    updateBalanceButton()
+    notify(`Balanced ${plan.eligible.length} voices`)
+  }
   function updateLiveUi() {
     if (!state.panel?.isConnected) return
+    updateBalanceButton()
     for (const participant of participants()) {
       const row = [...state.panel.querySelectorAll('[data-participant-key]')].find(item => item.dataset.participantKey === participant.key)
       if (!row) continue
@@ -15,6 +95,7 @@ export function createPanelController(state, { participants, onGain, onSave, onC
       if (value) value.textContent = `${Math.round(participant.value * 100)}%`
       const slider = row.querySelector('[data-role="slider"]')
       if (slider && document.activeElement !== slider) slider.value = String(participant.value)
+      updateLevelMeter(row, participant, levels)
     }
   }
   function render() {
@@ -83,16 +164,18 @@ export function createPanelController(state, { participants, onGain, onSave, onC
       const empty = document.createElement('div'); empty.textContent = 'Waiting for remote participants…'
       Object.assign(empty.style, { opacity: '0.75', padding: '8px 0' }); list.append(empty)
     }
-    for (const participant of listItems) list.append(renderParticipantRow(participant, onGain))
+    for (const participant of listItems) list.append(renderParticipantRow(participant, manualGain))
     body.append(list)
     const footer = document.createElement('div')
     Object.assign(footer.style, { display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '6px', marginTop: '9px', paddingTop: '8px', borderTop: '1px solid #3c4043' })
     const status = document.createElement('div')
-    status.id = `${PANEL_ID}_status`; status.textContent = state.status
+    status.id = `${PANEL_ID}_status`; status.textContent = statusText(state)
     Object.assign(status.style, { minHeight: '14px', marginTop: '0', color: '#bdc1c6', fontSize: '11px', lineHeight: '14px', flex: '1 1 auto', minWidth: '0', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' })
-    const reset = makeButton('Reset all', () => { for (const participant of listItems) onGain(participant, 1); render() })
+    const reset = makeButton('Reset all', () => { balanceUndo = null; for (const participant of listItems) onGain(participant, 1); render() })
     reset.style.flex = '0 0 auto'
-    footer.append(status, reset)
+    balanceButton = makeButton('Balance', balanceOrUndo)
+    balanceButton.style.flex = '0 0 auto'
+    footer.append(status, balanceButton, reset)
     const support = document.createElement('a')
     support.textContent = 'Support development'
     support.href = 'https://buymeacoffee.com/andreclemente'

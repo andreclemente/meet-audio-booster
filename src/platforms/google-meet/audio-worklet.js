@@ -1,4 +1,37 @@
 import { readAudioParam, writeAudioParam } from '../../shared/audio.js'
+import { meanSquare } from './levels.js'
+
+const TAP_FFT_SIZE = 2048
+
+// A read-only level tap: an extra fan-out edge from Meet's worklet output to
+// an AnalyserNode that feeds nothing. It observes the signal entering the
+// booster gain and never changes the audible path or any gain. Optional: any
+// failure simply means no measurement for that slot.
+function createSourceTap(source, output, context, connect, disconnect) {
+  if (typeof context?.createAnalyser !== 'function') return null
+  let analyser
+  try {
+    analyser = context.createAnalyser()
+    analyser.fftSize = TAP_FFT_SIZE
+    connect.call(source, analyser, output)
+  } catch { return null }
+  const buffer = new Float32Array(analyser.fftSize || TAP_FFT_SIZE)
+  let connected = true
+  return {
+    analyser,
+    buffer,
+    readMeanSquare() {
+      if (!connected) return 0
+      try { analyser.getFloatTimeDomainData(buffer) } catch { return 0 }
+      return meanSquare(buffer)
+    },
+    disconnect() {
+      if (!connected) return
+      connected = false
+      try { disconnect.call(source, analyser, output, 0) } catch {}
+    }
+  }
+}
 
 function normalizeIndex(value) {
   return value === undefined ? 0 : value
@@ -58,8 +91,9 @@ export function installAudioWorkletHook(onSlot, onRemove = () => {}) {
       }
       throw error
     }
-    mappings.push({ source: this, destination, booster, output, input, originalArgs: [...args] })
-    try { onSlot(booster) } catch {}
+    const tap = createSourceTap(this, output, destination.context, originalConnect, originalDisconnect)
+    mappings.push({ source: this, destination, booster, output, input, tap, originalArgs: [...args] })
+    try { onSlot(booster, tap) } catch {}
     return destination
   }
 
@@ -78,6 +112,7 @@ export function installAudioWorkletHook(onSlot, onRemove = () => {}) {
     }
     for (const mapping of matched) {
       try { originalDisconnect.call(mapping.booster, mapping.destination, 0, mapping.input) } catch {}
+      mapping.tap?.disconnect()
       const index = mappings.indexOf(mapping)
       if (index >= 0) mappings.splice(index, 1)
       try { onRemove(mapping.booster) } catch {}
@@ -106,6 +141,7 @@ export function installAudioWorkletHook(onSlot, onRemove = () => {}) {
         try { originalDisconnect.call(mapping.booster, mapping.destination, 0, mapping.input) } catch {}
         try { onRemove(mapping.booster) } catch {}
       }
+      mapping.tap?.disconnect()
     }
     mappings.length = 0
     if (AudioNode.prototype.connect === connectWrapper) AudioNode.prototype.connect = originalConnect
@@ -114,7 +150,7 @@ export function installAudioWorkletHook(onSlot, onRemove = () => {}) {
   }
 }
 
-export function createPooledSlot(gain, id) {
+export function createPooledSlot(gain, id, tap = null) {
   const baseGain = readAudioParam(gain.gain)
   let neutralized = true
   return {
@@ -125,6 +161,7 @@ export function createPooledSlot(gain, id) {
     appliedMultiplier: 1,
     targetValue: baseGain,
     participantKey: null,
+    tap,
     get actualValue() { return readAudioParam(gain.gain) },
     set(multiplier, immediate = false) {
       const safe = Number.isFinite(multiplier) ? Math.max(0, multiplier) : 1
@@ -144,6 +181,6 @@ export function createPooledSlot(gain, id) {
       this.participantKey = null
     },
     neutral() { this.release() },
-    destroy() { this.release() }
+    destroy() { this.release(); tap?.disconnect() }
   }
 }

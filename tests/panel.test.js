@@ -4,6 +4,8 @@ import { createState } from '../src/state.js'
 import { createPanelController } from '../src/ui/panel.js'
 import { saveSettings } from '../src/storage.js'
 import { PANEL_ID } from '../src/shared/constants.js'
+import { dbToScale } from '../src/ui/balance.js'
+import { statusText } from '../src/ui/panel.js'
 
 // Minimal DOM surface used by the production panel; no UI implementation is mocked.
 class Element {
@@ -45,14 +47,16 @@ function fixture(t) {
   const alice = { key: 'alice', name: 'Alice', platform: 'google-meet', value: 2.5 }
   const people = [alice]
   const gains = [], saves = [], collapses = []
-  const controller = createPanelController(state, { participants: () => people, onGain: (person, value) => { gains.push([person.key, value]); person.value = value }, onSave: position => saves.push(position), onCollapse: value => collapses.push(value) })
+  const levelData = new Map()
+  const controller = createPanelController(state, { participants: () => people, levels: key => levelData.get(key) ?? null, onGain: (person, value) => { gains.push([person.key, value]); person.value = value }, onSave: position => saves.push(position), onCollapse: value => collapses.push(value) })
   controller.render()
   const parts = () => {
     const [header, body] = state.panel.children
     const buttons = header.querySelectorAll('button')
-    return { header, body, collapse: buttons[0], close: buttons[1] }
+    const footerButtons = body.children[1].querySelectorAll('button')
+    return { header, body, collapse: buttons[0], close: buttons[1], balance: footerButtons[0], reset: footerButtons[1] }
   }
-  return { state, controller, parts, document, events, gains, saves, collapses, people, alice }
+  return { state, controller, parts, document, events, gains, saves, collapses, people, alice, levelData }
 }
 
 test('existing controls have participant-specific accessible names and close label', t => {
@@ -65,7 +69,7 @@ test('existing controls have participant-specific accessible names and close lab
 
 test('roster rerender restores focused participant control without changing gain', t => {
   const { state, controller, document, people, gains, parts } = fixture(t)
-  for (const getControl of [() => state.panel.querySelector('[data-role="slider"]'), () => state.panel.querySelectorAll('[data-participant-key]')[0].querySelectorAll('button')[2], () => parts().collapse, () => parts().close, () => parts().body.children[1].querySelector('button')]) {
+  for (const getControl of [() => state.panel.querySelector('[data-role="slider"]'), () => state.panel.querySelectorAll('[data-participant-key]')[0].querySelectorAll('button')[2], () => parts().collapse, () => parts().close, () => parts().reset]) {
     const before = getControl()
     before.focus()
     if (people.length === 1) people.push({ key: 'bob', name: 'Bob', platform: 'google-meet', value: 1 })
@@ -130,7 +134,7 @@ test('panel starts expanded with collapse immediately left of close and one comp
   assert.match(header.children[0].children[1].textContent, /1 participant/)
   assert.equal(body.children.length, 3)
   assert.equal(body.children[0].querySelectorAll('[data-participant-key]').length, 1)
-  assert.equal(body.children[1].querySelector('button').textContent, 'Reset all')
+  assert.equal(parts().reset.textContent, 'Reset all')
   assert.equal(body.children[1].children[0].textContent, state.status)
   assert.equal(body.children[2].textContent, 'Support development')
   assertExpanded(parts(), true)
@@ -182,7 +186,7 @@ test('rerender, live updates and toolbar hide/show retain collapse; reset and cl
   assert.equal(state.panel.style.display, 'block')
   assertExpanded(parts(), false)
   parts().collapse.click()
-  parts().body.children[1].querySelector('button').click()
+  parts().reset.click()
   assert.deepEqual(gains, [['alice', 1], ['bob', 1]])
   assertExpanded(parts(), true)
   parts().close.click()
@@ -223,7 +227,10 @@ test('approved support layout keeps exact dynamic status left of Reset all and s
   const [list, footer, support] = parts().body.children
   const status = document.getElementById(`${PANEL_ID}_status`)
   assert.equal(list.querySelectorAll('[data-participant-key]').length, 1)
-  assert.deepEqual(footer.children, [status, footer.querySelector('button')])
+  const [balance, reset] = footer.querySelectorAll('button')
+  assert.deepEqual(footer.children, [status, balance, reset])
+  assert.equal(balance.textContent, 'Balance')
+  assert.equal(reset.textContent, 'Reset all')
   assert.equal(footer.style.justifyContent, 'space-between')
   assert.equal(status.textContent, state.status)
   assert.equal(status.style.marginTop, '0')
@@ -231,7 +238,8 @@ test('approved support layout keeps exact dynamic status left of Reset all and s
   assert.equal(status.style.overflow, 'hidden')
   assert.equal(status.style.textOverflow, 'ellipsis')
   assert.equal(status.style.whiteSpace, 'nowrap')
-  assert.equal(footer.querySelector('button').style.flex, '0 0 auto')
+  assert.equal(reset.style.flex, '0 0 auto')
+  assert.equal(balance.style.flex, '0 0 auto')
   assert.equal(support.tagName, 'a')
   assert.equal(support.textContent, 'Support development')
   assert.equal(support.style.marginTop, '7px')
@@ -276,7 +284,7 @@ test('complete collapsed body contains support and status across roster rerender
   assert.equal(state.panel.querySelector('a').parentElement, parts().body)
   assert.equal(parts().body.children[1].children[0].id, `${PANEL_ID}_status`)
   parts().collapse.click()
-  parts().body.children[1].querySelector('button').click()
+  parts().reset.click()
   assert.deepEqual(gains, [['alice', 1], ['bob', 1]])
   assertExpanded(parts(), true)
   assert.equal(state.panel.querySelectorAll('a').length, 1)
@@ -377,7 +385,7 @@ test('title toggle persists restored state and survives roster, reset, toolbar a
   assertExpanded(parts(), false)
   doubleClick(parts().header.children[0].children[0])
   assert.equal(createState(storage).panelCollapsed, false)
-  parts().body.children[1].querySelector('button').click()
+  parts().reset.click()
   assert.deepEqual(gains, [['alice', 1], ['bob', 1]])
   doubleClick(parts().header.children[0].children[0])
   assertExpanded(parts(), false)
@@ -396,4 +404,174 @@ test('only dragging calls position save, not collapse callback', t => {
   events.mouseup()
   assert.deepEqual(saves, [{ left: 42, top: 112 }])
   assert.deepEqual(collapses, [])
+})
+
+const pct = db => `${(dbToScale(db) * 100).toFixed(2)}%`
+const meterOf = row => {
+  const track = row.querySelector('[data-role="level-track"]')
+  return { track, fill: track?.querySelector('[data-role="level-fill"]'), tick: track?.querySelector('[data-role="level-tick"]') }
+}
+const rowOf = (state, key) => state.panel.querySelectorAll('[data-participant-key]').find(row => row.dataset.participantKey === key)
+const withBob = (fixtureValue, value = 1) => {
+  fixtureValue.people.push({ key: 'bob', name: 'Bob', platform: 'google-meet', value })
+  fixtureValue.controller.render()
+}
+
+test('each row has an aria-hidden level line under its slider with no tick until a typical level is known', t => {
+  const f = fixture(t)
+  withBob(f)
+  for (const key of ['alice', 'bob']) {
+    const row = rowOf(f.state, key)
+    const { track, fill, tick } = meterOf(row)
+    assert.ok(track && fill && tick, key)
+    assert.equal(row.children.indexOf(track), row.children.indexOf(row.querySelector('[data-role="slider"]')) + 1)
+    assert.equal(track.getAttribute('aria-hidden'), 'true')
+    assert.equal(track.title, 'Not heard yet')
+    assert.equal(track.style.height, '3px')
+    assert.equal(track.style.background, '#3c4043')
+    assert.equal(track.style.margin, '1px 2px 5px')
+    assert.equal(fill.style.background, '#8ab4f8')
+    assert.equal(fill.style.opacity, '.9')
+    assert.equal(fill.style.width, '0%')
+    assert.equal(tick.style.display, 'none')
+    assert.equal(tick.style.background, '#e8eaed')
+    assert.equal(tick.style.width, '2px')
+    assert.equal(tick.style.height, '9px')
+    assert.equal(tick.style.top, '-3px')
+  }
+  assert.equal(f.state.panel.querySelectorAll('[data-role="level-track"]').length, 2)
+})
+
+test('live updates move fill/tick after volume without re-rendering rows', t => {
+  const f = fixture(t)
+  const row = rowOf(f.state, 'alice')
+  const { track, fill, tick } = meterOf(row)
+  f.levelData.set('alice', { liveDb: -30, typicalDb: null })
+  f.controller.updateLiveUi()
+  assert.equal(fill.style.width, pct(-30 + 20 * Math.log10(2.5)))
+  assert.equal(tick.style.display, 'none')
+  assert.equal(track.title, 'Not heard yet')
+  f.levelData.set('alice', { liveDb: null, typicalDb: -36 })
+  f.alice.value = 1
+  f.controller.updateLiveUi()
+  assert.equal(rowOf(f.state, 'alice'), row)
+  assert.equal(meterOf(rowOf(f.state, 'alice')).fill, fill)
+  assert.equal(fill.style.width, '0%')
+  assert.equal(tick.style.display, 'block')
+  assert.equal(tick.style.left, pct(-36))
+  assert.equal(track.title, 'Typical speaking level after your volume')
+  f.alice.value = 2
+  f.controller.updateLiveUi()
+  assert.equal(tick.style.left, pct(-36 + 20 * Math.log10(2)))
+  // Muted: no tick or fill.
+  f.alice.value = 0
+  f.levelData.set('alice', { liveDb: -20, typicalDb: -36 })
+  f.controller.updateLiveUi()
+  assert.equal(fill.style.width, '0%')
+  assert.equal(tick.style.display, 'none')
+  assert.deepEqual(f.gains, [])
+})
+
+test('Balance sits before Reset all with blue accent and is disabled until two voices are heard', t => {
+  const f = fixture(t)
+  const { balance, reset } = f.parts()
+  assert.equal(balance.parentElement, reset.parentElement)
+  assert.equal(balance.textContent, 'Balance')
+  assert.equal(balance.getAttribute('aria-label'), 'Balance volumes of participants already heard')
+  assert.equal(balance.style.color, '#8ab4f8')
+  assert.equal(balance.style.borderColor, '#8ab4f8')
+  assert.equal(balance.disabled, true)
+  withBob(f)
+  f.levelData.set('alice', { typicalDb: -30 })
+  f.controller.updateLiveUi()
+  assert.equal(f.parts().balance.disabled, true)
+  f.levelData.set('bob', { typicalDb: -30 })
+  f.controller.updateLiveUi()
+  assert.equal(f.parts().balance.disabled, false)
+  // Muted participant does not count.
+  f.people[1].value = 0
+  f.controller.updateLiveUi()
+  assert.equal(f.parts().balance.disabled, true)
+})
+
+test('Balance with fewer than two eligible voices is a no-op with a status notice', t => {
+  const f = fixture(t)
+  f.levelData.set('alice', { typicalDb: -30 })
+  f.parts().balance.onclick()
+  assert.deepEqual(f.gains, [])
+  assert.equal(f.document.getElementById(`${PANEL_ID}_status`).textContent, 'Not enough voices heard yet')
+  assert.equal(f.parts().balance.textContent, 'Balance')
+})
+
+test('Balance when volumes already line up changes nothing and offers no Undo', t => {
+  const f = fixture(t)
+  withBob(f, 1)
+  f.controller.render()
+  // Alice post = -40 + 7.96 = -32.04, Bob post = -32.04
+  f.levelData.set('alice', { typicalDb: -40 })
+  f.levelData.set('bob', { typicalDb: -32.04 })
+  f.controller.updateLiveUi()
+  f.parts().balance.click()
+  assert.deepEqual(f.gains, [])
+  assert.equal(f.document.getElementById(`${PANEL_ID}_status`).textContent, 'Volumes already balanced')
+  assert.equal(f.parts().balance.textContent, 'Balance')
+})
+
+test('Balance applies median-aligned volumes through onGain, then Undo restores them', t => {
+  const f = fixture(t)
+  withBob(f, 1)
+  f.people.push({ key: 'cara', name: 'Cara', platform: 'google-meet', value: 0 })
+  f.people.push({ key: 'dan', name: 'Dan', platform: 'google-meet', value: 1 })
+  f.controller.render()
+  // Alice post = -40 + 7.96 = -32.04, Bob post = -20 => median -26.02
+  f.levelData.set('alice', { typicalDb: -40 })
+  f.levelData.set('bob', { typicalDb: -20 })
+  f.levelData.set('cara', { typicalDb: -10 })
+  f.controller.updateLiveUi()
+  f.parts().balance.click()
+  assert.deepEqual(f.gains.map(([key]) => key).sort(), ['alice', 'bob'])
+  assert.equal(f.alice.value, 5)
+  assert.equal(f.people[1].value, 0.5)
+  assert.equal(f.people[2].value, 0)
+  assert.equal(f.people[3].value, 1)
+  assert.equal(f.document.getElementById(`${PANEL_ID}_status`).textContent, 'Balanced 2 voices')
+  const undo = f.parts().balance
+  assert.equal(undo.textContent, 'Undo')
+  assert.equal(undo.getAttribute('aria-label'), 'Undo balance')
+  assert.equal(undo.style.color, '#fff')
+  assert.equal(undo.style.borderColor, '#5f6368')
+  assert.equal(undo.disabled, false)
+  // Undo survives live updates and a roster render.
+  f.controller.updateLiveUi(); f.controller.render()
+  assert.equal(f.parts().balance.textContent, 'Undo')
+  f.gains.length = 0
+  f.parts().balance.click()
+  assert.deepEqual(f.gains.sort(), [['alice', 2.5], ['bob', 1]])
+  assert.equal(f.parts().balance.textContent, 'Balance')
+  assert.equal(f.parts().balance.getAttribute('aria-label'), 'Balance volumes of participants already heard')
+})
+
+test('Undo disappears after any manual volume change or Reset all', t => {
+  for (const action of ['slider', 'preset', 'reset']) {
+    const f = fixture(t)
+    withBob(f, 1)
+    f.levelData.set('alice', { typicalDb: -40 })
+    f.levelData.set('bob', { typicalDb: -20 })
+    f.controller.updateLiveUi()
+    f.parts().balance.click()
+    assert.equal(f.parts().balance.textContent, 'Undo')
+    const row = rowOf(f.state, 'bob')
+    if (action === 'slider') { const slider = row.querySelector('[data-role="slider"]'); slider.value = '1.5'; slider.oninput() }
+    if (action === 'preset') row.querySelectorAll('button')[1].click()
+    if (action === 'reset') f.parts().reset.click()
+    assert.equal(f.parts().balance.textContent, 'Balance', action)
+    assert.equal(f.parts().balance.getAttribute('aria-label'), 'Balance volumes of participants already heard')
+  }
+})
+
+test('status notice briefly overrides routing status, then routing status returns', () => {
+  const state = { status: 'Alice · automatic routing', statusNotice: { message: 'Balanced 2 voices', until: 1000 } }
+  assert.equal(statusText(state, 999), 'Balanced 2 voices')
+  assert.equal(statusText(state, 1000), 'Alice · automatic routing')
+  assert.equal(statusText({ status: 'Ready' }, 0), 'Ready')
 })

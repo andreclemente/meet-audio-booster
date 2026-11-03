@@ -543,7 +543,165 @@
     }
   }
 
+  // src/platforms/google-meet/levels.js
+  var LEVEL_SAMPLE_MS = 100;
+  var LEVEL_NOISE_FLOOR_DB = -55;
+  var LEVEL_WARMUP_FRAMES = 30;
+  var LEVEL_SETTLE_MS = 250;
+  var LEVEL_WINDOW_FRAMES = 300;
+  function meanSquare(buffer) {
+    if (!buffer?.length) return 0;
+    let sum = 0;
+    for (let index = 0; index < buffer.length; index++) sum += buffer[index] * buffer[index];
+    return sum / buffer.length;
+  }
+  function powerToDb(power) {
+    return Number.isFinite(power) && power > 0 ? 10 * Math.log10(power) : -Infinity;
+  }
+  function sumTapPower(slots) {
+    let power = 0;
+    for (const slot of slots || []) {
+      const value = slot?.tap ? slot.tap.readMeanSquare() : 0;
+      if (Number.isFinite(value) && value > 0) power += value;
+    }
+    return power;
+  }
+  function sumPipelinePower(pipelines) {
+    let power = 0;
+    for (const pipeline of pipelines || []) {
+      const rms = Number(pipeline?.rms);
+      if (Number.isFinite(rms) && rms > 0) power += rms * rms;
+    }
+    return power;
+  }
+  function attributeLevelSample({ available, speakers, routingState, appliedParticipantKey, localPresentationActive } = {}) {
+    if (available !== true || localPresentationActive) return null;
+    if (!Array.isArray(speakers) || speakers.length !== 1) return null;
+    const key = speakers[0]?.key;
+    if (!key || routingState !== "confirmed-speaker" || appliedParticipantKey !== key) return null;
+    return key;
+  }
+  function createTypicalLevelEstimator({ warmupFrames = LEVEL_WARMUP_FRAMES, window = LEVEL_WINDOW_FRAMES } = {}) {
+    if (!(window >= 1)) throw new RangeError("window must be positive");
+    const ring = new Float64Array(window);
+    const scratch = new Float64Array(window);
+    let next = 0, size = 0, total = 0, cached = null;
+    return {
+      add(db) {
+        if (!Number.isFinite(db)) return;
+        ring[next] = db;
+        next = (next + 1) % window;
+        size = Math.min(size + 1, window);
+        total++;
+        cached = null;
+      },
+      get frames() {
+        return total;
+      },
+      get typicalDb() {
+        if (total < warmupFrames || !size) return null;
+        if (cached === null) {
+          const sorted = scratch.subarray(0, size);
+          sorted.set(ring.subarray(0, size));
+          sorted.sort();
+          const middle = size >> 1;
+          cached = size % 2 ? sorted[middle] : (sorted[middle - 1] + sorted[middle]) / 2;
+        }
+        return cached;
+      }
+    };
+  }
+  function createParticipantLevelMeter({
+    sampleMs = LEVEL_SAMPLE_MS,
+    noiseFloorDb = LEVEL_NOISE_FLOOR_DB,
+    warmupFrames = LEVEL_WARMUP_FRAMES,
+    settleMs = LEVEL_SETTLE_MS,
+    window = LEVEL_WINDOW_FRAMES
+  } = {}) {
+    const estimators = /* @__PURE__ */ new Map();
+    let lastSampleAt = -Infinity;
+    let settleKey = null;
+    let settleSince = 0;
+    let live = null;
+    function prune(participantKeys) {
+      if (!estimators.size) return;
+      const present = participantKeys instanceof Set ? participantKeys : new Set(participantKeys || []);
+      for (const key of estimators.keys()) if (!present.has(key)) estimators.delete(key);
+      if (live && !present.has(live.key)) live = null;
+    }
+    function tick({ now, participantKeys, attributedKey = null, readPower }) {
+      prune(participantKeys);
+      if (attributedKey !== settleKey) {
+        settleKey = attributedKey;
+        settleSince = now;
+      }
+      if (!attributedKey || live?.key !== attributedKey) live = null;
+      if (now - lastSampleAt < sampleMs) return false;
+      lastSampleAt = now;
+      live = null;
+      if (!attributedKey || now - settleSince < settleMs) return false;
+      const db = powerToDb(readPower());
+      if (!(db >= noiseFloorDb)) return false;
+      live = { key: attributedKey, db: Math.min(db, 0) };
+      let estimator = estimators.get(attributedKey);
+      if (!estimator) estimators.set(attributedKey, estimator = createTypicalLevelEstimator({ warmupFrames, window }));
+      estimator.add(live.db);
+      return true;
+    }
+    function levelFor(key) {
+      const estimator = estimators.get(key);
+      return {
+        liveDb: live?.key === key ? live.db : null,
+        typicalDb: estimator ? estimator.typicalDb : null,
+        frames: estimator ? estimator.frames : 0
+      };
+    }
+    function reset() {
+      estimators.clear();
+      live = null;
+      settleKey = null;
+      settleSince = 0;
+      lastSampleAt = -Infinity;
+    }
+    return { tick, levelFor, reset };
+  }
+
   // src/platforms/google-meet/audio-worklet.js
+  var TAP_FFT_SIZE = 2048;
+  function createSourceTap(source, output, context, connect, disconnect) {
+    if (typeof context?.createAnalyser !== "function") return null;
+    let analyser;
+    try {
+      analyser = context.createAnalyser();
+      analyser.fftSize = TAP_FFT_SIZE;
+      connect.call(source, analyser, output);
+    } catch {
+      return null;
+    }
+    const buffer = new Float32Array(analyser.fftSize || TAP_FFT_SIZE);
+    let connected = true;
+    return {
+      analyser,
+      buffer,
+      readMeanSquare() {
+        if (!connected) return 0;
+        try {
+          analyser.getFloatTimeDomainData(buffer);
+        } catch {
+          return 0;
+        }
+        return meanSquare(buffer);
+      },
+      disconnect() {
+        if (!connected) return;
+        connected = false;
+        try {
+          disconnect.call(source, analyser, output, 0);
+        } catch {
+        }
+      }
+    };
+  }
   function normalizeIndex(value) {
     return value === void 0 ? 0 : value;
   }
@@ -604,9 +762,10 @@
         }
         throw error;
       }
-      mappings.push({ source: this, destination, booster, output, input, originalArgs: [...args] });
+      const tap = createSourceTap(this, output, destination.context, originalConnect, originalDisconnect);
+      mappings.push({ source: this, destination, booster, output, input, tap, originalArgs: [...args] });
       try {
-        onSlot(booster);
+        onSlot(booster, tap);
       } catch {
       }
       return destination;
@@ -635,6 +794,7 @@
           originalDisconnect.call(mapping.booster, mapping.destination, 0, mapping.input);
         } catch {
         }
+        mapping.tap?.disconnect();
         const index = mappings.indexOf(mapping);
         if (index >= 0) mappings.splice(index, 1);
         try {
@@ -675,6 +835,7 @@
           } catch {
           }
         }
+        mapping.tap?.disconnect();
       }
       mappings.length = 0;
       if (AudioNode.prototype.connect === connectWrapper) AudioNode.prototype.connect = originalConnect;
@@ -682,7 +843,7 @@
       delete globalThis.__meetingAudioBoosterWorkletHook;
     };
   }
-  function createPooledSlot(gain, id) {
+  function createPooledSlot(gain, id, tap = null) {
     const baseGain = readAudioParam(gain.gain);
     let neutralized = true;
     return {
@@ -693,6 +854,7 @@
       appliedMultiplier: 1,
       targetValue: baseGain,
       participantKey: null,
+      tap,
       get actualValue() {
         return readAudioParam(gain.gain);
       },
@@ -718,6 +880,7 @@
       },
       destroy() {
         this.release();
+        tap?.disconnect();
       }
     };
   }
@@ -1244,6 +1407,7 @@
     const media = createMediaPipelineManager(context);
     const workletSpeakerTracker = createWorkletSpeakerTracker();
     const nativeActivity = createNativeActivitySource();
+    const levelMeter = createParticipantLevelMeter();
     const selfIds = /* @__PURE__ */ new Set();
     let restoreHook, restoreCaptureHook, observer, mutationTimer, reconcileTimer, mediaTimer, routingTimer, visibilityHandler, slotCounter = 0;
     let capturePresentationActive = false;
@@ -1291,9 +1455,9 @@
       } else if (mode === "media") applyMediaPipelineOutputs(media.pipelines, null, 1, true);
       renderSoon();
     }
-    function registerSlot(gain) {
+    function registerSlot(gain, tap = null) {
       if (state.google.slots.some((slot) => slot.gain === gain)) return;
-      state.google.slots.push(createPooledSlot(gain, `slot-${++slotCounter}`));
+      state.google.slots.push(createPooledSlot(gain, `slot-${++slotCounter}`, tap));
       setMode("worklet");
       syncPresentationState();
       renderSoon();
@@ -1426,6 +1590,25 @@
       const active = state.participants.get(routing.appliedParticipantKey);
       setStatus(active ? `${active.name} · automatic routing` : labels[routing.routingState] || `${participants().length} participants ready`);
     }
+    function sampleLevels(now, activity = null) {
+      const g = state.google;
+      const attributedKey = activity && attributeLevelSample({
+        available: activity.available,
+        speakers: activity.speakers,
+        routingState: g.routingState,
+        appliedParticipantKey: g.appliedParticipantKey,
+        localPresentationActive: g.localPresentationActive
+      });
+      try {
+        levelMeter.tick({
+          now,
+          participantKeys: participants().map((item) => item.key),
+          attributedKey,
+          readPower: () => g.mode === "media" ? sumPipelinePower(media.pipelines) : g.mode === "worklet" ? sumTapPower(g.slots) : 0
+        });
+      } catch {
+      }
+    }
     function route() {
       if (state.google.localPresentationActive && state.google.mode === "media") {
         for (const slot of state.google.slots) slot.release();
@@ -1436,6 +1619,7 @@
         state.google.transitionGuard.candidateParticipantKey = null;
         state.google.transitionGuard.candidateSince = 0;
         setStatus("Presenting · own presentation audio bypassed");
+        sampleLevels(Date.now());
         updateLiveUi();
         return;
       }
@@ -1443,12 +1627,14 @@
       const activity = currentSpeakers(now);
       if (!activity.available) {
         neutralize("speaker-data-unavailable", participants().length ? "Speaker data unavailable · using safe 100% volume" : "Waiting for participants");
+        sampleLevels(now, activity);
         updateLiveUi();
         return;
       }
       const speakers = activity.speakers;
       if (state.google.mode === "media") routeMedia(now, speakers);
       else routeWorklet(now, speakers);
+      sampleLevels(now, activity);
       updateLiveUi();
     }
     function start() {
@@ -1483,14 +1669,23 @@
       selfIds.clear();
       workletSpeakerTracker.reset();
       nativeActivity.reset();
+      levelMeter.reset();
     }
     function applyParticipantGain(participant) {
       if (syncPresentationState() && state.google.mode === "media") return;
       if (state.google.activeParticipantKey === participant.key) setOutputs(participant.value);
     }
-    return { start, stop, route, applyParticipantGain, setOutputs, get pipelines() {
-      return media.pipelines;
-    } };
+    return {
+      start,
+      stop,
+      route,
+      applyParticipantGain,
+      setOutputs,
+      levelFor: (key) => levelMeter.levelFor(key),
+      get pipelines() {
+        return media.pipelines;
+      }
+    };
   }
 
   // src/ui/styles.js
@@ -1524,6 +1719,34 @@
     alignItems: "center",
     gap: "8px",
     marginBottom: "8px"
+  };
+  var levelTrackStyles = {
+    position: "relative",
+    height: "3px",
+    borderRadius: "999px",
+    background: "#3c4043",
+    margin: "1px 2px 5px"
+  };
+  var levelFillStyles = {
+    position: "absolute",
+    left: "0",
+    top: "0",
+    height: "100%",
+    width: "0%",
+    borderRadius: "999px",
+    background: "#8ab4f8",
+    opacity: ".9"
+  };
+  var levelTickStyles = {
+    position: "absolute",
+    top: "-3px",
+    left: "0%",
+    width: "2px",
+    height: "9px",
+    marginLeft: "-1px",
+    borderRadius: "1px",
+    background: "#e8eaed",
+    display: "none"
   };
 
   // src/ui/participant-row.js
@@ -1568,6 +1791,7 @@
       value.textContent = `${Math.round(next * 100)}%`;
     };
     const presets = document.createElement("div");
+    const meter = renderLevelMeter();
     Object.assign(presets.style, { display: "flex", gap: "5px", marginTop: "7px", flexWrap: "wrap" });
     for (const [text, gain] of [["Mute", 0], ["50%", 0.5], ["100%", 1], ["250%", 2.5]]) {
       const button = makeButton(text, () => {
@@ -1578,14 +1802,149 @@
       button.setAttribute("aria-label", `${text} for ${participant.name}`);
       presets.append(button);
     }
-    row.append(top, slider, presets);
+    row.append(top, slider, meter, presets);
     return row;
+  }
+  function renderLevelMeter() {
+    const track = document.createElement("div");
+    track.dataset.role = "level-track";
+    track.setAttribute("aria-hidden", "true");
+    track.title = "Not heard yet";
+    Object.assign(track.style, levelTrackStyles);
+    const fill = document.createElement("div");
+    fill.dataset.role = "level-fill";
+    Object.assign(fill.style, levelFillStyles);
+    const tick = document.createElement("div");
+    tick.dataset.role = "level-tick";
+    Object.assign(tick.style, levelTickStyles);
+    track.append(fill, tick);
+    return track;
+  }
+
+  // src/ui/balance.js
+  var LEVEL_SCALE_MIN_DB = -60;
+  var VOLUME_MIN = 0.05;
+  var VOLUME_MAX = 6;
+  var VOLUME_STEP = 0.05;
+  function dbToScale(db) {
+    if (typeof db !== "number" || Number.isNaN(db)) return 0;
+    return Math.min(1, Math.max(0, (db - LEVEL_SCALE_MIN_DB) / -LEVEL_SCALE_MIN_DB));
+  }
+  function postVolumeDb(preDb, volume) {
+    if (!Number.isFinite(preDb) || !Number.isFinite(volume) || volume <= 0) return null;
+    return preDb + 20 * Math.log10(volume);
+  }
+  function roundVolume(value) {
+    const stepped = Math.round(value / VOLUME_STEP) * VOLUME_STEP;
+    return Number(Math.min(VOLUME_MAX, Math.max(VOLUME_MIN, stepped)).toFixed(2));
+  }
+  function typicalOf(participant, levels) {
+    const typical = levels?.(participant.key)?.typicalDb;
+    return Number.isFinite(typical) ? typical : null;
+  }
+  function isBalanceEligible(participant, levels) {
+    return Number.isFinite(participant?.value) && participant.value > 0 && typicalOf(participant, levels) !== null;
+  }
+  function median(values) {
+    const sorted = [...values].sort((a, b) => a - b);
+    const middle = sorted.length >> 1;
+    return sorted.length % 2 ? sorted[middle] : (sorted[middle - 1] + sorted[middle]) / 2;
+  }
+  function planBalance(participants, levels) {
+    const eligible = participants.filter((participant) => isBalanceEligible(participant, levels));
+    if (eligible.length < 2) return { eligible, target: null, changes: [] };
+    const post = eligible.map((participant) => postVolumeDb(typicalOf(participant, levels), participant.value));
+    const target = median(post);
+    const changes = eligible.map((participant, index) => ({
+      participant,
+      from: participant.value,
+      to: roundVolume(participant.value * 10 ** ((target - post[index]) / 20))
+    }));
+    return { eligible, target, changes };
   }
 
   // src/ui/panel.js
-  function createPanelController(state, { participants, onGain, onSave, onCollapse }) {
+  var NOTICE_MS = 4e3;
+  var BALANCE_LABEL = "Balance volumes of participants already heard";
+  var UNDO_LABEL = "Undo balance";
+  function statusText(state, now = Date.now()) {
+    const notice = state.statusNotice;
+    return notice && now < notice.until ? notice.message : state.status;
+  }
+  function setStyle(element, name, value) {
+    if (element && element.style[name] !== value) element.style[name] = value;
+  }
+  function updateLevelMeter(row, participant, levels) {
+    const track = row.querySelector('[data-role="level-track"]');
+    if (!track) return;
+    const level = levels?.(participant.key) || null;
+    const live = postVolumeDb(level?.liveDb, participant.value);
+    const typical = postVolumeDb(level?.typicalDb, participant.value);
+    const [fill, tick] = track.children;
+    setStyle(fill, "width", live === null ? "0%" : `${(dbToScale(live) * 100).toFixed(2)}%`);
+    setStyle(tick, "display", typical === null ? "none" : "block");
+    if (typical !== null) setStyle(tick, "left", `${(dbToScale(typical) * 100).toFixed(2)}%`);
+    const title = Number.isFinite(level?.typicalDb) ? "Typical speaking level after your volume" : "Not heard yet";
+    if (track.title !== title) track.title = title;
+  }
+  function createPanelController(state, { participants, levels = () => null, onGain, onSave, onCollapse }) {
+    let balanceUndo = null;
+    let balanceButton = null;
+    function notify(message) {
+      state.statusNotice = { message, until: Date.now() + NOTICE_MS };
+      const status = document.getElementById(`${PANEL_ID}_status`);
+      if (status) status.textContent = message;
+    }
+    function updateBalanceButton() {
+      const button = balanceButton;
+      if (!button) return;
+      const undo = Boolean(balanceUndo);
+      const eligible = undo ? 2 : participants().filter((participant) => isBalanceEligible(participant, levels)).length;
+      const text = undo ? "Undo" : "Balance";
+      if (button.textContent !== text) button.textContent = text;
+      if (button.getAttribute("aria-label") !== (undo ? UNDO_LABEL : BALANCE_LABEL)) button.setAttribute("aria-label", undo ? UNDO_LABEL : BALANCE_LABEL);
+      setStyle(button, "color", undo ? buttonStyles.color : "#8ab4f8");
+      setStyle(button, "borderColor", undo ? "#5f6368" : "#8ab4f8");
+      const disabled = eligible < 2;
+      if (button.disabled !== disabled) button.disabled = disabled;
+      setStyle(button, "opacity", disabled ? ".5" : "1");
+      setStyle(button, "cursor", disabled ? "default" : "pointer");
+    }
+    function clearUndo() {
+      if (!balanceUndo) return;
+      balanceUndo = null;
+      updateBalanceButton();
+    }
+    function manualGain(participant, value) {
+      clearUndo();
+      onGain(participant, value);
+    }
+    function balanceOrUndo() {
+      if (balanceUndo) {
+        const previous2 = balanceUndo;
+        balanceUndo = null;
+        for (const participant of participants()) if (previous2.has(participant.key)) onGain(participant, previous2.get(participant.key));
+        updateBalanceButton();
+        return;
+      }
+      const plan = planBalance(participants(), levels);
+      if (plan.eligible.length < 2) {
+        notify("Not enough voices heard yet");
+        return;
+      }
+      if (plan.changes.every((change) => change.to === change.from)) {
+        notify("Volumes already balanced");
+        return;
+      }
+      const previous = new Map(plan.changes.map((change) => [change.participant.key, change.from]));
+      for (const change of plan.changes) if (change.to !== change.from) onGain(change.participant, change.to);
+      balanceUndo = previous;
+      updateBalanceButton();
+      notify(`Balanced ${plan.eligible.length} voices`);
+    }
     function updateLiveUi() {
       if (!state.panel?.isConnected) return;
+      updateBalanceButton();
       for (const participant of participants()) {
         const row = [...state.panel.querySelectorAll("[data-participant-key]")].find((item) => item.dataset.participantKey === participant.key);
         if (!row) continue;
@@ -1599,6 +1958,7 @@
         if (value) value.textContent = `${Math.round(participant.value * 100)}%`;
         const slider = row.querySelector('[data-role="slider"]');
         if (slider && document.activeElement !== slider) slider.value = String(participant.value);
+        updateLevelMeter(row, participant, levels);
       }
     }
     function render() {
@@ -1673,20 +2033,23 @@
         Object.assign(empty.style, { opacity: "0.75", padding: "8px 0" });
         list.append(empty);
       }
-      for (const participant of listItems) list.append(renderParticipantRow(participant, onGain));
+      for (const participant of listItems) list.append(renderParticipantRow(participant, manualGain));
       body.append(list);
       const footer = document.createElement("div");
       Object.assign(footer.style, { display: "flex", justifyContent: "space-between", alignItems: "center", gap: "6px", marginTop: "9px", paddingTop: "8px", borderTop: "1px solid #3c4043" });
       const status = document.createElement("div");
       status.id = `${PANEL_ID}_status`;
-      status.textContent = state.status;
+      status.textContent = statusText(state);
       Object.assign(status.style, { minHeight: "14px", marginTop: "0", color: "#bdc1c6", fontSize: "11px", lineHeight: "14px", flex: "1 1 auto", minWidth: "0", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" });
       const reset = makeButton("Reset all", () => {
+        balanceUndo = null;
         for (const participant of listItems) onGain(participant, 1);
         render();
       });
       reset.style.flex = "0 0 auto";
-      footer.append(status, reset);
+      balanceButton = makeButton("Balance", balanceOrUndo);
+      balanceButton.style.flex = "0 0 auto";
+      footer.append(status, balanceButton, reset);
       const support = document.createElement("a");
       support.textContent = "Support development";
       support.href = "https://buymeacoffee.com/andreclemente";
@@ -1836,7 +2199,8 @@
       if (state.audioUnavailable) message = "Audio unavailable · controls are inactive";
       state.status = message;
       const status = document.getElementById(`${PANEL_ID}_status`);
-      if (status) status.textContent = message;
+      const shown = statusText(state);
+      if (status && status.textContent !== shown) status.textContent = shown;
     }, renderSoon = function() {
       if (state.closed) return;
       clearTimeout(state.renderTimer);
@@ -1866,6 +2230,8 @@
     let platformController = null;
     const panel = createPanelController(state, {
       participants: () => visibleParticipants(state),
+      // In-memory pre-volume levels from the controller; never persisted.
+      levels: (key) => platformController?.levelFor?.(key) ?? null,
       onGain: applyGain,
       onCollapse: (collapsed) => {
         state.settings.collapsed = collapsed;
