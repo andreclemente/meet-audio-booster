@@ -1,7 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { STORAGE_KEY, LEGACY_STORAGE_KEYS } from '../src/shared/constants.js'
-import { loadSettings, saveSettings, participantStorageKeys, setParticipantGain } from '../src/storage.js'
+import { loadSettings, saveSettings, participantStorageKeys, setParticipantGain, getParticipantGain } from '../src/storage.js'
 import { createState } from '../src/state.js'
 
 function memoryStorage(entries = {}) {
@@ -74,4 +74,19 @@ test('missing and malformed collapsed preferences default false without losing s
     assert.equal(createState(storage).panelCollapsed, false)
   }
   assert.equal(createState(null).panelCollapsed, false)
+})
+
+test('a volume set for someone is restored when they rejoin with a new participant id', () => {
+  const storage = memoryStorage()
+  const first = createState(storage)
+  const alice = { platform: 'google-meet', participantId: 'join-1', name: 'Alice  Silva' }
+  setParticipantGain(first.settings, alice, 1.6)
+  saveSettings(storage, first.settings)
+  const later = createState(storage)
+  const rejoined = { platform: 'google-meet', participantId: 'join-2', name: 'alice silva' }
+  assert.equal(getParticipantGain(later.settings, rejoined), 1.6)
+  // A later change follows the person to their next join too.
+  setParticipantGain(later.settings, { ...rejoined }, 0.5)
+  assert.equal(getParticipantGain(later.settings, rejoined), 0.5)
+  assert.equal(getParticipantGain(later.settings, { platform: 'google-meet', participantId: 'join-3', name: 'Alice Silva' }), 0.5)
 })

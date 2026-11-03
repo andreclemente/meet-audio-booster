@@ -57,7 +57,9 @@ export function getParticipantGain(settings, participant) {
 
 export function setParticipantGain(settings, participant, value) {
   settings.gains ||= {}
-  const key = participantStorageKeys(participant)[0]
-  if (key) settings.gains[key] = Math.max(0, Number(value) || 0)
+  // Saved under the participant id AND the name: Meet assigns a new id on
+  // every join, so the name is what restores a volume after a rejoin.
+  const gain = Math.max(0, Number(value) || 0)
+  for (const key of participantStorageKeys(participant)) settings.gains[key] = gain
   return settings
 }

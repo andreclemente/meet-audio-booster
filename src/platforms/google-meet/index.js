@@ -1,4 +1,4 @@
-import { scanMeetParticipants, observeMeetParticipants, isGoogleParticipantSpeaking, hasLocalPresentation } from './participants.js'
+import { scanMeetParticipants, observeMeetParticipants, isGoogleParticipantSpeaking, hasLocalPresentation, updateMissingParticipants } from './participants.js'
 import { createAssociationLearner, createFreshAlignmentTracker } from './association.js'
 import { createRoutingState, routeGoogleAudio, isQuietMediaTransition } from './router.js'
 import { installLocalPresentationCaptureHook } from './presentation.js'
@@ -131,6 +131,8 @@ export function createGoogleMeetController({ state, context, setStatus, renderSo
   let captureLifecycleSeen = false
 
   function participants() { return visibleParticipants(state, 'google-meet') }
+  // Everyone known in this call, with or without a rendered tile (never self).
+  function knownParticipants() { return [...state.participants.values()].filter(item => item.platform === 'google-meet' && !selfIds.has(item.participantId)) }
   function applyPresentationState() {
     const presenting = resolveLocalPresentationActive({
       captureActive: capturePresentationActive,
@@ -195,12 +197,7 @@ export function createGoogleMeetController({ state, context, setStatus, renderSo
         extra: { participantId: data.participantId, element: data.element }
       })
     }
-    for (const participant of state.participants.values()) {
-      if (participant.platform !== 'google-meet' || found.has(participant.key)) continue
-      participant.speaking = false
-      // Verified self is not a temporarily missing remote: remove it now.
-      if (selfIds.has(participant.participantId) || now - participant.lastSeenAt > 8000) participant.present = false
-    }
+    updateMissingParticipants(state.participants.values(), found, { now, selfIds, isMember: nativeActivity.isMember })
     const isSelfKey = key => selfIds.has(state.participants.get(key)?.participantId)
     if ([state.google.activeParticipantKey, state.google.appliedParticipantKey,
       state.google.transitionGuard.candidateParticipantKey, state.google.routing?.appliedParticipantKey,
@@ -235,14 +232,17 @@ export function createGoogleMeetController({ state, context, setStatus, renderSo
     else for (const slot of state.google.slots) slot.set(multiplier, immediate)
   }
   function currentSpeakers(now) {
-    const list = participants()
-    const activity = nativeActivity.read(list, globalThis.document, now)
-    for (const participant of list) {
+    const known = knownParticipants()
+    const activity = nativeActivity.read(participants(), globalThis.document, now, { known, selfIds })
+    for (const participant of known) {
       participant.speaking = activity.available && activity.speakers.includes(participant)
       if (participant.speaking) participant.lastSpeakingAt = now
     }
+    // Counts and a source label only: never participant ids or names.
     state.google.speakerSource = activity.available ? 'meet-activity' : 'unavailable'
-    state.google.unknownSpeakerCount = activity.unknown.length
+    state.google.activitySource = activity.source
+    state.google.membershipTrusted = nativeActivity.membershipTrusted
+    state.google.unknownSpeakerCount = activity.unknown.length + activity.unknownSpeakers
     return activity
   }
   function neutralize(routingState, status) {
@@ -259,9 +259,9 @@ export function createGoogleMeetController({ state, context, setStatus, renderSo
   function routeWorklet(now, speakers) {
     const routing = workletSpeakerTracker.update({ now, speakers })
     const active = state.participants.get(routing.appliedParticipantKey) || null
-    const status = !participants().length ? 'Waiting for participants'
+    const status = active ? `${active.name} · automatic routing`
       : speakers.length > 1 ? 'Overlapping speakers · using safe 100% volume'
-      : active ? `${active.name} · automatic routing` : `${participants().length} participants ready`
+      : !participants().length ? 'Waiting for participants' : `${participants().length} participants ready`
 
     state.google.activeParticipantKey = routing.activeParticipantKey
     state.google.appliedParticipantKey = routing.appliedParticipantKey
@@ -279,7 +279,8 @@ export function createGoogleMeetController({ state, context, setStatus, renderSo
       Object.assign(energetic[0], learner.observe(energetic[0].id, speakers[0].key, { exclusiveUi: true, exclusiveEnergy: true }))
     }
     state.google.routing = routeGoogleAudio(state.google.routing || createRoutingState(), {
-      now, participants: Object.fromEntries(participants().map(item => [item.key, item])),
+      // A tileless participant is routable only while the registry names them as the speaker.
+      now, participants: Object.fromEntries([...participants(), ...speakers].map(item => [item.key, item])),
       uiSpeakerKeys: speakers.map(item => item.key), pipelines: media.pipelines
     })
     const routing = state.google.routing
@@ -331,10 +332,13 @@ export function createGoogleMeetController({ state, context, setStatus, renderSo
     }
     const now = Date.now()
     const activity = currentSpeakers(now)
-    if (!activity.available) {
+    if (activity.unknownSpeakers) neutralize('unknown-speaker', 'Unrecognized speaker · using safe 100% volume')
+    else if (!activity.available) {
       neutralize('speaker-data-unavailable', participants().length
         ? 'Speaker data unavailable · using safe 100% volume'
         : 'Waiting for participants')
+    }
+    if (activity.unknownSpeakers || !activity.available) {
       sampleLevels(now, activity)
       updateLiveUi()
       return
