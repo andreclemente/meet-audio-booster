@@ -15,6 +15,13 @@ function ownIcons(root) {
   return icons
 }
 
+// Every person's tile shows a microphone indicator; a screen share never does.
+// Language-independent, and present before a share's own controls render.
+export function hasMicrophoneIndicator(root) {
+  const icons = ownIcons(root)
+  return [...MICROPHONE_ICONS].some(icon => icons.has(icon))
+}
+
 export function isPresentationRoot(root) {
   if (!root?.getAttribute?.('data-participant-id')) return false
   const icons = ownIcons(root)
@@ -22,14 +29,9 @@ export function isPresentationRoot(root) {
   return [...PRESENTATION_ICONS].some(icon => icons.has(icon))
 }
 
+// Annotation tools are only offered to the presenter, on their own share.
 export function isLocalPresentationRoot(root) {
-  if (!root?.getAttribute?.('data-participant-id')) return false
-  if (extractNameFromParticipantRoot(root)) return false
-  const labels = [...(root.querySelectorAll?.('[aria-label]') || [])]
-    .map(element => element.getAttribute('aria-label') || '')
-  const text = `${root.innerText || root.textContent || ''} ${labels.join(' ')}`
-  return /\beveryone can see your annotations\b/i.test(text) &&
-    /\bscroll\s*(?:&|and)\s*zoom your presentation in meet\b/i.test(text)
+  return isPresentationRoot(root) && ownIcons(root).has('stylus_laser_pointer')
 }
 
 export function hasLocalPresentation(root = document) {
@@ -61,26 +63,10 @@ function hasOwnSelfControls(root) {
   return icons.has('visual_effects')
 }
 
-function ownParticipantText(root) {
-  // Ignore nested participant text for the legacy English '(You)' fallback too.
-  if (!root?.childNodes) return root?.innerText || root?.textContent || ''
-  function read(node) {
-    if (node !== root && node.hasAttribute?.('data-participant-id')) return ''
-    if (node.nodeType === 3) return node.textContent || ''
-    return [...(node.childNodes || [])].map(read).join(' ')
-  }
-  return read(root)
-}
-
+// Identity comes only from Meet's own controls (icon ligatures), never from
+// UI text: the extension must behave the same in every language.
 export function isSelfParticipant(root) {
-  if (hasOwnSelfControls(root)) return true
-  const text = ownParticipantText(root)
-  if (/(^|\s)\(you\)(?=\s|$)/i.test(text)) return true
-  const labels = [...(root?.querySelectorAll?.('[aria-label]') || [])]
-    .filter(element => !element.closest || element.closest('[data-participant-id]') === root)
-    .map(element => element.getAttribute('aria-label') || '')
-  if (labels.some(label => /^(Reframe|Backgrounds and effects)$/i.test(label))) return true
-  return labels.some(label => /^your\b|\byou are\b|\byou\s+\(/i.test(label) || /^(mute|unmute|turn (?:on|off)) your (?:microphone|camera)$/i.test(label))
+  return hasOwnSelfControls(root)
 }
 
 export function extractGoogleName(root) {
@@ -90,11 +76,9 @@ export function extractGoogleName(root) {
 export function isGoogleParticipantSpeaking(root) {
   if (!root) return false
   if (root.matches?.('.BlxGDf') || root.querySelector?.('.BlxGDf')) return true
-  const nodes = [root, ...(root.querySelectorAll?.('[aria-label], [data-is-speaking], [data-speaking], [aria-current]') || [])]
+  const nodes = [root, ...(root.querySelectorAll?.('[data-is-speaking], [data-speaking], [aria-current]') || [])]
   return nodes.some(node => {
-    const label = node.getAttribute?.('aria-label') || ''
-    return /(^|[,\s])speaking([,\s]|$)|\bis speaking\b/i.test(label) ||
-      /^(true|speaking|active)$/i.test(node.getAttribute?.('data-is-speaking') || '') ||
+    return /^(true|speaking|active)$/i.test(node.getAttribute?.('data-is-speaking') || '') ||
       /^(true|speaking|active)$/i.test(node.getAttribute?.('data-speaking') || '') ||
       /^(speaking|active)$/i.test(node.getAttribute?.('aria-current') || '')
   })
@@ -126,7 +110,7 @@ export function scanMeetParticipants(root = document, selfIds = new Set()) {
     if (selfIds.has(participantId)) continue
     const name = extractGoogleName(element)
     if (!name) continue
-    found.push({ key: `id:${participantId}`, participantId, name, element, speaking: isGoogleParticipantSpeaking(element) })
+    found.push({ key: `id:${participantId}`, participantId, name, element, speaking: isGoogleParticipantSpeaking(element), hasMicrophone: hasMicrophoneIndicator(element) })
   }
   return found
 }

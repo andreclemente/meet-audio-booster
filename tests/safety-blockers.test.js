@@ -397,29 +397,15 @@ test('AudioContext constructor failures are represented as unavailable', () => {
   try { assert.equal(createAudioContext(), null) } finally { globalThis.AudioContext = Original }
 })
 
-test('local presentation controls are detected without accepting a remote participant tile', () => {
-  function root(text, name = null) {
-    const node = name ? namedNode(name) : null
-    return {
-      innerText: text,
-      textContent: text,
-      getAttribute(attr) {
-        return attr === 'data-participant-id' ? 'spaces/example/devices/147' : null
-      },
-      querySelector(selector) { return node && selector.includes('.zWGUib') ? node : null },
-      querySelectorAll(selector) {
-        if (selector === '[aria-label]') return []
-        return node && selector.includes('.zWGUib') ? [node] : []
-      }
-    }
-  }
-
-  const presentationText = 'stylus_laser_pointer Everyone can see your annotations Scroll & zoom your presentation in Meet Enter Full Screen'
-  assert.equal(isLocalPresentationRoot(root(presentationText)), true)
-  assert.equal(isLocalPresentationRoot(root(presentationText, 'Alice Smith')), false)
-  assert.equal(isLocalPresentationRoot(root(
-    "keep_outline Pin André Clemente mic_off You can't unmute someone else More options for André Clemente"
-  )), false)
+test('your own screen share is recognised from its annotation control, not from text', () => {
+  const local = iconTile('local', 'Pessoa A', ['stylus_laser_pointer', 'zoom_in', 'more_vert'])
+  const remoteShare = iconTile('remote-share', 'Pessoa A', ['zoom_in', 'open_in_full'])
+  const camera = iconTile('camera', 'Pessoa A', ['keep_outline', 'mic_off', 'more_vert'])
+  const english = iconTile('text-only', 'Everyone can see your annotations Scroll & zoom your presentation in Meet', ['more_vert'])
+  assert.equal(isLocalPresentationRoot(local), true)
+  assert.equal(isLocalPresentationRoot(remoteShare), false)
+  assert.equal(isLocalPresentationRoot(camera), false)
+  assert.equal(isLocalPresentationRoot(english), false)
 })
 
 test('remote mute helper text does not identify a participant as self', () => {

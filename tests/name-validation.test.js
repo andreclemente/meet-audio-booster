@@ -2,7 +2,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { isValidParticipantName, extractNameFromParticipantRoot } from '../src/shared/dom.js'
 
-for (const value of ['', '   ', 'keep_outline', 'mic_off', 'more_vert', 'call_end', 'volume_up', 'person', 'group', 'Meeting details', 'More options']) {
+for (const value of ['', '   ', 'keep_outline', 'mic_off', 'more_vert', 'call_end', 'volume_up', 'person', 'group']) {
   test(`rejects non-participant token: ${JSON.stringify(value)}`, () => {
     assert.equal(isValidParticipantName(value), false)
   })
@@ -55,4 +55,16 @@ test('accepts a name only from a recognized participant name element', () => {
     }
   }
   assert.equal(extractNameFromParticipantRoot(root), 'Alice Smith')
+})
+
+test('a control label is never taken as a name, in any language', () => {
+  for (const label of ['More options', 'Mais opções', 'Meeting details', 'Detalhes da reunião']) {
+    const nameNode = { textContent: label, children: [], matches: sel => sel.includes('.zWGUib') && !sel.includes('button'), getAttribute: () => null }
+    const control = { getAttribute: attr => attr === 'aria-label' ? label : null }
+    const root = {
+      getAttribute: attr => attr === 'data-participant-id' ? 'p1' : null,
+      querySelectorAll: sel => sel.includes('.zWGUib') ? [nameNode] : sel.includes('aria-label') ? [control] : []
+    }
+    assert.equal(extractNameFromParticipantRoot(root), null, label)
+  }
 })

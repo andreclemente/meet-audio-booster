@@ -191,6 +191,11 @@ export function createGoogleMeetController({ state, context, setStatus, renderSo
     syncPresentationState()
     const found = new Set()
     for (const data of scanMeetParticipants(document, selfIds)) {
+      // Only a call tile or a confirmed call member is a person in the call;
+      // a People-list or lobby entry (someone asking to join) is not.
+      if (!data.element?.getAttribute?.('data-requested-participant-id') && !nativeActivity.isMember(data.participantId)) continue
+      // A new row needs a person's mic indicator, so a share never flashes in.
+      if (!data.hasMicrophone && !state.participants.has(data.key)) continue
       found.add(data.key)
       upsertParticipant(state, {
         ...data, platform: 'google-meet', present: true, lastSeenAt: now,
