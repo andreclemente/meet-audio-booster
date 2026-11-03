@@ -460,6 +460,12 @@
     const captures = /* @__PURE__ */ new Set();
     let active = false;
     let disposed = false;
+    let captureTimer = null;
+    const stopPolling = () => {
+      if (captureTimer === null) return;
+      clearInterval(captureTimer);
+      captureTimer = null;
+    };
     const emit = (next) => {
       if (disposed || active === next) return;
       active = next;
@@ -468,6 +474,7 @@
     const removeCapture = (capture) => {
       if (!captures.delete(capture)) return;
       for (const track of capture.tracks) track.removeEventListener?.("ended", capture.checkEnded);
+      if (!captures.size) stopPolling();
       emit(captures.size > 0);
     };
     const wrapped = async function(...args) {
@@ -484,6 +491,9 @@
       };
       captures.add(capture);
       for (const track of tracks) track.addEventListener?.("ended", capture.checkEnded);
+      if (captureTimer === null) captureTimer = setInterval(() => {
+        for (const current of captures) current.checkEnded();
+      }, 250);
       emit(true);
       return stream;
     };
@@ -492,6 +502,7 @@
     return () => {
       if (disposed) return;
       disposed = true;
+      stopPolling();
       for (const capture of captures) {
         for (const track of capture.tracks) track.removeEventListener?.("ended", capture.checkEnded);
       }
@@ -966,9 +977,19 @@
     if (!stream) return "";
     return [stream.id || "stream", ...(stream.getAudioTracks?.() || []).map((track) => track.id)].join("|");
   }
-  function createMediaElementPipeline(context, audio, id) {
+  function createMediaElementPipeline(context, audio, id, accepts = () => true, onRelease = () => {
+  }) {
     const stream = audio.srcObject;
-    const tracks = stream?.getAudioTracks?.() || [];
+    const tracks = [...stream?.getAudioTracks?.() || []];
+    if (!accepts(stream) || !tracks.length || tracks.some((track) => track.readyState === "ended")) return null;
+    let destroyed = false;
+    function eligible() {
+      for (const element of [...pipeline.elements]) {
+        if (element.srcObject !== stream || element.isConnected === false) pipeline.releaseElement(element);
+      }
+      const current = stream?.getAudioTracks?.() || [];
+      return !destroyed && pipeline.elements.size > 0 && accepts(stream) && current.length === tracks.length && tracks.every((track) => track.readyState !== "ended" && current.includes(track));
+    }
     let source, gain, analyser;
     try {
       source = context.createMediaStreamSource(stream);
@@ -1003,11 +1024,20 @@
       rms: 0,
       appliedMultiplier: 1,
       targetValue: 1,
+      eligible,
       sample() {
+        if (!eligible()) {
+          this.destroy();
+          return this;
+        }
         Object.assign(this, analyser.sample());
         return this;
       },
       activate() {
+        if (!eligible()) {
+          this.destroy();
+          return false;
+        }
         if (!this.connected) {
           try {
             gain.connect(context.destination);
@@ -1051,14 +1081,23 @@
           this.originalStates.delete(element);
         }
         this.elements.delete(element);
+        onRelease(element);
       },
       set(multiplier, immediate = false) {
+        if (!eligible()) {
+          this.destroy();
+          return;
+        }
         const safe = Number.isFinite(multiplier) ? Math.max(0, multiplier) : 1;
         this.appliedMultiplier = safe;
         this.targetValue = safe;
         if ((this.connected || immediate) && this.activate()) writeAudioParam(gain.gain, safe, { context, immediate: immediate && safe === 1 });
       },
       destroy() {
+        if (destroyed) return;
+        destroyed = true;
+        this.rms = 0;
+        this.activeByEnergy = false;
         this.deactivate();
         analyser.disconnect();
         try {
@@ -1076,26 +1115,40 @@
   function createMediaPipelineManager(context, { nextId = /* @__PURE__ */ (() => {
     let id = 0;
     return () => `media-${++id}`;
-  })() } = {}) {
+  })(), accepts = () => true } = {}) {
     let pipelines = [];
+    let hasAudio = false;
     const byElement = /* @__PURE__ */ new WeakMap();
+    function prune() {
+      for (const pipeline of [...pipelines]) if (!pipeline.eligible()) remove(pipeline);
+    }
     function scan(root = document) {
+      prune();
+      hasAudio = false;
       const seen = /* @__PURE__ */ new Set();
       for (const audio of root.querySelectorAll?.("audio") || []) {
         const stream = audio.srcObject;
         const tracks = stream?.getAudioTracks?.() || [];
-        if (!tracks.length || tracks.every((track) => track.readyState === "ended")) continue;
+        if (tracks.some((track) => track.readyState !== "ended")) hasAudio = true;
+        if (!accepts(stream) || !tracks.length || tracks.some((track) => track.readyState === "ended")) {
+          const previous2 = byElement.get(audio);
+          if (previous2) {
+            previous2.releaseElement(audio);
+            byElement.delete(audio);
+          }
+          continue;
+        }
         const key = mediaStreamKey(stream);
         seen.add(key);
         const previous = byElement.get(audio);
-        if (previous?.streamKey === key) continue;
+        if (previous?.stream === stream && previous.elements.has(audio)) continue;
         if (previous) {
           previous.releaseElement(audio);
           byElement.delete(audio);
         }
-        let pipeline = pipelines.find((item) => item.streamKey === key);
+        let pipeline = pipelines.find((item) => item.stream === stream);
         if (!pipeline) {
-          pipeline = createMediaElementPipeline(context, audio, nextId());
+          pipeline = createMediaElementPipeline(context, audio, nextId(), accepts, (element) => byElement.delete(element));
           if (!pipeline) continue;
           pipelines.push(pipeline);
         } else pipeline.elements.add(audio);
@@ -1104,7 +1157,7 @@
       }
       for (const pipeline of [...pipelines]) {
         for (const element of [...pipeline.elements]) {
-          if (!element.isConnected || mediaStreamKey(element.srcObject) !== pipeline.streamKey) {
+          if (!element.isConnected || element.srcObject !== pipeline.stream || !accepts(element.srcObject)) {
             pipeline.releaseElement(element);
             byElement.delete(element);
           }
@@ -1122,9 +1175,94 @@
     function destroy() {
       for (const pipeline of [...pipelines]) remove(pipeline);
     }
-    return { scan, destroy, get pipelines() {
+    return { scan, prune, destroy, get hasAudio() {
+      return hasAudio;
+    }, get pipelines() {
       return pipelines;
     } };
+  }
+
+  // src/platforms/google-meet/media-ownership.js
+  function installRemoteMediaOwnership(scope = globalThis) {
+    const peers = /* @__PURE__ */ new Set();
+    const parents = /* @__PURE__ */ new WeakMap();
+    const origins = /* @__PURE__ */ new WeakMap();
+    const restores = [];
+    let disposed = false;
+    const pcPrototype = scope.RTCPeerConnection?.prototype;
+    const trackPrototype = scope.MediaStreamTrack?.prototype;
+    const getReceivers = pcPrototype?.getReceivers;
+    function observe(peer) {
+      if (!disposed) peers.add(peer);
+    }
+    function wrap(owner, name, factory) {
+      if (!owner || typeof owner[name] !== "function") return;
+      const original = owner[name];
+      const wrapped = factory(original);
+      try {
+        owner[name] = wrapped;
+        if (owner[name] === wrapped) restores.push(() => {
+          if (owner[name] === wrapped) owner[name] = original;
+        });
+      } catch {
+      }
+    }
+    wrap(pcPrototype, "setRemoteDescription", (original) => function(...args) {
+      observe(this);
+      return original.apply(this, args);
+    });
+    wrap(trackPrototype, "clone", (original) => function(...args) {
+      const clone = original.apply(this, args);
+      if (!disposed) parents.set(clone, this);
+      return clone;
+    });
+    function refresh() {
+      if (disposed || typeof getReceivers !== "function") return;
+      for (const peer of peers) {
+        if (peer.connectionState === "closed" || peer.signalingState === "closed") {
+          peers.delete(peer);
+          continue;
+        }
+        try {
+          for (const receiver of getReceivers.call(peer)) {
+            if (receiver.track?.kind === "audio") origins.set(receiver.track, peer);
+          }
+        } catch {
+        }
+      }
+    }
+    function remote(track) {
+      if (disposed || track?.kind !== "audio" || track.readyState !== "live") return false;
+      const seen = /* @__PURE__ */ new Set();
+      for (let current = track; current && !seen.has(current); current = parents.get(current)) {
+        if (current.readyState !== "live") return false;
+        seen.add(current);
+        const peer = origins.get(current);
+        if (!peer || !peers.has(peer) || peer.connectionState === "closed" || peer.signalingState === "closed") continue;
+        try {
+          if (getReceivers.call(peer).some((receiver) => receiver.track === current)) return true;
+        } catch {
+        }
+      }
+      return false;
+    }
+    return {
+      refresh,
+      accepts(stream) {
+        const tracks = stream?.getAudioTracks?.() || [];
+        return tracks.length > 0 && tracks.every(remote);
+      },
+      dispose() {
+        disposed = true;
+        peers.clear();
+        for (const restore of restores.reverse()) {
+          try {
+            restore();
+          } catch {
+          }
+        }
+      }
+    };
   }
 
   // src/platforms/google-meet/membership.js
@@ -1930,10 +2068,10 @@
   function resolveLocalPresentationActive({ captureActive, domActive, captureLifecycleSeen }) {
     return captureLifecycleSeen ? captureActive : captureActive || domActive;
   }
-  function createGoogleMeetController({ state, context, setStatus, renderSoon, updateLiveUi }) {
+  function createGoogleMeetController({ state, context, setStatus, renderSoon, updateLiveUi, mediaOwnership = installRemoteMediaOwnership() }) {
     const learner = createAssociationLearner();
     const alignmentTracker = createFreshAlignmentTracker();
-    const media = createMediaPipelineManager(context);
+    const media = createMediaPipelineManager(context, { accepts: (stream) => mediaOwnership.accepts(stream) });
     const workletSpeakerTracker = createWorkletSpeakerTracker();
     const nativeActivity = createNativeActivitySource();
     const levelMeter = createParticipantLevelMeter();
@@ -1956,16 +2094,6 @@
       });
       if (presenting === state.google.localPresentationActive) return presenting;
       state.google.localPresentationActive = presenting;
-      if (presenting && state.google.mode === "media") {
-        workletSpeakerTracker.reset("local-presentation-bypass");
-        for (const slot of state.google.slots) slot.release();
-        for (const pipeline of media.pipelines) pipeline.deactivate();
-        state.google.activeParticipantKey = null;
-        state.google.appliedParticipantKey = null;
-        state.google.routingState = "local-presentation-bypass";
-        state.google.transitionGuard.candidateParticipantKey = null;
-        state.google.transitionGuard.candidateSince = 0;
-      }
       renderSoon();
       return presenting;
     }
@@ -2043,17 +2171,20 @@
       }
     }
     function scanMedia() {
-      if (state.google.localPresentationActive) {
-        for (const pipeline of media.pipelines) pipeline.deactivate();
-        return;
-      }
+      mediaOwnership.refresh();
       media.scan();
       state.google.mediaPipelines = media.pipelines;
       if (state.google.slots.length) setMode("worklet");
-      else if (media.pipelines.length && performance.now() - state.google.modeStartedAt > 1200) setMode("media");
+      else if (media.hasAudio && performance.now() - state.google.modeStartedAt > 1200) setMode("media");
       if (state.google.mode === "media") activateMediaModePipelines(media.pipelines, state.google.routing);
     }
+    function refreshMediaOwnership() {
+      mediaOwnership.refresh();
+      media.prune();
+      state.google.mediaPipelines = media.pipelines;
+    }
     function setOutputs(multiplier, immediate = false) {
+      refreshMediaOwnership();
       if (state.google.mode === "media") applyMediaPipelineOutputs(media.pipelines, state.google.routing, multiplier, immediate);
       else for (const slot of state.google.slots) slot.set(multiplier, immediate);
     }
@@ -2121,7 +2252,7 @@
         ambiguous: "Overlapping speakers · using safe 100% volume"
       };
       const active = state.participants.get(routing.appliedParticipantKey);
-      setStatus(active ? `${active.name} · automatic routing` : labels[routing.routingState] || `${participants().length} participants ready`);
+      setStatus(!media.pipelines.length ? "Remote audio ownership unavailable · using native playback" : active ? `${active.name} · automatic routing` : labels[routing.routingState] || `${participants().length} participants ready`);
     }
     function sampleLevels(now, activity = null) {
       const g = state.google;
@@ -2130,7 +2261,9 @@
         speakers: activity.speakers,
         routingState: g.routingState,
         appliedParticipantKey: g.appliedParticipantKey,
-        localPresentationActive: g.localPresentationActive
+        // Media graphs contain only verified remote audio; worklet semantics stay
+        // unchanged because their pooled source has no equivalent provenance.
+        localPresentationActive: g.localPresentationActive && g.mode !== "media"
       });
       try {
         levelMeter.tick({
@@ -2146,19 +2279,7 @@
       }
     }
     function route() {
-      if (state.google.localPresentationActive && state.google.mode === "media") {
-        for (const slot of state.google.slots) slot.release();
-        if (state.google.mode === "media") for (const pipeline of media.pipelines) pipeline.deactivate();
-        state.google.activeParticipantKey = null;
-        state.google.appliedParticipantKey = null;
-        state.google.routingState = "local-presentation-bypass";
-        state.google.transitionGuard.candidateParticipantKey = null;
-        state.google.transitionGuard.candidateSince = 0;
-        setStatus("Presenting · own presentation audio bypassed");
-        sampleLevels(Date.now());
-        updateLiveUi();
-        return;
-      }
+      refreshMediaOwnership();
       const now = Date.now();
       const activity = currentSpeakers(now);
       if (activity.unknownSpeakers) neutralize("unknown-speaker", "Unrecognized speaker · using safe 100% volume");
@@ -2205,6 +2326,8 @@
       for (const slot of state.google.slots) slot.destroy();
       state.google.slots = [];
       media.destroy();
+      state.google.mediaPipelines = [];
+      mediaOwnership.dispose();
       selfIds.clear();
       presentationIds.clear();
       workletSpeakerTracker.reset();
@@ -2212,7 +2335,7 @@
       levelMeter.reset();
     }
     function applyParticipantGain(participant) {
-      if (syncPresentationState() && state.google.mode === "media") return;
+      syncPresentationState();
       if (state.google.activeParticipantKey === participant.key) setOutputs(participant.value);
     }
     return {
@@ -2759,13 +2882,14 @@
       state.platform = detectPlatform();
       const context = getContext();
       state.audioUnavailable = !context;
-      const common = { state, context, setStatus, renderSoon, updateLiveUi: panel.updateLiveUi };
+      const common = { state, context, setStatus, renderSoon, updateLiveUi: panel.updateLiveUi, mediaOwnership };
       platformController = createGoogleMeetController(common);
       platformController.start();
       if (!context) setStatus("Audio unavailable · controls are inactive");
       panel.render();
     };
     globalThis.__meetingAudioBoosterInstalled = true;
+    const mediaOwnership = installRemoteMediaOwnership();
     const state = createState();
     let platformController = null;
     const panel = createPanelController(state, {

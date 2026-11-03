@@ -4,6 +4,7 @@ import { createRoutingState, routeGoogleAudio, isQuietMediaTransition } from './
 import { installLocalPresentationCaptureHook } from './presentation.js'
 import { installAudioWorkletHook, createPooledSlot } from './audio-worklet.js'
 import { createMediaPipelineManager } from './media-elements.js'
+import { installRemoteMediaOwnership } from './media-ownership.js'
 import { createNativeActivitySource } from './native-activity.js'
 import { createParticipantLevelMeter, attributeLevelSample, sumTapPower, sumPipelinePower } from './levels.js'
 import { upsertParticipant, visibleParticipants } from '../../state.js'
@@ -117,10 +118,10 @@ export function resolveLocalPresentationActive({ captureActive, domActive, captu
   return captureLifecycleSeen ? captureActive : (captureActive || domActive)
 }
 
-export function createGoogleMeetController({ state, context, setStatus, renderSoon, updateLiveUi }) {
+export function createGoogleMeetController({ state, context, setStatus, renderSoon, updateLiveUi, mediaOwnership = installRemoteMediaOwnership() }) {
   const learner = createAssociationLearner()
   const alignmentTracker = createFreshAlignmentTracker()
-  const media = createMediaPipelineManager(context)
+  const media = createMediaPipelineManager(context, { accepts: stream => mediaOwnership.accepts(stream) })
   const workletSpeakerTracker = createWorkletSpeakerTracker()
   const nativeActivity = createNativeActivitySource()
   const levelMeter = createParticipantLevelMeter()
@@ -141,16 +142,6 @@ export function createGoogleMeetController({ state, context, setStatus, renderSo
     })
     if (presenting === state.google.localPresentationActive) return presenting
     state.google.localPresentationActive = presenting
-    if (presenting && state.google.mode === 'media') {
-      workletSpeakerTracker.reset('local-presentation-bypass')
-      for (const slot of state.google.slots) slot.release()
-      for (const pipeline of media.pipelines) pipeline.deactivate()
-      state.google.activeParticipantKey = null
-      state.google.appliedParticipantKey = null
-      state.google.routingState = 'local-presentation-bypass'
-      state.google.transitionGuard.candidateParticipantKey = null
-      state.google.transitionGuard.candidateSince = 0
-    }
     renderSoon()
     return presenting
   }
@@ -222,17 +213,20 @@ export function createGoogleMeetController({ state, context, setStatus, renderSo
     if (signature !== state.google.rosterSignature) { state.google.rosterSignature = signature; renderSoon() }
   }
   function scanMedia() {
-    if (state.google.localPresentationActive) {
-      for (const pipeline of media.pipelines) pipeline.deactivate()
-      return
-    }
+    mediaOwnership.refresh()
     media.scan()
     state.google.mediaPipelines = media.pipelines
     if (state.google.slots.length) setMode('worklet')
-    else if (media.pipelines.length && performance.now() - state.google.modeStartedAt > 1200) setMode('media')
+    else if (media.hasAudio && performance.now() - state.google.modeStartedAt > 1200) setMode('media')
     if (state.google.mode === 'media') activateMediaModePipelines(media.pipelines, state.google.routing)
   }
+  function refreshMediaOwnership() {
+    mediaOwnership.refresh()
+    media.prune()
+    state.google.mediaPipelines = media.pipelines
+  }
   function setOutputs(multiplier, immediate = false) {
+    refreshMediaOwnership()
     if (state.google.mode === 'media') applyMediaPipelineOutputs(media.pipelines, state.google.routing, multiplier, immediate)
     else for (const slot of state.google.slots) slot.set(multiplier, immediate)
   }
@@ -302,14 +296,18 @@ export function createGoogleMeetController({ state, context, setStatus, renderSo
       ambiguous: 'Overlapping speakers · using safe 100% volume'
     }
     const active = state.participants.get(routing.appliedParticipantKey)
-    setStatus(active ? `${active.name} · automatic routing` : labels[routing.routingState] || `${participants().length} participants ready`)
+    setStatus(!media.pipelines.length ? 'Remote audio ownership unavailable · using native playback'
+      : active ? `${active.name} · automatic routing` : labels[routing.routingState] || `${participants().length} participants ready`)
   }
   // Measurement only: runs after routing decisions and never feeds back into them.
   function sampleLevels(now, activity = null) {
     const g = state.google
     const attributedKey = activity && attributeLevelSample({
       available: activity.available, speakers: activity.speakers, routingState: g.routingState,
-      appliedParticipantKey: g.appliedParticipantKey, localPresentationActive: g.localPresentationActive
+      appliedParticipantKey: g.appliedParticipantKey,
+      // Media graphs contain only verified remote audio; worklet semantics stay
+      // unchanged because their pooled source has no equivalent provenance.
+      localPresentationActive: g.localPresentationActive && g.mode !== 'media'
     })
     try {
       levelMeter.tick({
@@ -322,19 +320,7 @@ export function createGoogleMeetController({ state, context, setStatus, renderSo
     } catch {}
   }
   function route() {
-    if (state.google.localPresentationActive && state.google.mode === 'media') {
-      for (const slot of state.google.slots) slot.release()
-      if (state.google.mode === 'media') for (const pipeline of media.pipelines) pipeline.deactivate()
-      state.google.activeParticipantKey = null
-      state.google.appliedParticipantKey = null
-      state.google.routingState = 'local-presentation-bypass'
-      state.google.transitionGuard.candidateParticipantKey = null
-      state.google.transitionGuard.candidateSince = 0
-      setStatus('Presenting · own presentation audio bypassed')
-      sampleLevels(Date.now())
-      updateLiveUi()
-      return
-    }
+    refreshMediaOwnership()
     const now = Date.now()
     const activity = currentSpeakers(now)
     if (activity.unknownSpeakers) neutralize('unknown-speaker', 'Unrecognized speaker · using safe 100% volume')
@@ -378,13 +364,15 @@ export function createGoogleMeetController({ state, context, setStatus, renderSo
     for (const slot of state.google.slots) slot.destroy()
     state.google.slots = []
     media.destroy()
+    state.google.mediaPipelines = []
+    mediaOwnership.dispose()
     selfIds.clear(); presentationIds.clear()
     workletSpeakerTracker.reset()
     nativeActivity.reset()
     levelMeter.reset()
   }
   function applyParticipantGain(participant) {
-    if (syncPresentationState() && state.google.mode === 'media') return
+    syncPresentationState()
     // Pooled worklets expose no stable per-participant energy identity. Keep
     // the confirmed speaker latched through quiet activity; concrete speaker
     // changes, overlap, presentation and unknown speaker data neutralize it.

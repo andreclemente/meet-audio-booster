@@ -135,6 +135,7 @@ test('media pipelines stay neutral while speaker data is unavailable', () => {
     const writes = []
     controller.pipelines.push({
       id: 'pipe-a', participantKey: 'A', associationReliable: true, activeByEnergy: true,
+      eligible: () => true,
       sample() { return this },
       set(value) { writes.push(value); this.appliedMultiplier = value }
     })
