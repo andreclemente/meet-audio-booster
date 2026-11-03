@@ -489,7 +489,11 @@
     };
     owner[HOOK_KEY] = wrapped;
     owner.getDisplayMedia = wrapped;
-    return () => {
+    const refresh = () => {
+      if (disposed) return;
+      for (const capture of [...captures]) capture.checkEnded();
+    };
+    const restore = () => {
       if (disposed) return;
       disposed = true;
       for (const capture of captures) {
@@ -499,6 +503,8 @@
       if (owner.getDisplayMedia === wrapped) owner.getDisplayMedia = original;
       if (owner[HOOK_KEY] === wrapped) delete owner[HOOK_KEY];
     };
+    restore.refresh = refresh;
+    return restore;
   }
 
   // src/shared/audio.js
@@ -1976,6 +1982,7 @@
       return applyPresentationState();
     }
     function syncPresentationState() {
+      restoreCaptureHook?.refresh?.();
       domPresentationActive = hasLocalPresentation();
       return applyPresentationState();
     }

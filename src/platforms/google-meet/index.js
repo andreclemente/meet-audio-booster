@@ -161,6 +161,7 @@ export function createGoogleMeetController({ state, context, setStatus, renderSo
     return applyPresentationState()
   }
   function syncPresentationState() {
+    restoreCaptureHook?.refresh?.()
     domPresentationActive = hasLocalPresentation()
     return applyPresentationState()
   }

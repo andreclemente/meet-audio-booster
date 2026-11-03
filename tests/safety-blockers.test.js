@@ -543,3 +543,21 @@ test('a share row created before its controls rendered is dropped once they appe
   updateMissingParticipants([row], found, { now: 1, selfIds, presentationIds, isMember: () => true })
   assert.equal(row.present, false)
 })
+
+test('presenting ends when the page stops the capture itself (no ended event)', async () => {
+  const events = []
+  // Live Meet: "Stop presenting" calls track.stop(); readyState becomes 'ended'
+  // but no 'ended' event fires, so the bypass used to stay on until a reload.
+  const track = { readyState: 'live', addEventListener() {}, removeEventListener() {}, stop() { this.readyState = 'ended' } }
+  const stream = { getVideoTracks: () => [track], getTracks: () => [track] }
+  const prototype = { getDisplayMedia: async () => stream }
+  const mediaDevices = Object.create(prototype)
+  const restore = installLocalPresentationCaptureHook(active => events.push(active), mediaDevices)
+  await mediaDevices.getDisplayMedia({ video: true })
+  restore.refresh()
+  assert.deepEqual(events, [true])
+  track.stop()
+  restore.refresh()
+  assert.deepEqual(events, [true, false])
+  restore()
+})

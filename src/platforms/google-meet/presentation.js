@@ -41,7 +41,14 @@ export function installLocalPresentationCaptureHook(onActive, mediaDevices = glo
   owner[HOOK_KEY] = wrapped
   owner.getDisplayMedia = wrapped
 
-  return () => {
+  // A track stopped by the page itself (Meet's own "stop presenting" calls
+  // track.stop()) never fires 'ended', so the caller must also poll.
+  const refresh = () => {
+    if (disposed) return
+    for (const capture of [...captures]) capture.checkEnded()
+  }
+
+  const restore = () => {
     if (disposed) return
     disposed = true
     for (const capture of captures) {
@@ -51,4 +58,6 @@ export function installLocalPresentationCaptureHook(onActive, mediaDevices = glo
     if (owner.getDisplayMedia === wrapped) owner.getDisplayMedia = original
     if (owner[HOOK_KEY] === wrapped) delete owner[HOOK_KEY]
   }
+  restore.refresh = refresh
+  return restore
 }
