@@ -10,15 +10,14 @@ Per-participant playback volume controls for Google Meet. Preferences stay in br
 2. Join a Google Meet call and use each participant's slider or preset to adjust what **you** hear. Start at 100% and raise volume gradually.
 3. Use the toolbar button to reopen a hidden panel; use Reset all to return the listed participants to 100%.
 
-![Example controls shown with sample participants](docs/assets/production-panel.png)
-
-*Example controls shown with sample participants*
+![Meet Audio Booster participant volume controls, level estimates and Balance](docs/assets/production-panel.png)
 
 ## Troubleshooting and support
 
 - No panel: confirm the tab is on `meet.google.com`, reload after installing, and click the extension toolbar button.
 - No participants: join the call and wait for remote participants. The extension cannot adjust your microphone or other people's playback.
-- A setting seems inactive: speaker handoffs, overlapping speech, uncertain stream association and a hidden meeting tab deliberately fall back to 100%. Saved mute/gain is not guaranteed while the tab is hidden. Browser restrictions or meeting changes can also prevent audio interception; see the limitations below.
+- A setting seems inactive: speaker handoffs, overlapping speech or uncertain speaker/stream association can return playback to 100%. The same routing policy applies whether the meeting tab is visible or in the background. Browser restrictions or meeting changes can also prevent audio interception; see the limitations below.
+- Balance is unavailable: wait until at least two unmuted participants have spoken alone long enough for typical level estimates. Estimates may be unavailable; Balance does not continuously adjust volume.
 - Preferences: clear Google Meet site data to remove local settings; uninstalling alone may leave them behind.
 
 [Get help or report an issue](https://github.com/andreclemente/meet-audio-booster/issues) · [Open a new issue](https://github.com/andreclemente/meet-audio-booster/issues/new). Include browser/extension versions and reproduction steps, not private meeting details or participant names.
@@ -27,12 +26,16 @@ Optional: [Buy Me a Coffee](https://buymeacoffee.com/andreclemente) to support d
 
 ## Features
 
-- Per-participant 0–600% controls, mute, and presets
-- Compatible storage under `__meeting_audio_booster_v15`, including panel position
-- Draggable panel that can be restored with the extension toolbar button
-- Collapse button immediately left of × hides the participant controls, reset footer, and status while keeping the header visible. The collapsed or expanded preference is saved locally per site alongside gain and panel-position settings and restored after reload; existing settings default to expanded. Toolbar hide/show preserves the current state, and toggling still works if storage is unavailable.
-- Google Meet MAIN-world AudioWorklet interception (including Brave's pooled nodes) and Chromium media-element replay fallback
-- JSON-serializable diagnostics from `window.__meetingAudioBoosterDebug()`
+- Per-participant 0–600% controls, Mute, 50%, 100% and 250% presets, and Reset all
+- Draggable panel; collapse or expand with the button beside × or by double-clicking the title. Reopen a hidden panel with the extension toolbar button.
+- Volume preferences, panel position and the collapsed/expanded preference saved locally and restored after reload
+- Speaking-level estimates and a one-time Balance action, described below
+
+### Level estimates and Balance
+
+The thin line beneath each slider estimates the speaking level after your volume setting; a marker shows the typical level once enough speech has been heard. Estimates are collected only while a single speaker can be confidently associated with the audio. They are session-only, kept in memory rather than saved or transmitted, and may be unavailable.
+
+Once at least two unmuted participants have usable typical estimates, **Balance** makes a one-time volume adjustment toward the median of their estimated typical levels after your current volume settings. Muted participants and those without estimates are left unchanged. Results are approximate and limited by the available volume range. **Undo** restores the pre-Balance volumes until another volume change, including Reset all, clears that option. This is not continuous automatic leveling.
 
 ## Supported sites
 
@@ -67,19 +70,21 @@ The repository root remains directly loadable for compatibility, but `dist/` is 
 - `src/shared/`: constants, audio/DOM helpers, and safe diagnostics
 - `scripts/build.mjs`: MV3 release assembly
 
+Preferences use the compatible `__meeting_audio_booster_v15` storage key. Google Meet MAIN-world AudioWorklet interception (including Brave's pooled nodes) has a Chromium media-element replay fallback. JSON-serializable diagnostics are available from `window.__meetingAudioBoosterDebug()`.
+
 Meet's pooled AudioWorklet outputs are deliberately never permanently assigned to people. A speaker handoff resets every output to 100% before a confirmed new setting is applied. Media stream association is learned only after repeated exclusive UI and energy agreement, never from array or DOM order. Ambiguous, stale, overlapping, or unknown observations route at 100%.
 
 ## Exact limitations
 
-- Meeting applications can change undocumented DOM and Web Audio internals; participant/speaker selectors may require maintenance.
-- Google Meet routing is conservative. During overlap, handoff confirmation, stale UI, unknown stream association, or while the meeting tab is hidden it intentionally uses 100%. Saved mute/gain is not guaranteed in a hidden tab.
+- Meeting applications can change undocumented DOM and Web Audio internals; participant/speaker selectors may require maintenance. Compatibility with every Meet build, browser or interface language is not guaranteed.
+- Google Meet can mix voices into shared audio outputs. The extension follows confirmed speaker activity; it does not isolate simultaneous voices into independent audio channels. During overlap, handoff confirmation, stale UI or unknown stream association it intentionally uses 100%, so saved mute/gain is not guaranteed in those situations. The same policy applies in visible and background tabs.
 - RMS indicates that a stream carries energy; it cannot identify a person until repeated exclusive alignment establishes an association.
 - Audio protected by browser/platform restrictions or created before MAIN-world hooks can be unavailable for replay.
 - Automated tests validate routing, storage, names, energy logic, build output, and MV3 policy, but real calls on current Google Meet builds still require manual browser testing.
 
 ## Privacy
 
-Volume preferences, panel position and the collapsed/expanded preference are stored locally. See [privacy.md](privacy.md).
+Volume preferences, panel position and the collapsed/expanded preference are stored locally. Speaking-level estimates stay in session memory, not persistent storage. See [privacy.md](privacy.md).
 
 ## License
 
