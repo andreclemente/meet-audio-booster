@@ -536,8 +536,10 @@ test('a share row created before its controls rendered is dropped once they appe
   const [first] = scanMeetParticipants(docOf([early]), selfIds)
   const row = { platform: 'google-meet', key: first.key, participantId: 'share-id', present: true, lastSeenAt: 0 }
   const later = iconTile('share-id', 'André Clemente', ['more_vert', 'zoom_in', 'open_in_full'])
-  const found = new Set(scanMeetParticipants(docOf([later]), selfIds).map(item => item.key))
-  assert.equal(selfIds.has('share-id'), true)
-  updateMissingParticipants([row], found, { now: 1, selfIds, isMember: () => true })
+  const presentationIds = new Set()
+  const found = new Set(scanMeetParticipants(docOf([later]), selfIds, presentationIds).map(item => item.key))
+  assert.equal(presentationIds.has('share-id'), true)
+  assert.equal(selfIds.has('share-id'), false)
+  updateMissingParticipants([row], found, { now: 1, selfIds, presentationIds, isMember: () => true })
   assert.equal(row.present, false)
 })

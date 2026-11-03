@@ -354,36 +354,37 @@
   function scoreRoot(element) {
     return Math.min((element.innerText || "").length, 500) + Math.min(element.querySelectorAll?.("*").length || 0, 500);
   }
-  function scanMeetParticipants(root = document, selfIds = /* @__PURE__ */ new Set()) {
+  function scanMeetParticipants(root = document, selfIds = /* @__PURE__ */ new Set(), presentationIds = /* @__PURE__ */ new Set()) {
     const roots = /* @__PURE__ */ new Map();
     for (const element of root.querySelectorAll?.("[data-participant-id]") || []) {
       const participantId = element.getAttribute("data-participant-id");
       if (!participantId) continue;
       if (isSelfParticipant(element)) selfIds.add(participantId);
-      if (isPresentationRoot(element)) selfIds.add(participantId);
+      if (isPresentationRoot(element)) presentationIds.add(participantId);
       if (!isRecognizedParticipantRoot(element) || isLocalPresentationRoot(element)) continue;
       const current = roots.get(participantId);
       if (!current || scoreRoot(element) > scoreRoot(current)) roots.set(participantId, element);
     }
     const found = [];
     for (const [participantId, element] of roots) {
-      if (selfIds.has(participantId)) continue;
+      if (selfIds.has(participantId) || presentationIds.has(participantId)) continue;
       const name = extractGoogleName(element);
       if (!name) continue;
       found.push({ key: `id:${participantId}`, participantId, name, element, speaking: isGoogleParticipantSpeaking(element), hasMicrophone: hasMicrophoneIndicator(element) });
     }
     return found;
   }
-  function updateMissingParticipants(participants, found, { now, selfIds, isMember = () => false, graceMs = 8e3 }) {
+  function updateMissingParticipants(participants, found, { now, selfIds, presentationIds = /* @__PURE__ */ new Set(), isMember = () => false, graceMs = 8e3 }) {
+    const excluded = (id) => selfIds.has(id) || presentationIds.has(id);
     for (const participant of participants) {
       if (participant.platform !== "google-meet" || found.has(participant.key)) continue;
-      if (!selfIds.has(participant.participantId) && isMember(participant.participantId)) {
+      if (!excluded(participant.participantId) && isMember(participant.participantId)) {
         participant.present = true;
         participant.lastSeenAt = now;
         continue;
       }
       participant.speaking = false;
-      if (selfIds.has(participant.participantId) || now - participant.lastSeenAt > graceMs) participant.present = false;
+      if (excluded(participant.participantId) || now - participant.lastSeenAt > graceMs) participant.present = false;
     }
   }
   function observeMeetParticipants(onChange, root = document.documentElement) {
@@ -1936,7 +1937,7 @@
     const workletSpeakerTracker = createWorkletSpeakerTracker();
     const nativeActivity = createNativeActivitySource();
     const levelMeter = createParticipantLevelMeter();
-    const selfIds = /* @__PURE__ */ new Set();
+    const selfIds = /* @__PURE__ */ new Set(), presentationIds = /* @__PURE__ */ new Set();
     let restoreHook, restoreCaptureHook, observer, mutationTimer, reconcileTimer, mediaTimer, routingTimer, visibilityHandler, slotCounter = 0;
     let capturePresentationActive = false;
     let domPresentationActive = false;
@@ -1945,7 +1946,7 @@
       return visibleParticipants(state, "google-meet");
     }
     function knownParticipants() {
-      return [...state.participants.values()].filter((item) => item.platform === "google-meet" && !selfIds.has(item.participantId));
+      return [...state.participants.values()].filter((item) => item.platform === "google-meet" && !selfIds.has(item.participantId) && !presentationIds.has(item.participantId));
     }
     function applyPresentationState() {
       const presenting = resolveLocalPresentationActive({
@@ -2004,7 +2005,7 @@
       const now = Date.now();
       syncPresentationState();
       const found = /* @__PURE__ */ new Set();
-      for (const data of scanMeetParticipants(document, selfIds)) {
+      for (const data of scanMeetParticipants(document, selfIds, presentationIds)) {
         if (!data.element?.getAttribute?.("data-requested-participant-id") && !nativeActivity.isMember(data.participantId)) continue;
         if (!data.hasMicrophone && !state.participants.has(data.key)) continue;
         found.add(data.key);
@@ -2016,7 +2017,7 @@
           extra: { participantId: data.participantId, element: data.element }
         });
       }
-      updateMissingParticipants(state.participants.values(), found, { now, selfIds, isMember: nativeActivity.isMember });
+      updateMissingParticipants(state.participants.values(), found, { now, selfIds, presentationIds, isMember: nativeActivity.isMember });
       const isSelfKey = (key) => selfIds.has(state.participants.get(key)?.participantId);
       if ([
         state.google.activeParticipantKey,
@@ -2205,6 +2206,7 @@
       state.google.slots = [];
       media.destroy();
       selfIds.clear();
+      presentationIds.clear();
       workletSpeakerTracker.reset();
       nativeActivity.reset();
       levelMeter.reset();

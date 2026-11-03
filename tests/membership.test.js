@@ -385,10 +385,31 @@ test('controller: a screen share never gets a row, not even before its controls 
     h.roots([a.root, share.root])
     h.controller.start()
     call.speak('device-a', 2)
-    for (const step of [[], ['more_vert'], ['zoom_in', 'open_in_full']]) {
+    for (const [index, step] of [[], ['more_vert'], ['zoom_in', 'open_in_full']].entries()) {
       icons = step
-      h.advance(1500)
+      h.advance(1500 * (index + 1))
       assert.deepEqual(names(h.state), ['Alice'])
     }
+  })
+})
+
+test('controller: share audio is an unknown speaker (safe 100%), never skipped like self', () => {
+  const call = makeCall({ ids: ['device-a', 'device-share'] })
+  const a = call.tile('device-a', { name: 'Alice' })
+  const share = call.tile('device-share', { name: 'Alice' })
+  const original = share.root.querySelectorAll
+  share.root.querySelectorAll = selector => selector.includes('google-symbols')
+    ? ['zoom_in', 'open_in_full'].map(textContent => ({ textContent, closest: () => share.root })) : original(selector)
+  withController(h => {
+    h.roots([a.root, share.root])
+    h.controller.start()
+    call.speak('device-a', 2)
+    h.advance(1500)
+    assert.equal(h.state.google.routingState, 'confirmed-speaker')
+    call.speak('device-share', 4)
+    h.advance(3000)
+    assert.deepEqual(names(h.state), ['Alice'])
+    assert.notEqual(h.state.google.routingState, 'confirmed-speaker')
+    assert.ok(h.state.google.unknownSpeakerCount >= 1)
   })
 })

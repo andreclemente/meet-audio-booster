@@ -90,24 +90,25 @@ function scoreRoot(element) {
 
 // Pass a controller-owned Set to retain verified IDs while Meet hides tiles.
 // Omitted state is intentionally fresh: independent callers/meetings never share it.
-export function scanMeetParticipants(root = document, selfIds = new Set()) {
+export function scanMeetParticipants(root = document, selfIds = new Set(), presentationIds = new Set()) {
   const roots = new Map()
   for (const element of root.querySelectorAll?.('[data-participant-id]') || []) {
     const participantId = element.getAttribute('data-participant-id')
     if (!participantId) continue
     // Gather identity before either name validation or richest-root selection.
     if (isSelfParticipant(element)) selfIds.add(participantId)
-    // A screen share is not a person: exclude its id everywhere self is
-    // excluded (rows, speaker readings, membership). Its controls can render
-    // after the tile, so a row created earlier is dropped at once too.
-    if (isPresentationRoot(element)) selfIds.add(participantId)
+    // A screen share is not a person: no row, never kept by membership. It is
+    // NOT treated like self for speaker readings: share audio must stay an
+    // unknown speaker (100%), never be skipped. Its controls can render after
+    // the tile, so a row created earlier is dropped at once too.
+    if (isPresentationRoot(element)) presentationIds.add(participantId)
     if (!isRecognizedParticipantRoot(element) || isLocalPresentationRoot(element)) continue
     const current = roots.get(participantId)
     if (!current || scoreRoot(element) > scoreRoot(current)) roots.set(participantId, element)
   }
   const found = []
   for (const [participantId, element] of roots) {
-    if (selfIds.has(participantId)) continue
+    if (selfIds.has(participantId) || presentationIds.has(participantId)) continue
     const name = extractGoogleName(element)
     if (!name) continue
     found.push({ key: `id:${participantId}`, participantId, name, element, speaking: isGoogleParticipantSpeaking(element), hasMicrophone: hasMicrophoneIndicator(element) })
@@ -120,16 +121,17 @@ export function scanMeetParticipants(root = document, selfIds = new Set()) {
 // present while Meet's trusted in-call membership still lists their id; a
 // hidden tile is not a departure. Otherwise (left the call, or membership
 // unavailable) the tile grace period applies. Verified self is removed now.
-export function updateMissingParticipants(participants, found, { now, selfIds, isMember = () => false, graceMs = 8000 }) {
+export function updateMissingParticipants(participants, found, { now, selfIds, presentationIds = new Set(), isMember = () => false, graceMs = 8000 }) {
+  const excluded = id => selfIds.has(id) || presentationIds.has(id)
   for (const participant of participants) {
     if (participant.platform !== 'google-meet' || found.has(participant.key)) continue
-    if (!selfIds.has(participant.participantId) && isMember(participant.participantId)) {
+    if (!excluded(participant.participantId) && isMember(participant.participantId)) {
       participant.present = true
       participant.lastSeenAt = now
       continue
     }
     participant.speaking = false
-    if (selfIds.has(participant.participantId) || now - participant.lastSeenAt > graceMs) participant.present = false
+    if (excluded(participant.participantId) || now - participant.lastSeenAt > graceMs) participant.present = false
   }
 }
 

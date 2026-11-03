@@ -124,7 +124,7 @@ export function createGoogleMeetController({ state, context, setStatus, renderSo
   const workletSpeakerTracker = createWorkletSpeakerTracker()
   const nativeActivity = createNativeActivitySource()
   const levelMeter = createParticipantLevelMeter()
-  const selfIds = new Set()
+  const selfIds = new Set(), presentationIds = new Set()
   let restoreHook, restoreCaptureHook, observer, mutationTimer, reconcileTimer, mediaTimer, routingTimer, visibilityHandler, slotCounter = 0
   let capturePresentationActive = false
   let domPresentationActive = false
@@ -132,7 +132,7 @@ export function createGoogleMeetController({ state, context, setStatus, renderSo
 
   function participants() { return visibleParticipants(state, 'google-meet') }
   // Everyone known in this call, with or without a rendered tile (never self).
-  function knownParticipants() { return [...state.participants.values()].filter(item => item.platform === 'google-meet' && !selfIds.has(item.participantId)) }
+  function knownParticipants() { return [...state.participants.values()].filter(item => item.platform === 'google-meet' && !selfIds.has(item.participantId) && !presentationIds.has(item.participantId)) }
   function applyPresentationState() {
     const presenting = resolveLocalPresentationActive({
       captureActive: capturePresentationActive,
@@ -190,7 +190,7 @@ export function createGoogleMeetController({ state, context, setStatus, renderSo
     const now = Date.now()
     syncPresentationState()
     const found = new Set()
-    for (const data of scanMeetParticipants(document, selfIds)) {
+    for (const data of scanMeetParticipants(document, selfIds, presentationIds)) {
       // Only a call tile or a confirmed call member is a person in the call;
       // a People-list or lobby entry (someone asking to join) is not.
       if (!data.element?.getAttribute?.('data-requested-participant-id') && !nativeActivity.isMember(data.participantId)) continue
@@ -202,7 +202,7 @@ export function createGoogleMeetController({ state, context, setStatus, renderSo
         extra: { participantId: data.participantId, element: data.element }
       })
     }
-    updateMissingParticipants(state.participants.values(), found, { now, selfIds, isMember: nativeActivity.isMember })
+    updateMissingParticipants(state.participants.values(), found, { now, selfIds, presentationIds, isMember: nativeActivity.isMember })
     const isSelfKey = key => selfIds.has(state.participants.get(key)?.participantId)
     if ([state.google.activeParticipantKey, state.google.appliedParticipantKey,
       state.google.transitionGuard.candidateParticipantKey, state.google.routing?.appliedParticipantKey,
@@ -378,7 +378,7 @@ export function createGoogleMeetController({ state, context, setStatus, renderSo
     for (const slot of state.google.slots) slot.destroy()
     state.google.slots = []
     media.destroy()
-    selfIds.clear()
+    selfIds.clear(); presentationIds.clear()
     workletSpeakerTracker.reset()
     nativeActivity.reset()
     levelMeter.reset()
