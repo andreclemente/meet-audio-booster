@@ -1,8 +1,8 @@
-const CONTROL_WORDS = new Set([
-  'people', 'person', 'group', 'chat', 'meeting details', 'more options',
-  'audio settings', 'video settings', 'settings', 'close', 'leave call',
-  'present now', 'raise hand', 'keep_outline', 'mic', 'mic_off', 'more_vert',
-  'call_end', 'volume_up', 'videocam', 'videocam_off', 'devices'
+// Material icon ligatures: the same in every UI language.
+const ICON_WORDS = new Set([
+  'keep_outline', 'keep_off', 'mic', 'mic_none', 'mic_off', 'more_vert', 'call_end',
+  'volume_up', 'volume_off', 'videocam', 'videocam_off', 'devices', 'visual_effects', 'frame_person',
+  'person', 'group', 'chat', 'people'
 ])
 
 export const PARTICIPANT_NAME_SELECTORS = [
@@ -17,23 +17,15 @@ export const PARTICIPANT_NAME_SELECTORS = [
 export function cleanName(value) {
   return String(value || '')
     .replace(/\s+\(.*?\)$/, '')
-    .replace(/,\s*(?:muted|not muted|speaking)$/i, '')
-    .replace(/\s+is speaking$/i, '')
     .replace(/\s+/g, ' ')
     .trim()
 }
 
-export function isSelfText(value) {
-  return /(^|[\s(])you([\s)]|$)/i.test(value || '')
-}
-
 export function isValidParticipantName(value) {
   const name = cleanName(value)
-  if (!name || name.length > 80 || isSelfText(name)) return false
-  const lower = name.toLocaleLowerCase()
-  if (CONTROL_WORDS.has(lower)) return false
-  if (/^(?:[a-z]+_){1,}[a-z]+$/.test(lower) || /^\d+$/.test(name)) return false
-  return !/(?:microphone|camera|google meet|meeting|participant|presentation|screen)/i.test(name)
+  if (!name || name.length > 80) return false
+  if (ICON_WORDS.has(name.toLocaleLowerCase())) return false
+  return !/^(?:[a-z]+_){1,}[a-z]+$/.test(name.toLocaleLowerCase()) && !/^\d+$/.test(name)
 }
 
 function participantNameLeaves(element) {
@@ -66,11 +58,20 @@ function extractCandidateName(element) {
 export function extractNameFromParticipantRoot(root) {
   if (!root?.getAttribute?.('data-participant-id')) return null
   const candidates = root.querySelectorAll?.(PARTICIPANT_NAME_SELECTORS) || []
+  // Meet's own control labels/tooltips in this tile, in whatever language the
+  // UI uses: text equal to one of them is a control, not a person.
+  const controlLabels = new Set()
+  for (const element of root.querySelectorAll?.('[aria-label], [data-tooltip]') || []) {
+    for (const attr of ['aria-label', 'data-tooltip']) {
+      const value = cleanName(element.getAttribute?.(attr)).toLocaleLowerCase()
+      if (value) controlLabels.add(value)
+    }
+  }
   for (const element of candidates) {
     if (!element.matches?.(PARTICIPANT_NAME_SELECTORS)) continue
     if (element.matches?.('button, [role="button"], [aria-hidden="true"]')) continue
     const name = extractCandidateName(element)
-    if (isValidParticipantName(name)) return name
+    if (isValidParticipantName(name) && !controlLabels.has(name.toLocaleLowerCase())) return name
   }
   return null
 }

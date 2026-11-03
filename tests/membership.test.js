@@ -64,7 +64,16 @@ function makeCall({ build = 1, ids, members = ids, record = 'model', duplicateMe
       __jsmodel: { A0Tiaf: { pending: { value: { wy: model } } } },
       querySelectorAll(selector) {
         if (selector.includes('jscontroller')) return [ring]
-        if (selector === '[aria-label]') return root.selfLabel ? [{ getAttribute: () => 'Reframe', closest: () => root }] : []
+        if (selector === '[aria-label]') return []
+        // Every person's tile shows a microphone indicator.
+        if (selector.includes('google-symbols')) return [{ textContent: 'mic_none', closest: () => root }]
+        if (selector === 'button, [role="button"]') {
+          if (!root.selfLabel) return []
+          const button = { closest: sel => sel === '[data-participant-id]' ? root : button }
+          const icon = { textContent: 'visual_effects', closest: sel => sel === '[data-participant-id]' ? root : button }
+          button.querySelectorAll = () => [icon]
+          return [button]
+        }
         if (nameNode && selector.includes('data-self-name')) return [nameNode]
         if (nameNode && selector === '*') return [nameNode]
         return []
@@ -340,5 +349,67 @@ test('controller: a participant verified as self is never kept by membership', (
     h.advance(3000)
     assert.deepEqual(names(h.state), ['Alice'])
     assert.equal(h.state.google.membershipTrusted, true)
+  })
+})
+
+test('controller: someone asking to join (listed, not a call tile, not a member) gets no row until admitted', () => {
+  const call = makeCall({ ids: ['device-a'] })
+  const a = call.tile('device-a', { name: 'Alice' })
+  // A lobby/People entry: has the id and a name, but is not a call tile.
+  const knock = call.tile('device-k', { name: 'Kim' })
+  const original = knock.root.getAttribute
+  knock.root.getAttribute = attr => attr === 'data-requested-participant-id' ? null : original(attr)
+  withController(h => {
+    h.roots([a.root, knock.root])
+    h.controller.start()
+    call.speak('device-a', 2)
+    h.advance(1500)
+    assert.equal(h.state.google.membershipTrusted, true)
+    assert.deepEqual(names(h.state), ['Alice'])
+    call.join('device-k')
+    h.advance(6000)
+    assert.equal(h.state.google.membershipTrusted, true)
+    assert.deepEqual(names(h.state), ['Alice', 'Kim'])
+  })
+})
+
+test('controller: a screen share never gets a row, not even before its controls render', () => {
+  const call = makeCall({ ids: ['device-a', 'device-share'] })
+  const a = call.tile('device-a', { name: 'Alice' })
+  const share = call.tile('device-share', { name: 'Alice' })
+  const original = share.root.querySelectorAll
+  let icons = []
+  share.root.querySelectorAll = selector => selector.includes('google-symbols')
+    ? icons.map(textContent => ({ textContent, closest: () => share.root })) : original(selector)
+  withController(h => {
+    h.roots([a.root, share.root])
+    h.controller.start()
+    call.speak('device-a', 2)
+    for (const [index, step] of [[], ['more_vert'], ['zoom_in', 'open_in_full']].entries()) {
+      icons = step
+      h.advance(1500 * (index + 1))
+      assert.deepEqual(names(h.state), ['Alice'])
+    }
+  })
+})
+
+test('controller: share audio is an unknown speaker (safe 100%), never skipped like self', () => {
+  const call = makeCall({ ids: ['device-a', 'device-share'] })
+  const a = call.tile('device-a', { name: 'Alice' })
+  const share = call.tile('device-share', { name: 'Alice' })
+  const original = share.root.querySelectorAll
+  share.root.querySelectorAll = selector => selector.includes('google-symbols')
+    ? ['zoom_in', 'open_in_full'].map(textContent => ({ textContent, closest: () => share.root })) : original(selector)
+  withController(h => {
+    h.roots([a.root, share.root])
+    h.controller.start()
+    call.speak('device-a', 2)
+    h.advance(1500)
+    assert.equal(h.state.google.routingState, 'confirmed-speaker')
+    call.speak('device-share', 4)
+    h.advance(3000)
+    assert.deepEqual(names(h.state), ['Alice'])
+    assert.notEqual(h.state.google.routingState, 'confirmed-speaker')
+    assert.ok(h.state.google.unknownSpeakerCount >= 1)
   })
 })

@@ -27,6 +27,7 @@ function tile(id, { name = '同名', icons = [], labels = [], rich = false, requ
     querySelectorAll(selector) {
       if (selector.includes('jscontroller')) return [ring]
       if (selector === BUTTONS) return buttons
+      if (selector.includes('google-symbols')) return [{ textContent: 'mic_none', closest: () => root }]
       if (selector === '[aria-label]') return labelNodes
       if (selector.includes('data-self-name')) return name ? [nameNode] : []
       if (selector === '*') return [nameNode, ...buttons, ...labelNodes]
@@ -82,10 +83,15 @@ test('unnamed own-control root contributes identity before name/root selection',
 test('People ordering is not identity: remote first stays, self row not first is excluded', () => {
   assert.deepEqual(ids([remote(), tile('self', { rich: true }), self()]), ['remote'])
 })
-test('each icon alone and disabled remote controls are insufficient', () => {
-  for (const icons of [['frame_person'], ['visual_effects'], ['keep_outline', 'mic_off', 'more_vert'], ['frame_person_extra', 'visual_effects']]) {
+test('Reframe alone, look-alike icons and disabled remote controls are insufficient', () => {
+  for (const icons of [['frame_person'], ['keep_outline', 'mic_off', 'more_vert'], ['frame_person_extra', 'visual_effects_extra']]) {
     assert.deepEqual(ids([tile('remote', { icons, disabled: true })]), ['remote'])
   }
+})
+
+test('a self tile without a camera (no Reframe control) is still self, in any language', () => {
+  // Live pt-PT call: a device with no camera renders effects but no Reframe.
+  assert.deepEqual(ids([tile('self', { name: 'Pessoa A', icons: ['visual_effects', 'more_vert', 'devices'] }), remote()]), ['remote'])
 })
 test('plain name or parent label containing icon tokens is not a button icon', () => {
   assert.equal(isSelfParticipant(tile('remote', { name: 'frame_person visual_effects', labels: ['frame_person visual_effects'] })), false)
@@ -98,9 +104,7 @@ test('icons owned by a nested different participant do not identify the outer ro
   assert.equal(isSelfParticipant(outer), false)
   assert.deepEqual(ids([outer, nested]), ['remote'])
 })
-test('the control pair must belong to one root, not be assembled across same-ID roots', () => {
-  assert.deepEqual(ids([tile('remote', { icons: ['frame_person'] }), tile('remote', { icons: ['visual_effects'] })]), ['remote'])
-})
+
 test('nested English control labels are not borrowed by an outer participant', () => {
   const root = remote()
   const nested = tile('self')
@@ -115,11 +119,11 @@ test('generic raw-presentation flag/data-self-name are not new self markers', ()
   root.getAttribute = attr => attr === 'data-use-raw-local-presentation-stream' ? 'true' : original(attr)
   assert.deepEqual(ids([root]), ['remote'])
 })
-test('existing English controls aggregate across duplicate roots without matching remote helper text', () => {
-  assert.deepEqual(ids([
-    tile('self', { labels: ['Reframe'] }), tile('self', { rich: true }),
-    remote({ labels: ["You can’t unmute someone else"] })
-  ]), ['remote'])
+test('UI text in any language never identifies self: only Meet controls do', () => {
+  for (const labels of [['Reframe'], ['Backgrounds and effects'], ['Reenquadrar'], ['Turn off your microphone'], ['You are presenting']]) {
+    assert.deepEqual(ids([tile('ana', { name: 'Ana (You)', labels })]), ['ana'])
+    assert.equal(isSelfParticipant(tile('remote', { name: 'Ana (You)', labels })), false)
+  }
 })
 test('scan-local evidence persists only in the explicitly supplied lifetime Set', () => {
   const known = new Set()

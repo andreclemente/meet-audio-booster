@@ -201,29 +201,25 @@
   }
 
   // src/shared/dom.js
-  var CONTROL_WORDS = /* @__PURE__ */ new Set([
-    "people",
-    "person",
-    "group",
-    "chat",
-    "meeting details",
-    "more options",
-    "audio settings",
-    "video settings",
-    "settings",
-    "close",
-    "leave call",
-    "present now",
-    "raise hand",
+  var ICON_WORDS = /* @__PURE__ */ new Set([
     "keep_outline",
+    "keep_off",
     "mic",
+    "mic_none",
     "mic_off",
     "more_vert",
     "call_end",
     "volume_up",
+    "volume_off",
     "videocam",
     "videocam_off",
-    "devices"
+    "devices",
+    "visual_effects",
+    "frame_person",
+    "person",
+    "group",
+    "chat",
+    "people"
   ]);
   var PARTICIPANT_NAME_SELECTORS = [
     "[data-self-name]",
@@ -234,18 +230,13 @@
     '[jsname="EydYod"]'
   ].join(", ");
   function cleanName(value) {
-    return String(value || "").replace(/\s+\(.*?\)$/, "").replace(/,\s*(?:muted|not muted|speaking)$/i, "").replace(/\s+is speaking$/i, "").replace(/\s+/g, " ").trim();
-  }
-  function isSelfText(value) {
-    return /(^|[\s(])you([\s)]|$)/i.test(value || "");
+    return String(value || "").replace(/\s+\(.*?\)$/, "").replace(/\s+/g, " ").trim();
   }
   function isValidParticipantName(value) {
     const name = cleanName(value);
-    if (!name || name.length > 80 || isSelfText(name)) return false;
-    const lower = name.toLocaleLowerCase();
-    if (CONTROL_WORDS.has(lower)) return false;
-    if (/^(?:[a-z]+_){1,}[a-z]+$/.test(lower) || /^\d+$/.test(name)) return false;
-    return !/(?:microphone|camera|google meet|meeting|participant|presentation|screen)/i.test(name);
+    if (!name || name.length > 80) return false;
+    if (ICON_WORDS.has(name.toLocaleLowerCase())) return false;
+    return !/^(?:[a-z]+_){1,}[a-z]+$/.test(name.toLocaleLowerCase()) && !/^\d+$/.test(name);
   }
   function participantNameLeaves(element) {
     const names = [];
@@ -274,11 +265,18 @@
   function extractNameFromParticipantRoot(root) {
     if (!root?.getAttribute?.("data-participant-id")) return null;
     const candidates = root.querySelectorAll?.(PARTICIPANT_NAME_SELECTORS) || [];
+    const controlLabels = /* @__PURE__ */ new Set();
+    for (const element of root.querySelectorAll?.("[aria-label], [data-tooltip]") || []) {
+      for (const attr of ["aria-label", "data-tooltip"]) {
+        const value = cleanName(element.getAttribute?.(attr)).toLocaleLowerCase();
+        if (value) controlLabels.add(value);
+      }
+    }
     for (const element of candidates) {
       if (!element.matches?.(PARTICIPANT_NAME_SELECTORS)) continue;
       if (element.matches?.('button, [role="button"], [aria-hidden="true"]')) continue;
       const name = extractCandidateName(element);
-      if (isValidParticipantName(name)) return name;
+      if (isValidParticipantName(name) && !controlLabels.has(name.toLocaleLowerCase())) return name;
     }
     return null;
   }
@@ -288,12 +286,28 @@
   }
 
   // src/platforms/google-meet/participants.js
-  function isLocalPresentationRoot(root) {
+  var PRESENTATION_ICONS = /* @__PURE__ */ new Set(["zoom_in", "zoom_out", "open_in_full", "stylus_laser_pointer"]);
+  var MICROPHONE_ICONS = /* @__PURE__ */ new Set(["mic", "mic_none", "mic_off"]);
+  function ownIcons(root) {
+    const icons = /* @__PURE__ */ new Set();
+    for (const icon of root?.querySelectorAll?.(MATERIAL_ICON_SELECTOR) || []) {
+      if (icon.closest && icon.closest("[data-participant-id]") !== root) continue;
+      icons.add((icon.textContent || "").trim());
+    }
+    return icons;
+  }
+  function hasMicrophoneIndicator(root) {
+    const icons = ownIcons(root);
+    return [...MICROPHONE_ICONS].some((icon) => icons.has(icon));
+  }
+  function isPresentationRoot(root) {
     if (!root?.getAttribute?.("data-participant-id")) return false;
-    if (extractNameFromParticipantRoot(root)) return false;
-    const labels = [...root.querySelectorAll?.("[aria-label]") || []].map((element) => element.getAttribute("aria-label") || "");
-    const text = `${root.innerText || root.textContent || ""} ${labels.join(" ")}`;
-    return /\beveryone can see your annotations\b/i.test(text) && /\bscroll\s*(?:&|and)\s*zoom your presentation in meet\b/i.test(text);
+    const icons = ownIcons(root);
+    if ([...MICROPHONE_ICONS].some((icon) => icons.has(icon))) return false;
+    return [...PRESENTATION_ICONS].some((icon) => icons.has(icon));
+  }
+  function isLocalPresentationRoot(root) {
+    return isPresentationRoot(root) && ownIcons(root).has("stylus_laser_pointer");
   }
   function hasLocalPresentation(root = document) {
     return [...root.querySelectorAll?.("[data-participant-id]") || []].some(isLocalPresentationRoot);
@@ -321,24 +335,10 @@
         icons.add((icon.textContent || "").trim());
       }
     }
-    return icons.has("frame_person") && icons.has("visual_effects");
-  }
-  function ownParticipantText(root) {
-    if (!root?.childNodes) return root?.innerText || root?.textContent || "";
-    function read(node) {
-      if (node !== root && node.hasAttribute?.("data-participant-id")) return "";
-      if (node.nodeType === 3) return node.textContent || "";
-      return [...node.childNodes || []].map(read).join(" ");
-    }
-    return read(root);
+    return icons.has("visual_effects");
   }
   function isSelfParticipant(root) {
-    if (hasOwnSelfControls(root)) return true;
-    const text = ownParticipantText(root);
-    if (/(^|\s)\(you\)(?=\s|$)/i.test(text)) return true;
-    const labels = [...root?.querySelectorAll?.("[aria-label]") || []].filter((element) => !element.closest || element.closest("[data-participant-id]") === root).map((element) => element.getAttribute("aria-label") || "");
-    if (labels.some((label) => /^(Reframe|Backgrounds and effects)$/i.test(label))) return true;
-    return labels.some((label) => /^your\b|\byou are\b|\byou\s+\(/i.test(label) || /^(mute|unmute|turn (?:on|off)) your (?:microphone|camera)$/i.test(label));
+    return hasOwnSelfControls(root);
   }
   function extractGoogleName(root) {
     return extractNameFromParticipantRoot(root);
@@ -346,44 +346,45 @@
   function isGoogleParticipantSpeaking(root) {
     if (!root) return false;
     if (root.matches?.(".BlxGDf") || root.querySelector?.(".BlxGDf")) return true;
-    const nodes = [root, ...root.querySelectorAll?.("[aria-label], [data-is-speaking], [data-speaking], [aria-current]") || []];
+    const nodes = [root, ...root.querySelectorAll?.("[data-is-speaking], [data-speaking], [aria-current]") || []];
     return nodes.some((node) => {
-      const label = node.getAttribute?.("aria-label") || "";
-      return /(^|[,\s])speaking([,\s]|$)|\bis speaking\b/i.test(label) || /^(true|speaking|active)$/i.test(node.getAttribute?.("data-is-speaking") || "") || /^(true|speaking|active)$/i.test(node.getAttribute?.("data-speaking") || "") || /^(speaking|active)$/i.test(node.getAttribute?.("aria-current") || "");
+      return /^(true|speaking|active)$/i.test(node.getAttribute?.("data-is-speaking") || "") || /^(true|speaking|active)$/i.test(node.getAttribute?.("data-speaking") || "") || /^(speaking|active)$/i.test(node.getAttribute?.("aria-current") || "");
     });
   }
   function scoreRoot(element) {
     return Math.min((element.innerText || "").length, 500) + Math.min(element.querySelectorAll?.("*").length || 0, 500);
   }
-  function scanMeetParticipants(root = document, selfIds = /* @__PURE__ */ new Set()) {
+  function scanMeetParticipants(root = document, selfIds = /* @__PURE__ */ new Set(), presentationIds = /* @__PURE__ */ new Set()) {
     const roots = /* @__PURE__ */ new Map();
     for (const element of root.querySelectorAll?.("[data-participant-id]") || []) {
       const participantId = element.getAttribute("data-participant-id");
       if (!participantId) continue;
       if (isSelfParticipant(element)) selfIds.add(participantId);
+      if (isPresentationRoot(element)) presentationIds.add(participantId);
       if (!isRecognizedParticipantRoot(element) || isLocalPresentationRoot(element)) continue;
       const current = roots.get(participantId);
       if (!current || scoreRoot(element) > scoreRoot(current)) roots.set(participantId, element);
     }
     const found = [];
     for (const [participantId, element] of roots) {
-      if (selfIds.has(participantId)) continue;
+      if (selfIds.has(participantId) || presentationIds.has(participantId)) continue;
       const name = extractGoogleName(element);
       if (!name) continue;
-      found.push({ key: `id:${participantId}`, participantId, name, element, speaking: isGoogleParticipantSpeaking(element) });
+      found.push({ key: `id:${participantId}`, participantId, name, element, speaking: isGoogleParticipantSpeaking(element), hasMicrophone: hasMicrophoneIndicator(element) });
     }
     return found;
   }
-  function updateMissingParticipants(participants, found, { now, selfIds, isMember = () => false, graceMs = 8e3 }) {
+  function updateMissingParticipants(participants, found, { now, selfIds, presentationIds = /* @__PURE__ */ new Set(), isMember = () => false, graceMs = 8e3 }) {
+    const excluded = (id) => selfIds.has(id) || presentationIds.has(id);
     for (const participant of participants) {
       if (participant.platform !== "google-meet" || found.has(participant.key)) continue;
-      if (!selfIds.has(participant.participantId) && isMember(participant.participantId)) {
+      if (!excluded(participant.participantId) && isMember(participant.participantId)) {
         participant.present = true;
         participant.lastSeenAt = now;
         continue;
       }
       participant.speaking = false;
-      if (selfIds.has(participant.participantId) || now - participant.lastSeenAt > graceMs) participant.present = false;
+      if (excluded(participant.participantId) || now - participant.lastSeenAt > graceMs) participant.present = false;
     }
   }
   function observeMeetParticipants(onChange, root = document.documentElement) {
@@ -1936,7 +1937,7 @@
     const workletSpeakerTracker = createWorkletSpeakerTracker();
     const nativeActivity = createNativeActivitySource();
     const levelMeter = createParticipantLevelMeter();
-    const selfIds = /* @__PURE__ */ new Set();
+    const selfIds = /* @__PURE__ */ new Set(), presentationIds = /* @__PURE__ */ new Set();
     let restoreHook, restoreCaptureHook, observer, mutationTimer, reconcileTimer, mediaTimer, routingTimer, visibilityHandler, slotCounter = 0;
     let capturePresentationActive = false;
     let domPresentationActive = false;
@@ -1945,7 +1946,7 @@
       return visibleParticipants(state, "google-meet");
     }
     function knownParticipants() {
-      return [...state.participants.values()].filter((item) => item.platform === "google-meet" && !selfIds.has(item.participantId));
+      return [...state.participants.values()].filter((item) => item.platform === "google-meet" && !selfIds.has(item.participantId) && !presentationIds.has(item.participantId));
     }
     function applyPresentationState() {
       const presenting = resolveLocalPresentationActive({
@@ -2004,7 +2005,9 @@
       const now = Date.now();
       syncPresentationState();
       const found = /* @__PURE__ */ new Set();
-      for (const data of scanMeetParticipants(document, selfIds)) {
+      for (const data of scanMeetParticipants(document, selfIds, presentationIds)) {
+        if (!data.element?.getAttribute?.("data-requested-participant-id") && !nativeActivity.isMember(data.participantId)) continue;
+        if (!data.hasMicrophone && !state.participants.has(data.key)) continue;
         found.add(data.key);
         upsertParticipant(state, {
           ...data,
@@ -2014,7 +2017,7 @@
           extra: { participantId: data.participantId, element: data.element }
         });
       }
-      updateMissingParticipants(state.participants.values(), found, { now, selfIds, isMember: nativeActivity.isMember });
+      updateMissingParticipants(state.participants.values(), found, { now, selfIds, presentationIds, isMember: nativeActivity.isMember });
       const isSelfKey = (key) => selfIds.has(state.participants.get(key)?.participantId);
       if ([
         state.google.activeParticipantKey,
@@ -2203,6 +2206,7 @@
       state.google.slots = [];
       media.destroy();
       selfIds.clear();
+      presentationIds.clear();
       workletSpeakerTracker.reset();
       nativeActivity.reset();
       levelMeter.reset();
