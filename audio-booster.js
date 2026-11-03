@@ -288,6 +288,22 @@
   }
 
   // src/platforms/google-meet/participants.js
+  var PRESENTATION_ICONS = /* @__PURE__ */ new Set(["zoom_in", "zoom_out", "open_in_full", "stylus_laser_pointer"]);
+  var MICROPHONE_ICONS = /* @__PURE__ */ new Set(["mic", "mic_none", "mic_off"]);
+  function ownIcons(root) {
+    const icons = /* @__PURE__ */ new Set();
+    for (const icon of root?.querySelectorAll?.(MATERIAL_ICON_SELECTOR) || []) {
+      if (icon.closest && icon.closest("[data-participant-id]") !== root) continue;
+      icons.add((icon.textContent || "").trim());
+    }
+    return icons;
+  }
+  function isPresentationRoot(root) {
+    if (!root?.getAttribute?.("data-participant-id")) return false;
+    const icons = ownIcons(root);
+    if ([...MICROPHONE_ICONS].some((icon) => icons.has(icon))) return false;
+    return [...PRESENTATION_ICONS].some((icon) => icons.has(icon));
+  }
   function isLocalPresentationRoot(root) {
     if (!root?.getAttribute?.("data-participant-id")) return false;
     if (extractNameFromParticipantRoot(root)) return false;
@@ -321,7 +337,7 @@
         icons.add((icon.textContent || "").trim());
       }
     }
-    return icons.has("frame_person") && icons.has("visual_effects");
+    return icons.has("visual_effects");
   }
   function ownParticipantText(root) {
     if (!root?.childNodes) return root?.innerText || root?.textContent || "";
@@ -361,6 +377,7 @@
       const participantId = element.getAttribute("data-participant-id");
       if (!participantId) continue;
       if (isSelfParticipant(element)) selfIds.add(participantId);
+      if (isPresentationRoot(element)) selfIds.add(participantId);
       if (!isRecognizedParticipantRoot(element) || isLocalPresentationRoot(element)) continue;
       const current = roots.get(participantId);
       if (!current || scoreRoot(element) > scoreRoot(current)) roots.set(participantId, element);

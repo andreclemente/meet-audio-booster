@@ -1,5 +1,27 @@
 import { extractNameFromParticipantRoot, isRecognizedParticipantRoot } from '../../shared/dom.js'
 
+// Material icon names are ligatures, identical in every UI language. A screen
+// share tile has presentation controls (zoom, open in full, annotations) and
+// never a microphone indicator; a person's tile always has one.
+const PRESENTATION_ICONS = new Set(['zoom_in', 'zoom_out', 'open_in_full', 'stylus_laser_pointer'])
+const MICROPHONE_ICONS = new Set(['mic', 'mic_none', 'mic_off'])
+
+function ownIcons(root) {
+  const icons = new Set()
+  for (const icon of root?.querySelectorAll?.(MATERIAL_ICON_SELECTOR) || []) {
+    if (icon.closest && icon.closest('[data-participant-id]') !== root) continue
+    icons.add((icon.textContent || '').trim())
+  }
+  return icons
+}
+
+export function isPresentationRoot(root) {
+  if (!root?.getAttribute?.('data-participant-id')) return false
+  const icons = ownIcons(root)
+  if ([...MICROPHONE_ICONS].some(icon => icons.has(icon))) return false
+  return [...PRESENTATION_ICONS].some(icon => icons.has(icon))
+}
+
 export function isLocalPresentationRoot(root) {
   if (!root?.getAttribute?.('data-participant-id')) return false
   if (extractNameFromParticipantRoot(root)) return false
@@ -34,7 +56,9 @@ function hasOwnSelfControls(root) {
       icons.add((icon.textContent || '').trim())
     }
   }
-  return icons.has('frame_person') && icons.has('visual_effects')
+  // Reframe is not rendered at all when the device has no camera; effects is
+  // only ever offered on your own tile.
+  return icons.has('visual_effects')
 }
 
 function ownParticipantText(root) {
@@ -89,6 +113,10 @@ export function scanMeetParticipants(root = document, selfIds = new Set()) {
     if (!participantId) continue
     // Gather identity before either name validation or richest-root selection.
     if (isSelfParticipant(element)) selfIds.add(participantId)
+    // A screen share is not a person: exclude its id everywhere self is
+    // excluded (rows, speaker readings, membership). Its controls can render
+    // after the tile, so a row created earlier is dropped at once too.
+    if (isPresentationRoot(element)) selfIds.add(participantId)
     if (!isRecognizedParticipantRoot(element) || isLocalPresentationRoot(element)) continue
     const current = roots.get(participantId)
     if (!current || scoreRoot(element) > scoreRoot(current)) roots.set(participantId, element)

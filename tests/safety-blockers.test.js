@@ -5,7 +5,7 @@ import path from 'node:path'
 import { applyMediaPipelineOutputs, activateMediaModePipelines } from '../src/platforms/google-meet/index.js'
 import { createFreshAlignmentTracker, createAssociationLearner } from '../src/platforms/google-meet/association.js'
 import { routeGoogleAudio, createRoutingState } from '../src/platforms/google-meet/router.js'
-import { scanMeetParticipants, isSelfParticipant, isLocalPresentationRoot } from '../src/platforms/google-meet/participants.js'
+import { scanMeetParticipants, isSelfParticipant, isLocalPresentationRoot, isPresentationRoot, updateMissingParticipants } from '../src/platforms/google-meet/participants.js'
 import { installAudioWorkletHook, createPooledSlot } from '../src/platforms/google-meet/audio-worklet.js'
 import { createAudioContext } from '../src/shared/audio.js'
 import { installLocalPresentationCaptureHook } from '../src/platforms/google-meet/presentation.js'
@@ -498,4 +498,60 @@ test('manifest metadata matches the package and product name', async () => {
   assert.equal(manifest.version, pkg.version)
   assert.equal(manifest.name, 'Meet Audio Booster')
   assert.equal(manifest.action.default_title, 'Show Meet Audio Booster')
+})
+
+// Shapes from the live pt-PT capture: a screen-share tile carries the presenter's
+// name but only presentation controls; a camera tile always has a mic indicator.
+function iconTile(id, name, icons) {
+  const root = {
+    innerText: name, textContent: name,
+    getAttribute: attr => (attr === 'data-participant-id' || attr === 'data-requested-participant-id') ? id : null,
+    matches: () => false, querySelector: () => null,
+    querySelectorAll(selector) {
+      if (selector.includes('.zWGUib')) return [namedNode(name)]
+      if (selector.includes('google-symbols')) return icons.map(text => ({ textContent: text, closest: () => root }))
+      return []
+    }
+  }
+  return root
+}
+
+test('a screen share is not a participant in any UI language, even with the presenter name', () => {
+  const share = iconTile('share-id', 'André Clemente', ['keep_off', 'volume_off', 'more_vert', 'zoom_in', 'open_in_new', 'open_in_full'])
+  const camera = iconTile('camera-id', 'André Clemente', ['keep_outline', 'mic_none', 'more_vert', 'devices'])
+  const localShare = iconTile('local-share-id', 'André Clemente', ['stylus_laser_pointer', 'more_vert'])
+  assert.equal(isPresentationRoot(share), true)
+  assert.equal(isPresentationRoot(localShare), true)
+  assert.equal(isPresentationRoot(camera), false)
+  const doc = { querySelectorAll: selector => selector === '[data-participant-id]' ? [share, camera, localShare] : [] }
+  assert.deepEqual(scanMeetParticipants(doc).map(item => item.participantId), ['camera-id'])
+})
+
+test('a person with any microphone indicator is never treated as a screen share', () => {
+  for (const mic of ['mic', 'mic_none', 'mic_off']) {
+    assert.equal(isPresentationRoot(iconTile('p', 'Bea', [mic, 'open_in_full', 'zoom_in'])), false)
+  }
+  assert.equal(isPresentationRoot(iconTile('p', 'Bea', ['more_vert'])), false)
+})
+
+test('a screen share stays excluded when Meet also renders a plain root for the same id', () => {
+  const share = iconTile('share-id', 'André Clemente', ['zoom_in', 'open_in_full'])
+  const plain = iconTile('share-id', 'André Clemente', [])
+  for (const roots of [[share, plain], [plain, share]]) {
+    const doc = { querySelectorAll: selector => selector === '[data-participant-id]' ? roots : [] }
+    assert.deepEqual(scanMeetParticipants(doc), [])
+  }
+})
+
+test('a share row created before its controls rendered is dropped once they appear, even while a member', () => {
+  const selfIds = new Set()
+  const early = iconTile('share-id', 'André Clemente', ['more_vert'])
+  const docOf = roots => ({ querySelectorAll: selector => selector === '[data-participant-id]' ? roots : [] })
+  const [first] = scanMeetParticipants(docOf([early]), selfIds)
+  const row = { platform: 'google-meet', key: first.key, participantId: 'share-id', present: true, lastSeenAt: 0 }
+  const later = iconTile('share-id', 'André Clemente', ['more_vert', 'zoom_in', 'open_in_full'])
+  const found = new Set(scanMeetParticipants(docOf([later]), selfIds).map(item => item.key))
+  assert.equal(selfIds.has('share-id'), true)
+  updateMissingParticipants([row], found, { now: 1, selfIds, isMember: () => true })
+  assert.equal(row.present, false)
 })
