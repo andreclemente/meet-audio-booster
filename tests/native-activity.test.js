@@ -313,3 +313,25 @@ test('identity cache is rebuilt when a stale getter is rediscovered', () => {
     delete BuildOneModel.prototype.qb
   }
 })
+
+test('a participant temporarily hidden by Meet keeps their measured level', () => {
+  const a = nativeRoot('device-a', { level: { value: 0.6 } })
+  const b = nativeRoot('device-b', { level: { value: 0 } })
+  const alice = participant('A', 'device-a', a.root, 1)
+  const bob = participant('B', 'device-b', b.root, 1)
+  const f = controllerFixture([a.root, b.root], [alice, bob], false)
+  f.slot.tap = { readMeanSquare: () => 0.01 }
+  withClock(f.doc, setNow => {
+    let t = 0
+    for (; t < 6000; t += 30) { setNow(t); f.controller.route() }
+    assert.ok(Number.isFinite(f.controller.levelFor('A').typicalDb))
+    // Meet stops rendering Alice's tile for a while (e.g. someone presents).
+    alice.present = false
+    a.level.value = 0
+    b.level.value = 0.6
+    for (; t < 20000; t += 30) { setNow(t); f.controller.route() }
+    alice.present = true
+    setNow(t); f.controller.route()
+    assert.ok(Number.isFinite(f.controller.levelFor('A').typicalDb))
+  })
+})

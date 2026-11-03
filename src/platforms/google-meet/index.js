@@ -307,7 +307,10 @@ export function createGoogleMeetController({ state, context, setStatus, renderSo
     })
     try {
       levelMeter.tick({
-        now, participantKeys: participants().map(item => item.key), attributedKey,
+        // Keep estimates for everyone known in this call, not only the currently
+        // visible participants: Meet hides tiles (e.g. while presenting), and a
+        // temporarily hidden person must not lose their level.
+        now, participantKeys: [...state.participants.keys()], attributedKey,
         readPower: () => g.mode === 'media' ? sumPipelinePower(media.pipelines) : g.mode === 'worklet' ? sumTapPower(g.slots) : 0
       })
     } catch {}
