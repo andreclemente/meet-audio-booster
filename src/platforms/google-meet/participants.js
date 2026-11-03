@@ -103,6 +103,24 @@ export function scanMeetParticipants(root = document, selfIds = new Set()) {
   return found
 }
 
+// Participants without a rendered tile this scan. Meet stops rendering tiles
+// while someone presents and in large meetings, so a known participant stays
+// present while Meet's trusted in-call membership still lists their id; a
+// hidden tile is not a departure. Otherwise (left the call, or membership
+// unavailable) the tile grace period applies. Verified self is removed now.
+export function updateMissingParticipants(participants, found, { now, selfIds, isMember = () => false, graceMs = 8000 }) {
+  for (const participant of participants) {
+    if (participant.platform !== 'google-meet' || found.has(participant.key)) continue
+    if (!selfIds.has(participant.participantId) && isMember(participant.participantId)) {
+      participant.present = true
+      participant.lastSeenAt = now
+      continue
+    }
+    participant.speaking = false
+    if (selfIds.has(participant.participantId) || now - participant.lastSeenAt > graceMs) participant.present = false
+  }
+}
+
 export function observeMeetParticipants(onChange, root = document.documentElement) {
   const observer = new MutationObserver(() => onChange())
   observer.observe(root, { childList: true, subtree: true, attributes: true, attributeFilter: ['data-participant-id'] })

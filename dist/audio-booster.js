@@ -60,8 +60,8 @@
   }
   function setParticipantGain(settings, participant, value) {
     settings.gains ||= {};
-    const key = participantStorageKeys(participant)[0];
-    if (key) settings.gains[key] = Math.max(0, Number(value) || 0);
+    const gain = Math.max(0, Number(value) || 0);
+    for (const key of participantStorageKeys(participant)) settings.gains[key] = gain;
     return settings;
   }
 
@@ -373,6 +373,18 @@
       found.push({ key: `id:${participantId}`, participantId, name, element, speaking: isGoogleParticipantSpeaking(element) });
     }
     return found;
+  }
+  function updateMissingParticipants(participants, found, { now, selfIds, isMember = () => false, graceMs = 8e3 }) {
+    for (const participant of participants) {
+      if (participant.platform !== "google-meet" || found.has(participant.key)) continue;
+      if (!selfIds.has(participant.participantId) && isMember(participant.participantId)) {
+        participant.present = true;
+        participant.lastSeenAt = now;
+        continue;
+      }
+      participant.speaking = false;
+      if (selfIds.has(participant.participantId) || now - participant.lastSeenAt > graceMs) participant.present = false;
+    }
   }
   function observeMeetParticipants(onChange, root = document.documentElement) {
     const observer = new MutationObserver(() => onChange());
@@ -1114,6 +1126,486 @@
     } };
   }
 
+  // src/platforms/google-meet/membership.js
+  var MAX_MEMBERS = 2048;
+  var MAX_FIELDS = 64;
+  var DISCOVERY_SAMPLE = 32;
+  var ENTRIES_PER_TICK = 128;
+  var FULL_SCAN_MS = 250;
+  var MISMATCH_MS = 1e3;
+  var mapSize = Object.getOwnPropertyDescriptor(Map.prototype, "size").get;
+  var mapKeys = Map.prototype.keys;
+  var mapEntries = Map.prototype.entries;
+  var mapGet = Map.prototype.get;
+  var mapHas = Map.prototype.has;
+  function isObjectValue(value) {
+    return value !== null && typeof value === "object";
+  }
+  function isLive(model) {
+    try {
+      return model.isDisposed() === false;
+    } catch {
+      return false;
+    }
+  }
+  function isMembershipShaped(map) {
+    try {
+      const size = mapSize.call(map);
+      if (!(size >= 1 && size <= MAX_MEMBERS)) return false;
+      for (const [key, value] of mapEntries.call(map)) {
+        if (typeof key !== "string" || !key || !isObjectValue(value)) return false;
+      }
+      return true;
+    } catch {
+      return false;
+    }
+  }
+  function recordHoldsParticipant(record, id, isParticipantModel) {
+    try {
+      if (!isObjectValue(record)) return false;
+      let found = 0;
+      let fields = 0;
+      for (const name in record) {
+        if (++fields > MAX_FIELDS) return false;
+        let descriptor;
+        try {
+          descriptor = Object.getOwnPropertyDescriptor(record, name);
+        } catch {
+          continue;
+        }
+        if (!descriptor || !("value" in descriptor) || !isObjectValue(descriptor.value)) continue;
+        if (isParticipantModel(descriptor.value, id)) found++;
+      }
+      return found === 1;
+    } catch {
+      return false;
+    }
+  }
+  function readKeys(map) {
+    try {
+      const size = mapSize.call(map);
+      if (!(size >= 1 && size <= MAX_MEMBERS)) return null;
+      const keys = [];
+      for (const key of mapKeys.call(map)) {
+        if (typeof key !== "string" || !key || keys.length >= MAX_MEMBERS) return null;
+        keys.push(key);
+      }
+      return keys;
+    } catch {
+      return null;
+    }
+  }
+  function validEntry(map, id, isParticipantModel) {
+    try {
+      return mapHas.call(map, id) && recordHoldsParticipant(mapGet.call(map, id), id, isParticipantModel);
+    } catch {
+      return false;
+    }
+  }
+  function passesDiscovery(map, ids, isParticipantModel) {
+    if (!ids.every((id) => validEntry(map, id, isParticipantModel))) return false;
+    const sample = (readKeys(map) || []).slice(0, DISCOVERY_SAMPLE);
+    return sample.length > 0 && sample.every((id) => validEntry(map, id, isParticipantModel));
+  }
+  function createMembershipTracker({ mismatchMs = MISMATCH_MS, entriesPerTick = ENTRIES_PER_TICK } = {}) {
+    let map = null;
+    let validated = /* @__PURE__ */ new Set();
+    let complete = false;
+    let mismatchSince = null;
+    let anchors = [];
+    let lastScan = -Infinity;
+    let lastSize = -1;
+    let scanOk = true;
+    function drop() {
+      map = null;
+      validated = /* @__PURE__ */ new Set();
+      complete = false;
+      mismatchSince = null;
+      anchors = [];
+      lastScan = -Infinity;
+      lastSize = -1;
+      scanOk = true;
+    }
+    function adopt(candidate, tileModels) {
+      drop();
+      map = candidate;
+      anchors = tileModels.slice(0, 64);
+    }
+    function finish({ state, members, reached }, ids, tileModels, isParticipantModel) {
+      if (state !== "complete") return drop();
+      if (!ids.length) {
+        if (map && !reached.has(map)) drop();
+        return;
+      }
+      const found = isParticipantModel ? members.filter((candidate) => passesDiscovery(candidate, ids, isParticipantModel)) : [];
+      if (found.length !== 1) return drop();
+      if (found[0] !== map) adopt(found[0], tileModels);
+    }
+    function scan(now, levelValues, isParticipantModel) {
+      const keys = readKeys(map);
+      if (!keys) return false;
+      const current = new Set(keys);
+      for (const id of validated) if (!current.has(id)) validated.delete(id);
+      if (isParticipantModel) {
+        let checked = 0;
+        for (const id of keys) {
+          if (validated.has(id)) continue;
+          if (checked++ >= entriesPerTick) break;
+          if (!validEntry(map, id, isParticipantModel)) return false;
+          validated.add(id);
+        }
+      }
+      complete = validated.size === current.size;
+      lastScan = now;
+      lastSize = current.size;
+      scanOk = !levelValues || keys.every((id) => levelValues.has(id));
+      return true;
+    }
+    function update({ now, tileIds, levelValues, tileModels, isParticipantModel }) {
+      if (!map) return;
+      let size = -1;
+      try {
+        size = mapSize.call(map);
+      } catch {
+      }
+      if (size !== lastSize || !complete || now - lastScan >= FULL_SCAN_MS) {
+        if (!scan(now, levelValues, isParticipantModel)) return drop();
+      }
+      let covered = false;
+      try {
+        covered = tileIds.every((id) => mapHas.call(map, id));
+      } catch {
+      }
+      const consistent = covered && scanOk;
+      if (consistent) {
+        mismatchSince = null;
+        if (tileModels.length) anchors = [.../* @__PURE__ */ new Set([...tileModels, ...anchors.filter(isLive)])].slice(0, 64);
+      } else {
+        mismatchSince ??= now;
+        if (now - mismatchSince > mismatchMs) return drop();
+      }
+      if (!tileIds.length && !tileModels.length && !anchors.some(isLive)) drop();
+    }
+    return {
+      finish,
+      update,
+      reset: drop,
+      get map() {
+        return map;
+      },
+      get anchors() {
+        return anchors.filter(isLive);
+      },
+      get trusted() {
+        return Boolean(map && complete);
+      },
+      // Boolean membership answer only; never exposes the key set.
+      has(id) {
+        if (!map || !complete || typeof id !== "string") return false;
+        try {
+          return mapHas.call(map, id);
+        } catch {
+          return false;
+        }
+      }
+    };
+  }
+
+  // src/platforms/google-meet/activity-registry.js
+  var MAX_DEPTH = 4;
+  var MAX_OBJECTS = 3e3;
+  var MAX_KEYS_PER_OBJECT = 512;
+  var MAX_MAP_SIZE = 2048;
+  var MAX_VALUE = 5.5;
+  var MAX_ANCHORS = 64;
+  var MAX_CANDIDATES = 64;
+  var DISCOVERY_MS = 1e3;
+  var VERIFY_MS = 5e3;
+  var MISMATCH_MS2 = 1e3;
+  var SLICE_MS = 4;
+  var MAX_SLICES = 5;
+  var CLOCK_EVERY = 64;
+  var mapSize2 = Object.getOwnPropertyDescriptor(Map.prototype, "size").get;
+  var mapEntries2 = Map.prototype.entries;
+  var mapHas2 = Map.prototype.has;
+  var monotonic = typeof globalThis.performance?.now === "function" ? () => globalThis.performance.now() : () => Date.now();
+  var wideObjects = /* @__PURE__ */ new WeakSet();
+  function isMap(value) {
+    try {
+      return value instanceof Map && Number.isInteger(mapSize2.call(value));
+    } catch {
+      return false;
+    }
+  }
+  function isSkipped(value) {
+    try {
+      if (value === globalThis || ArrayBuffer.isView(value)) return true;
+      return typeof Node === "function" && value instanceof Node;
+    } catch {
+      return true;
+    }
+  }
+  function readLevelRegistry(map) {
+    try {
+      const size = mapSize2.call(map);
+      if (!(size >= 1 && size <= MAX_MAP_SIZE)) return null;
+      const values = /* @__PURE__ */ new Map();
+      for (const [key, value] of mapEntries2.call(map)) {
+        if (typeof key !== "string" || !key || typeof value !== "number" || !Number.isFinite(value) || value < 0 || value > MAX_VALUE) return null;
+        values.set(key, value);
+        if (values.size > MAX_MAP_SIZE) return null;
+      }
+      return values;
+    } catch {
+      return null;
+    }
+  }
+  function registryStep(value) {
+    return Math.floor(value);
+  }
+  function compareWithTiles(values, tileLevels) {
+    let positive = false;
+    for (const [id, level] of tileLevels) {
+      const value = values.get(id);
+      const step = Math.round(level * 5);
+      if (value === void 0 || registryStep(value) !== step) return { ok: false, positive: false };
+      if (step > 0) positive = true;
+    }
+    return { ok: tileLevels.size > 0, positive };
+  }
+  function ownDataValues(object) {
+    const values = [];
+    const push = (key) => {
+      try {
+        const descriptor = Object.getOwnPropertyDescriptor(object, key);
+        if (descriptor && "value" in descriptor) values.push(descriptor.value);
+      } catch {
+      }
+    };
+    try {
+      if (wideObjects.has(object)) return values;
+      if (Array.isArray(object)) {
+        const length = Object.getOwnPropertyDescriptor(object, "length")?.value;
+        const count = Number.isInteger(length) ? Math.min(length, MAX_KEYS_PER_OBJECT) : 0;
+        for (let index = 0; index < count; index++) push(index);
+        return values;
+      }
+      const names = [];
+      for (const name in object) {
+        if (names.length >= MAX_KEYS_PER_OBJECT) {
+          wideObjects.add(object);
+          return values;
+        }
+        names.push(name);
+      }
+      for (const name of names) push(name);
+    } catch {
+    }
+    return values;
+  }
+  function coversIds(map, ids) {
+    try {
+      return ids.every((id) => mapHas2.call(map, id));
+    } catch {
+      return false;
+    }
+  }
+  function createRegistryWalk({ anchors, ids = [], target = null, targets = [target], clock = monotonic, sliceMs = SLICE_MS, maxSlices = MAX_SLICES }) {
+    const visited = new Set(anchors);
+    const queue = anchors.map((anchor) => [anchor, 0]);
+    const candidates = /* @__PURE__ */ new Set();
+    const members = /* @__PURE__ */ new Set();
+    const wanted = new Set(targets.filter(Boolean));
+    const reached = /* @__PURE__ */ new Set();
+    let head = 0;
+    let pending = null;
+    let index = 0;
+    let depth = 0;
+    let slices = 0;
+    let state = "running";
+    function visit(value) {
+      if (value === null || typeof value !== "object" || visited.has(value)) return 1;
+      if (visited.size >= MAX_OBJECTS) {
+        state = "complete";
+        return 0;
+      }
+      visited.add(value);
+      if (wanted.has(value)) reached.add(value);
+      if (isSkipped(value)) return 1;
+      if (isMap(value)) {
+        if (!ids.length || !coversIds(value, ids)) return 1 + ids.length;
+        if (readLevelRegistry(value)) candidates.add(value);
+        else if (isMembershipShaped(value)) members.add(value);
+        else return 1 + mapSize2.call(value);
+        if (candidates.size > MAX_CANDIDATES || members.size > MAX_CANDIDATES) state = "incomplete";
+        return mapSize2.call(value);
+      }
+      if (depth + 1 < MAX_DEPTH) queue.push([value, depth + 1]);
+      return 1;
+    }
+    function step() {
+      if (state !== "running") return state;
+      slices++;
+      const start = clock();
+      let work = 0;
+      while (state === "running") {
+        if (work >= CLOCK_EVERY) {
+          work = 0;
+          if (clock() - start >= sliceMs) {
+            if (slices >= maxSlices) state = "incomplete";
+            break;
+          }
+        }
+        if (pending && index < pending.length) {
+          work += visit(pending[index++]);
+          continue;
+        }
+        if (head >= queue.length) {
+          state = "complete";
+          break;
+        }
+        const [object, objectDepth] = queue[head++];
+        pending = ownDataValues(object);
+        index = 0;
+        depth = objectDepth;
+        work = CLOCK_EVERY;
+      }
+      return state;
+    }
+    return { step, result: () => ({ state, candidates: [...candidates], members: [...members], reached, reachedTarget: reached.has(target) }) };
+  }
+  function isLive2(model) {
+    try {
+      return model.isDisposed() === false;
+    } catch {
+      return false;
+    }
+  }
+  function agreeing(candidates, tileLevels) {
+    return candidates.filter((candidate) => {
+      const values = readLevelRegistry(candidate);
+      return values && compareWithTiles(values, tileLevels).ok;
+    });
+  }
+  function createActivityRegistry({ discoveryMs = DISCOVERY_MS, mismatchMs = MISMATCH_MS2, verifyMs = VERIFY_MS, clock = monotonic } = {}) {
+    const membership = createMembershipTracker({ mismatchMs });
+    let map = null;
+    let trusted = false;
+    let anchors = [];
+    let mismatchSince = null;
+    let lastDiscovery = -Infinity;
+    let lastVerify = -Infinity;
+    let walk = null;
+    function drop() {
+      map = null;
+      trusted = false;
+      anchors = [];
+      mismatchSince = null;
+    }
+    function adopt(models) {
+      anchors = [.../* @__PURE__ */ new Set([...models, ...anchors.filter(isLive2)])].slice(0, MAX_ANCHORS);
+    }
+    function trust(now) {
+      if (!trusted) lastVerify = now;
+      trusted = true;
+    }
+    function adoptUnique(found, now, tileLevels, tileModels) {
+      drop();
+      if (found.length !== 1) return;
+      map = found[0];
+      anchors = tileModels.slice(0, MAX_ANCHORS);
+      const values = readLevelRegistry(map);
+      if (values && compareWithTiles(values, tileLevels).positive) trust(now);
+    }
+    function finish({ purpose, target, run, ids }, now, tileLevels, tileModels, isParticipantModel) {
+      const result = run.result();
+      membership.finish(result, ids, tileModels, isParticipantModel);
+      if (purpose === "members") return;
+      const { state, candidates, reachedTarget } = result;
+      const found = state === "complete" && tileLevels.size ? agreeing(candidates, tileLevels) : [];
+      if (purpose === "discover") {
+        if (!(trusted && found.length === 1 && found[0] === map)) adoptUnique(found, now, tileLevels, tileModels);
+        return;
+      }
+      if (map !== target) return;
+      if (state !== "complete" || !reachedTarget) return adoptUnique(found, now, tileLevels, tileModels);
+      const values = readLevelRegistry(map);
+      if (found.length > 1 && values && compareWithTiles(values, tileLevels).positive) drop();
+    }
+    function update({ now, tileLevels, tileModels, selfLevels = /* @__PURE__ */ new Map(), isParticipantModel = null }) {
+      let values = map ? readLevelRegistry(map) : null;
+      if (map && !values) drop();
+      const checked = map;
+      if (map) {
+        const self = new Map([...selfLevels].filter(([id]) => values.has(id)));
+        if (tileLevels.size || self.size) {
+          const check = tileLevels.size ? compareWithTiles(values, tileLevels) : { ok: true, positive: false };
+          if (check.ok && (!self.size || compareWithTiles(values, self).ok)) {
+            mismatchSince = null;
+            if (check.positive) trust(now);
+            adopt(tileModels);
+          } else {
+            mismatchSince ??= now;
+            if (now - mismatchSince > mismatchMs) drop();
+          }
+        } else if (!anchors.some(isLive2)) drop();
+      }
+      const ids = [...tileLevels.keys()];
+      const discovering = (!trusted || !membership.map) && ids.length && tileModels.length && now - lastDiscovery >= discoveryMs;
+      if (!walk && (discovering || (trusted || membership.map) && now - lastVerify >= verifyMs)) {
+        const verify = Boolean(map && trusted);
+        if (discovering) lastDiscovery = now;
+        if (verify || !discovering) lastVerify = now;
+        const roots = discovering && !verify ? tileModels : [.../* @__PURE__ */ new Set([...tileModels, ...anchors.filter(isLive2), ...membership.anchors])];
+        const target = verify ? map : null;
+        walk = { purpose: verify ? "verify" : discovering ? "discover" : "members", target, ids, run: createRegistryWalk({ anchors: roots, ids, target, targets: [target, membership.map], clock }) };
+      }
+      if (walk && walk.run.step() !== "running") {
+        const finished = walk;
+        walk = null;
+        finish(finished, now, tileLevels, tileModels, isParticipantModel);
+      }
+      if (map !== checked) values = map ? readLevelRegistry(map) : null;
+      const levelValues = map && trusted ? values : null;
+      membership.update({ now, tileIds: ids, levelValues, tileModels, isParticipantModel });
+      return mismatchSince === null ? levelValues : null;
+    }
+    return {
+      update,
+      reset: () => {
+        drop();
+        membership.reset();
+        walk = null;
+        lastDiscovery = -Infinity;
+        lastVerify = -Infinity;
+      },
+      get trusted() {
+        return Boolean(map && trusted);
+      },
+      membership
+    };
+  }
+  function readRegistryActivity(values, participants, known, selfIds) {
+    const byId = /* @__PURE__ */ new Map();
+    for (const participant of [...known, ...participants]) {
+      if (participant?.participantId && !selfIds.has(participant.participantId)) byId.set(participant.participantId, participant);
+    }
+    const levels = /* @__PURE__ */ new Map();
+    const speakers = [];
+    let unknownSpeakers = 0;
+    for (const [id, value] of values) {
+      if (selfIds.has(id)) continue;
+      const participant = byId.get(id);
+      const step = registryStep(value);
+      if (participant) {
+        levels.set(participant.key, step / 5);
+        if (step >= 1) speakers.push(participant);
+      } else if (step >= 1) unknownSpeakers++;
+    }
+    const unknown = participants.filter((participant) => !levels.has(participant.key)).map((participant) => participant.key);
+    return { available: unknown.length === 0, levels, unknown, speakers, unknownSpeakers, source: "meet-registry" };
+  }
+
   // src/platforms/google-meet/native-activity.js
   var RING_RENDERER = /Math\.round\([^;]*?\.([A-Za-z_$][\w$]*)\(\)\*5\)/;
   var DELEGATING_GETTER = /^[A-Za-z_$][\w$]*\(\)\{return this\.[A-Za-z_$][\w$]*\.[A-Za-z_$][\w$]*\(\)\}$/;
@@ -1247,6 +1739,14 @@
       return null;
     }
   }
+  function strongestLevel(models, getter) {
+    let level = null;
+    for (const model of models) {
+      const value = readLevel(model, getter);
+      if (value !== null) level = Math.max(level ?? 0, value);
+    }
+    return level;
+  }
   function isSpeakingLevel(level) {
     return Number.isFinite(level) && Math.round(level * 5) > 0;
   }
@@ -1256,6 +1756,7 @@
     let lastConfirmedAt = 0;
     let identityCache = /* @__PURE__ */ new WeakMap();
     const entries = /* @__PURE__ */ new Map();
+    const registry = createActivityRegistry();
     function rootsFor(participant, rootsByParticipantId) {
       const roots = rootsByParticipantId.get(participant.participantId) || [];
       if (participant.element && !roots.includes(participant.element)) roots.push(participant.element);
@@ -1274,7 +1775,7 @@
       entries.set(participant.key, { participantId: participant.participantId, models, discoveredAt: now });
       return models;
     }
-    function readUnsafe(participants, root, now) {
+    function readUnsafe(participants, root, now, { known = participants, selfIds = /* @__PURE__ */ new Set() } = {}) {
       const rootsByParticipantId = /* @__PURE__ */ new Map();
       for (const element of root?.querySelectorAll?.("[data-participant-id]") || []) {
         const id = element.getAttribute?.("data-participant-id");
@@ -1300,39 +1801,66 @@
       }
       const levels = /* @__PURE__ */ new Map();
       const unknown = [];
-      for (const key of entries.keys()) if (!participants.some((participant) => participant.key === key)) entries.delete(key);
-      if (!getter) return { available: false, levels, unknown: participants.map((participant) => participant.key), speakers: [] };
-      for (const participant of participants) {
+      const tileLevels = /* @__PURE__ */ new Map();
+      const tileModels = [];
+      const selfTiles = [...selfIds].filter((id) => rootsByParticipantId.has(id)).map((id) => ({ key: `self:${id}`, participantId: id }));
+      for (const key of entries.keys()) {
+        if (!participants.some((participant) => participant.key === key) && !selfTiles.some((item) => item.key === key)) entries.delete(key);
+      }
+      for (const participant of getter ? participants : []) {
         const roots = rootsFor(participant, rootsByParticipantId);
         const models = roots.length ? modelsFor(participant, roots, now) : [];
-        let level = null;
-        for (const model of models) {
-          const value = readLevel(model, getter);
-          if (value !== null) level = Math.max(level ?? 0, value);
-        }
+        const level = strongestLevel(models, getter);
         if (level === null) {
           unknown.push(participant.key);
           continue;
         }
         levels.set(participant.key, level);
+        tileLevels.set(participant.participantId, level);
+        tileModels.push(...models);
       }
+      const selfLevels = /* @__PURE__ */ new Map();
+      for (const self of getter ? selfTiles : []) {
+        const models = modelsFor(self, rootsByParticipantId.get(self.participantId), now);
+        tileModels.push(...models);
+        const level = strongestLevel(models, getter);
+        if (level !== null) selfLevels.set(self.participantId, level);
+      }
+      if (levels.size || selfLevels.size) lastConfirmedAt = now;
+      const isParticipantModel = getter ? (value, id) => isParticipantSourceModel(value, id, getter, identityCache) : null;
+      const registryValues = registry.update({ now, tileLevels, tileModels, selfLevels, isParticipantModel });
+      if (registryValues) return readRegistryActivity(registryValues, participants, known, selfIds);
+      if (!getter) return unavailable(participants);
       const speakers = participants.filter((participant) => isSpeakingLevel(levels.get(participant.key)));
-      if (levels.size) lastConfirmedAt = now;
-      return { available: participants.length > 0 && unknown.length === 0, levels, unknown, speakers };
+      const available = participants.length > 0 && unknown.length === 0;
+      return { available, levels, unknown, speakers, unknownSpeakers: 0, source: available ? "meet-tiles" : "unavailable" };
     }
-    function read(participants, root = globalThis.document, now = Date.now()) {
+    function unavailable(participants) {
+      return { available: false, levels: /* @__PURE__ */ new Map(), unknown: participants.map((participant) => participant.key), speakers: [], unknownSpeakers: 0, source: "unavailable" };
+    }
+    function read(participants, root = globalThis.document, now = Date.now(), options = {}) {
       try {
-        return readUnsafe(participants, root, now);
+        return readUnsafe(participants, root, now, options);
       } catch {
-        return { available: false, levels: /* @__PURE__ */ new Map(), unknown: participants.map((participant) => participant.key), speakers: [] };
+        return unavailable(participants);
       }
     }
     function reset() {
       entries.clear();
+      registry.reset();
     }
-    return { read, reset, get activityGetter() {
-      return getter;
-    } };
+    return {
+      read,
+      reset,
+      get activityGetter() {
+        return getter;
+      },
+      // Meet's in-call membership (tile-independent), as booleans only.
+      get membershipTrusted() {
+        return registry.membership.trusted;
+      },
+      isMember: (id) => registry.membership.has(id)
+    };
   }
 
   // src/platforms/google-meet/index.js
@@ -1416,6 +1944,9 @@
     function participants() {
       return visibleParticipants(state, "google-meet");
     }
+    function knownParticipants() {
+      return [...state.participants.values()].filter((item) => item.platform === "google-meet" && !selfIds.has(item.participantId));
+    }
     function applyPresentationState() {
       const presenting = resolveLocalPresentationActive({
         captureActive: capturePresentationActive,
@@ -1483,11 +2014,7 @@
           extra: { participantId: data.participantId, element: data.element }
         });
       }
-      for (const participant of state.participants.values()) {
-        if (participant.platform !== "google-meet" || found.has(participant.key)) continue;
-        participant.speaking = false;
-        if (selfIds.has(participant.participantId) || now - participant.lastSeenAt > 8e3) participant.present = false;
-      }
+      updateMissingParticipants(state.participants.values(), found, { now, selfIds, isMember: nativeActivity.isMember });
       const isSelfKey = (key) => selfIds.has(state.participants.get(key)?.participantId);
       if ([
         state.google.activeParticipantKey,
@@ -1528,14 +2055,16 @@
       else for (const slot of state.google.slots) slot.set(multiplier, immediate);
     }
     function currentSpeakers(now) {
-      const list = participants();
-      const activity = nativeActivity.read(list, globalThis.document, now);
-      for (const participant of list) {
+      const known = knownParticipants();
+      const activity = nativeActivity.read(participants(), globalThis.document, now, { known, selfIds });
+      for (const participant of known) {
         participant.speaking = activity.available && activity.speakers.includes(participant);
         if (participant.speaking) participant.lastSpeakingAt = now;
       }
       state.google.speakerSource = activity.available ? "meet-activity" : "unavailable";
-      state.google.unknownSpeakerCount = activity.unknown.length;
+      state.google.activitySource = activity.source;
+      state.google.membershipTrusted = nativeActivity.membershipTrusted;
+      state.google.unknownSpeakerCount = activity.unknown.length + activity.unknownSpeakers;
       return activity;
     }
     function neutralize(routingState, status) {
@@ -1552,7 +2081,7 @@
     function routeWorklet(now, speakers) {
       const routing = workletSpeakerTracker.update({ now, speakers });
       const active = state.participants.get(routing.appliedParticipantKey) || null;
-      const status = !participants().length ? "Waiting for participants" : speakers.length > 1 ? "Overlapping speakers · using safe 100% volume" : active ? `${active.name} · automatic routing` : `${participants().length} participants ready`;
+      const status = active ? `${active.name} · automatic routing` : speakers.length > 1 ? "Overlapping speakers · using safe 100% volume" : !participants().length ? "Waiting for participants" : `${participants().length} participants ready`;
       state.google.activeParticipantKey = routing.activeParticipantKey;
       state.google.appliedParticipantKey = routing.appliedParticipantKey;
       state.google.routingState = routing.routingState;
@@ -1569,8 +2098,9 @@
         Object.assign(energetic[0], learner.observe(energetic[0].id, speakers[0].key, { exclusiveUi: true, exclusiveEnergy: true }));
       }
       state.google.routing = routeGoogleAudio(state.google.routing || createRoutingState(), {
+        // A tileless participant is routable only while the registry names them as the speaker.
         now,
-        participants: Object.fromEntries(participants().map((item) => [item.key, item])),
+        participants: Object.fromEntries([...participants(), ...speakers].map((item) => [item.key, item])),
         uiSpeakerKeys: speakers.map((item) => item.key),
         pipelines: media.pipelines
       });
@@ -1628,8 +2158,11 @@
       }
       const now = Date.now();
       const activity = currentSpeakers(now);
-      if (!activity.available) {
+      if (activity.unknownSpeakers) neutralize("unknown-speaker", "Unrecognized speaker · using safe 100% volume");
+      else if (!activity.available) {
         neutralize("speaker-data-unavailable", participants().length ? "Speaker data unavailable · using safe 100% volume" : "Waiting for participants");
+      }
+      if (activity.unknownSpeakers || !activity.available) {
         sampleLevels(now, activity);
         updateLiveUi();
         return;

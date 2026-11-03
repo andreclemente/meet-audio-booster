@@ -8,6 +8,14 @@
 // accepted when one of their delegating getters returns exactly the
 // participant's data-participant-id and the model is not disposed. Anything
 // that cannot be confirmed is reported as unknown, never guessed.
+//
+// Tiles are only rendered for some participants, so accepted tile models are
+// also the anchors from which Meet's participant-keyed level registry is
+// discovered (activity-registry.js). While that registry is trusted it is the
+// single source for everyone, with or without a tile; otherwise the tile-only
+// reading below applies unchanged.
+
+import { createActivityRegistry, readRegistryActivity } from './activity-registry.js'
 
 const RING_RENDERER = /Math\.round\([^;]*?\.([A-Za-z_$][\w$]*)\(\)\*5\)/
 const DELEGATING_GETTER = /^[A-Za-z_$][\w$]*\(\)\{return this\.[A-Za-z_$][\w$]*\.[A-Za-z_$][\w$]*\(\)\}$/
@@ -141,6 +149,17 @@ function readLevel(model, getter) {
   } catch { return null }
 }
 
+// Meet may keep several representations of one participant and zero all but
+// one, so the strongest current representation is the activity.
+function strongestLevel(models, getter) {
+  let level = null
+  for (const model of models) {
+    const value = readLevel(model, getter)
+    if (value !== null) level = Math.max(level ?? 0, value)
+  }
+  return level
+}
+
 // Meet's ring is shown when Math.round(level * 5) > 0.
 export function isSpeakingLevel(level) {
   return Number.isFinite(level) && Math.round(level * 5) > 0
@@ -154,6 +173,7 @@ export function createNativeActivitySource({ rediscoverMs = REDISCOVER_MS } = {}
   // replaced whenever the getter is rediscovered.
   let identityCache = new WeakMap()
   const entries = new Map()
+  const registry = createActivityRegistry()
 
   function rootsFor(participant, rootsByParticipantId) {
     const roots = rootsByParticipantId.get(participant.participantId) || []
@@ -178,7 +198,7 @@ export function createNativeActivitySource({ rediscoverMs = REDISCOVER_MS } = {}
     return models
   }
 
-  function readUnsafe(participants, root, now) {
+  function readUnsafe(participants, root, now, { known = participants, selfIds = new Set() } = {}) {
     const rootsByParticipantId = new Map()
     for (const element of root?.querySelectorAll?.('[data-participant-id]') || []) {
       const id = element.getAttribute?.('data-participant-id')
@@ -203,37 +223,66 @@ export function createNativeActivitySource({ rediscoverMs = REDISCOVER_MS } = {}
     }
     const levels = new Map()
     const unknown = []
-    for (const key of entries.keys()) if (!participants.some(participant => participant.key === key)) entries.delete(key)
-    if (!getter) return { available: false, levels, unknown: participants.map(participant => participant.key), speakers: [] }
-    for (const participant of participants) {
+    const tileLevels = new Map()
+    const tileModels = []
+    const selfTiles = [...selfIds].filter(id => rootsByParticipantId.has(id)).map(id => ({ key: `self:${id}`, participantId: id }))
+    for (const key of entries.keys()) {
+      if (!participants.some(participant => participant.key === key) && !selfTiles.some(item => item.key === key)) entries.delete(key)
+    }
+    for (const participant of getter ? participants : []) {
       const roots = rootsFor(participant, rootsByParticipantId)
       const models = roots.length ? modelsFor(participant, roots, now) : []
-      // Meet may keep several representations of one participant and zero all
-      // but one, so the strongest current representation is the activity.
-      let level = null
-      for (const model of models) {
-        const value = readLevel(model, getter)
-        if (value !== null) level = Math.max(level ?? 0, value)
-      }
+      const level = strongestLevel(models, getter)
       if (level === null) { unknown.push(participant.key); continue }
       levels.set(participant.key, level)
+      tileLevels.set(participant.participantId, level)
+      tileModels.push(...models)
     }
+    // The local tile's models are registry anchors and its level a registry
+    // cross-check; the local participant is never routed.
+    const selfLevels = new Map()
+    for (const self of getter ? selfTiles : []) {
+      const models = modelsFor(self, rootsByParticipantId.get(self.participantId), now)
+      tileModels.push(...models)
+      const level = strongestLevel(models, getter)
+      if (level !== null) selfLevels.set(self.participantId, level)
+    }
+    // Any read tile level confirms the getter, whichever path answers.
+    if (levels.size || selfLevels.size) lastConfirmedAt = now
+    // Membership records hold participant models of the tile models' class;
+    // they are confirmed with the same identity check.
+    const isParticipantModel = getter ? (value, id) => isParticipantSourceModel(value, id, getter, identityCache) : null
+    const registryValues = registry.update({ now, tileLevels, tileModels, selfLevels, isParticipantModel })
+    if (registryValues) return readRegistryActivity(registryValues, participants, known, selfIds)
+    if (!getter) return unavailable(participants)
     const speakers = participants.filter(participant => isSpeakingLevel(levels.get(participant.key)))
-    if (levels.size) lastConfirmedAt = now
     // Routing is only safe when every present participant's activity is known:
     // an unconfirmed participant could be the one actually speaking.
-    return { available: participants.length > 0 && unknown.length === 0, levels, unknown, speakers }
+    const available = participants.length > 0 && unknown.length === 0
+    return { available, levels, unknown, speakers, unknownSpeakers: 0, source: available ? 'meet-tiles' : 'unavailable' }
   }
 
-  function read(participants, root = globalThis.document, now = Date.now()) {
+  function unavailable(participants) {
+    return { available: false, levels: new Map(), unknown: participants.map(participant => participant.key), speakers: [], unknownSpeakers: 0, source: 'unavailable' }
+  }
+
+  // options.known: every participant known in this call (present or not);
+  // options.selfIds: verified local participant ids, never routed.
+  function read(participants, root = globalThis.document, now = Date.now(), options = {}) {
     try {
-      return readUnsafe(participants, root, now)
+      return readUnsafe(participants, root, now, options)
     } catch {
-      return { available: false, levels: new Map(), unknown: participants.map(participant => participant.key), speakers: [] }
+      return unavailable(participants)
     }
   }
 
-  function reset() { entries.clear() }
+  function reset() { entries.clear(); registry.reset() }
 
-  return { read, reset, get activityGetter() { return getter } }
+  return {
+    read, reset,
+    get activityGetter() { return getter },
+    // Meet's in-call membership (tile-independent), as booleans only.
+    get membershipTrusted() { return registry.membership.trusted },
+    isMember: id => registry.membership.has(id)
+  }
 }
