@@ -2,7 +2,7 @@ import { createState, visibleParticipants } from './state.js'
 import { saveSettings, setParticipantGain } from './storage.js'
 import { detectPlatform } from './platforms/google-meet/platform.js'
 import { createGoogleMeetController } from './platforms/google-meet/index.js'
-import { createPanelController } from './ui/panel.js'
+import { createPanelController, statusText } from './ui/panel.js'
 import { installDebugApi } from './shared/debug.js'
 import { PANEL_ID } from './shared/constants.js'
 import { createAudioContext } from './shared/audio.js'
@@ -20,7 +20,8 @@ if (detectPlatform() === 'google-meet' && !globalThis.__meetingAudioBoosterInsta
     if (state.audioUnavailable) message = 'Audio unavailable · controls are inactive'
     state.status = message
     const status = document.getElementById(`${PANEL_ID}_status`)
-    if (status) status.textContent = message
+    const shown = statusText(state)
+    if (status && status.textContent !== shown) status.textContent = shown
   }
   function renderSoon() {
     if (state.closed) return
@@ -36,6 +37,8 @@ if (detectPlatform() === 'google-meet' && !globalThis.__meetingAudioBoosterInsta
   }
   const panel = createPanelController(state, {
     participants: () => visibleParticipants(state),
+    // In-memory pre-volume levels from the controller; never persisted.
+    levels: key => platformController?.levelFor?.(key) ?? null,
     onGain: applyGain,
     onCollapse: collapsed => { state.settings.collapsed = collapsed; saveSettings(globalThis.localStorage, state.settings) },
     onSave: position => { state.settings.position = position; saveSettings(globalThis.localStorage, state.settings) }

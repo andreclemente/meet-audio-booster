@@ -1,4 +1,4 @@
-import { buttonStyles } from './styles.js'
+import { buttonStyles, levelTrackStyles, levelFillStyles, levelTickStyles } from './styles.js'
 
 export function makeButton(text, action) {
   const element = document.createElement('button')
@@ -34,12 +34,30 @@ export function renderParticipantRow(participant, onGain) {
   Object.assign(slider.style, { width: '100%', margin: '0' })
   slider.oninput = () => { const next = Number(slider.value); onGain(participant, next); value.textContent = `${Math.round(next * 100)}%` }
   const presets = document.createElement('div')
+  const meter = renderLevelMeter()
   Object.assign(presets.style, { display: 'flex', gap: '5px', marginTop: '7px', flexWrap: 'wrap' })
   for (const [text, gain] of [['Mute', 0], ['50%', 0.5], ['100%', 1], ['250%', 2.5]]) {
     const button = makeButton(text, () => { slider.value = String(gain); onGain(participant, gain); value.textContent = `${Math.round(gain * 100)}%` })
     button.setAttribute('aria-label', `${text} for ${participant.name}`)
     presets.append(button)
   }
-  row.append(top, slider, presets)
+  row.append(top, slider, meter, presets)
   return row
+}
+
+// Purely visual level line; updated in place by the panel's live update.
+export function renderLevelMeter() {
+  const track = document.createElement('div')
+  track.dataset.role = 'level-track'
+  track.setAttribute('aria-hidden', 'true')
+  track.title = 'Not heard yet'
+  Object.assign(track.style, levelTrackStyles)
+  const fill = document.createElement('div')
+  fill.dataset.role = 'level-fill'
+  Object.assign(fill.style, levelFillStyles)
+  const tick = document.createElement('div')
+  tick.dataset.role = 'level-tick'
+  Object.assign(tick.style, levelTickStyles)
+  track.append(fill, tick)
+  return track
 }

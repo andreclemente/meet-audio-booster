@@ -5,6 +5,7 @@ import { installLocalPresentationCaptureHook } from './presentation.js'
 import { installAudioWorkletHook, createPooledSlot } from './audio-worklet.js'
 import { createMediaPipelineManager } from './media-elements.js'
 import { createNativeActivitySource } from './native-activity.js'
+import { createParticipantLevelMeter, attributeLevelSample, sumTapPower, sumPipelinePower } from './levels.js'
 import { upsertParticipant, visibleParticipants } from '../../state.js'
 
 export function collectCurrentUiSpeakers(participants, isSpeaking = participant => isGoogleParticipantSpeaking(participant.element)) {
@@ -122,6 +123,7 @@ export function createGoogleMeetController({ state, context, setStatus, renderSo
   const media = createMediaPipelineManager(context)
   const workletSpeakerTracker = createWorkletSpeakerTracker()
   const nativeActivity = createNativeActivitySource()
+  const levelMeter = createParticipantLevelMeter()
   const selfIds = new Set()
   let restoreHook, restoreCaptureHook, observer, mutationTimer, reconcileTimer, mediaTimer, routingTimer, visibilityHandler, slotCounter = 0
   let capturePresentationActive = false
@@ -168,9 +170,9 @@ export function createGoogleMeetController({ state, context, setStatus, renderSo
     } else if (mode === 'media') applyMediaPipelineOutputs(media.pipelines, null, 1, true)
     renderSoon()
   }
-  function registerSlot(gain) {
+  function registerSlot(gain, tap = null) {
     if (state.google.slots.some(slot => slot.gain === gain)) return
-    state.google.slots.push(createPooledSlot(gain, `slot-${++slotCounter}`))
+    state.google.slots.push(createPooledSlot(gain, `slot-${++slotCounter}`, tap))
     setMode('worklet')
     syncPresentationState()
     renderSoon()
@@ -296,6 +298,23 @@ export function createGoogleMeetController({ state, context, setStatus, renderSo
     const active = state.participants.get(routing.appliedParticipantKey)
     setStatus(active ? `${active.name} · automatic routing` : labels[routing.routingState] || `${participants().length} participants ready`)
   }
+  // Measurement only: runs after routing decisions and never feeds back into them.
+  function sampleLevels(now, activity = null) {
+    const g = state.google
+    const attributedKey = activity && attributeLevelSample({
+      available: activity.available, speakers: activity.speakers, routingState: g.routingState,
+      appliedParticipantKey: g.appliedParticipantKey, localPresentationActive: g.localPresentationActive
+    })
+    try {
+      levelMeter.tick({
+        // Keep estimates for everyone known in this call, not only the currently
+        // visible participants: Meet hides tiles (e.g. while presenting), and a
+        // temporarily hidden person must not lose their level.
+        now, participantKeys: [...state.participants.keys()], attributedKey,
+        readPower: () => g.mode === 'media' ? sumPipelinePower(media.pipelines) : g.mode === 'worklet' ? sumTapPower(g.slots) : 0
+      })
+    } catch {}
+  }
   function route() {
     if (state.google.localPresentationActive && state.google.mode === 'media') {
       for (const slot of state.google.slots) slot.release()
@@ -306,6 +325,7 @@ export function createGoogleMeetController({ state, context, setStatus, renderSo
       state.google.transitionGuard.candidateParticipantKey = null
       state.google.transitionGuard.candidateSince = 0
       setStatus('Presenting · own presentation audio bypassed')
+      sampleLevels(Date.now())
       updateLiveUi()
       return
     }
@@ -315,12 +335,14 @@ export function createGoogleMeetController({ state, context, setStatus, renderSo
       neutralize('speaker-data-unavailable', participants().length
         ? 'Speaker data unavailable · using safe 100% volume'
         : 'Waiting for participants')
+      sampleLevels(now, activity)
       updateLiveUi()
       return
     }
     const speakers = activity.speakers
     if (state.google.mode === 'media') routeMedia(now, speakers)
     else routeWorklet(now, speakers)
+    sampleLevels(now, activity)
     updateLiveUi()
   }
   function start() {
@@ -350,6 +372,7 @@ export function createGoogleMeetController({ state, context, setStatus, renderSo
     selfIds.clear()
     workletSpeakerTracker.reset()
     nativeActivity.reset()
+    levelMeter.reset()
   }
   function applyParticipantGain(participant) {
     if (syncPresentationState() && state.google.mode === 'media') return
@@ -358,5 +381,9 @@ export function createGoogleMeetController({ state, context, setStatus, renderSo
     // changes, overlap, presentation and unknown speaker data neutralize it.
     if (state.google.activeParticipantKey === participant.key) setOutputs(participant.value)
   }
-  return { start, stop, route, applyParticipantGain, setOutputs, get pipelines() { return media.pipelines } }
+  return {
+    start, stop, route, applyParticipantGain, setOutputs,
+    levelFor: key => levelMeter.levelFor(key),
+    get pipelines() { return media.pipelines }
+  }
 }
