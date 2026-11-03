@@ -1,15 +1,12 @@
 import { PANEL_ID } from '../shared/constants.js'
-import { panelStyles, headerStyles, buttonStyles } from './styles.js'
+import { panelStyles, headerStyles } from './styles.js'
 import { makeButton, renderParticipantRow } from './participant-row.js'
-import { planBalance, isBalanceEligible, postVolumeDb, dbToScale } from './balance.js'
+import { postVolumeDb, dbToScale } from './balance.js'
+import { createAutoBalance } from './auto-balance.js'
 
-const NOTICE_MS = 4000
-const BALANCE_LABEL = 'Balance volumes of participants already heard'
-const UNDO_LABEL = 'Undo balance'
-
-// A short action notice (e.g. "Balanced 3 voices") briefly takes precedence
-// over the routing status, which is rewritten on every routing tick.
+// Reuse the existing footer: automatic learning/state, otherwise routing status.
 export function statusText(state, now = Date.now()) {
+  if (state.autoBalanceEnabled) return state.autoBalanceReady ? 'Auto Balance on' : 'Learning levels…'
   const notice = state.statusNotice
   return notice && now < notice.until ? notice.message : state.status
 }
@@ -33,58 +30,46 @@ function updateLevelMeter(row, participant, levels) {
 }
 
 export function createPanelController(state, { participants, levels = () => null, onGain, onSave, onCollapse }) {
-  // Volumes before the last Balance, kept only until any other volume change.
-  let balanceUndo = null
+  const auto = createAutoBalance({ participants, levels, onGain })
+  state.autoBalanceEnabled = false
   let balanceButton = null
-  function notify(message) {
-    state.statusNotice = { message, until: Date.now() + NOTICE_MS }
-    const status = document.getElementById(`${PANEL_ID}_status`)
-    if (status) status.textContent = message
-  }
   function updateBalanceButton() {
     const button = balanceButton
     if (!button) return
-    const undo = Boolean(balanceUndo)
-    const eligible = undo ? 2 : participants().filter(participant => isBalanceEligible(participant, levels)).length
-    const text = undo ? 'Undo' : 'Balance'
-    if (button.textContent !== text) button.textContent = text
-    if (button.getAttribute('aria-label') !== (undo ? UNDO_LABEL : BALANCE_LABEL)) button.setAttribute('aria-label', undo ? UNDO_LABEL : BALANCE_LABEL)
-    setStyle(button, 'color', undo ? buttonStyles.color : '#8ab4f8')
-    setStyle(button, 'borderColor', undo ? '#5f6368' : '#8ab4f8')
-    const disabled = eligible < 2
-    if (button.disabled !== disabled) button.disabled = disabled
-    setStyle(button, 'opacity', disabled ? '.5' : '1')
-    setStyle(button, 'cursor', disabled ? 'default' : 'pointer')
+    button.textContent = 'Auto Balance'
+    button.setAttribute('aria-label', 'Auto Balance')
+    button.setAttribute('aria-pressed', String(auto.enabled))
+    setStyle(button, 'color', auto.enabled ? '#202124' : '#8ab4f8')
+    setStyle(button, 'background', auto.enabled ? '#8ab4f8' : '#303134')
+    setStyle(button, 'borderColor', '#8ab4f8')
+    button.disabled = false
   }
-  function clearUndo() {
-    if (!balanceUndo) return
-    balanceUndo = null
+  function stopAuto() {
+    auto.stop()
+    state.autoBalanceEnabled = false
+    state.autoBalanceReady = false
     updateBalanceButton()
+    const status = document.getElementById(`${PANEL_ID}_status`)
+    if (status) status.textContent = statusText(state)
   }
   function manualGain(participant, value) {
-    clearUndo()
+    stopAuto()
     onGain(participant, value)
   }
-  function balanceOrUndo() {
-    if (balanceUndo) {
-      const previous = balanceUndo
-      balanceUndo = null
-      for (const participant of participants()) if (previous.has(participant.key)) onGain(participant, previous.get(participant.key))
-      updateBalanceButton()
-      return
-    }
-    const plan = planBalance(participants(), levels)
-    if (plan.eligible.length < 2) { notify('Not enough voices heard yet'); return }
-    if (plan.changes.every(change => change.to === change.from)) { notify('Volumes already balanced'); return }
-    const previous = new Map(plan.changes.map(change => [change.participant.key, change.from]))
-    for (const change of plan.changes) if (change.to !== change.from) onGain(change.participant, change.to)
-    balanceUndo = previous
-    updateBalanceButton()
-    notify(`Balanced ${plan.eligible.length} voices`)
+  function toggleAuto() {
+    if (auto.enabled) stopAuto()
+    else { auto.start(Date.now()); state.autoBalanceEnabled = true; state.autoBalanceReady = false }
+    updateLiveUi()
+  }
+  function autoTick(now, sampledKey) {
+    auto.tick(now, sampledKey)
+    state.autoBalanceReady = auto.targetDb !== null
   }
   function updateLiveUi() {
     if (!state.panel?.isConnected) return
     updateBalanceButton()
+    const status = document.getElementById(`${PANEL_ID}_status`)
+    if (status) status.textContent = statusText(state)
     for (const participant of participants()) {
       const row = [...state.panel.querySelectorAll('[data-participant-key]')].find(item => item.dataset.participantKey === participant.key)
       if (!row) continue
@@ -171,9 +156,11 @@ export function createPanelController(state, { participants, levels = () => null
     const status = document.createElement('div')
     status.id = `${PANEL_ID}_status`; status.textContent = statusText(state)
     Object.assign(status.style, { minHeight: '14px', marginTop: '0', color: '#bdc1c6', fontSize: '11px', lineHeight: '14px', flex: '1 1 auto', minWidth: '0', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' })
-    const reset = makeButton('Reset all', () => { balanceUndo = null; for (const participant of listItems) onGain(participant, 1); render() })
+    const reset = makeButton('Reset', () => { stopAuto(); for (const participant of participants()) onGain(participant, 1); render() })
+    reset.setAttribute('aria-label', 'Reset all participant volumes to 100%')
     reset.style.flex = '0 0 auto'
-    balanceButton = makeButton('Balance', balanceOrUndo)
+    balanceButton = makeButton('Auto Balance', toggleAuto)
+    balanceButton.onmouseenter = balanceButton.onmouseleave = updateBalanceButton
     balanceButton.style.flex = '0 0 auto'
     footer.append(status, balanceButton, reset)
     const support = document.createElement('a')
@@ -198,7 +185,7 @@ export function createPanelController(state, { participants, levels = () => null
   function show() { state.closed = false; render(); if (state.panel) state.panel.style.display = 'block' }
   function hide() { state.closed = true; if (state.panel) state.panel.style.display = 'none' }
   function toggle() { state.closed ? show() : hide() }
-  return { render, show, hide, toggle, updateLiveUi }
+  return { render, show, hide, toggle, updateLiveUi, autoTick, stopAuto, invalidateAuto: now => auto.invalidate(now) }
 }
 
 function recoverPosition(panel) {

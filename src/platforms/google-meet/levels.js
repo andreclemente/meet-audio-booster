@@ -88,6 +88,10 @@ export function createParticipantLevelMeter({
   settleMs = LEVEL_SETTLE_MS, window = LEVEL_WINDOW_FRAMES
 } = {}) {
   const estimators = new Map()
+  // Auto Balance never consumes the long-lived visual median. Use only the
+  // last 1.5 s of attributable speech, requiring ten fresh accepted samples.
+  const recent = new Map()
+  let clock = 0
   let lastSampleAt = -Infinity
   let settleKey = null
   let settleSince = 0
@@ -97,12 +101,15 @@ export function createParticipantLevelMeter({
     if (!estimators.size) return
     const present = participantKeys instanceof Set ? participantKeys : new Set(participantKeys || [])
     for (const key of estimators.keys()) if (!present.has(key)) estimators.delete(key)
+    for (const key of recent.keys()) if (!present.has(key)) recent.delete(key)
     if (live && !present.has(live.key)) live = null
   }
 
   // Called on every routing tick; reads audio at most once per sampleMs and
   // only when a settled sole speaker is attributable.
   function tick({ now, participantKeys, attributedKey = null, readPower }) {
+    if (now < clock) reset()
+    clock = now
     prune(participantKeys)
     if (attributedKey !== settleKey) { settleKey = attributedKey; settleSince = now }
     if (!attributedKey || live?.key !== attributedKey) live = null
@@ -116,20 +123,32 @@ export function createParticipantLevelMeter({
     let estimator = estimators.get(attributedKey)
     if (!estimator) estimators.set(attributedKey, estimator = createTypicalLevelEstimator({ warmupFrames, window }))
     estimator.add(live.db)
+    let frames = recent.get(attributedKey) || []
+    // A gap invalidates the entire short estimate, not just its timestamp.
+    if (frames.length && now - frames.at(-1).at > 1000) frames = []
+    frames = frames.filter(frame => now - frame.at <= 1500)
+    frames.push({ at: now, db: live.db })
+    recent.set(attributedKey, frames)
     return true
   }
 
   function levelFor(key) {
     const estimator = estimators.get(key)
+    const frames = (recent.get(key) || []).filter(frame => clock - frame.at <= 1500)
+    const sorted = frames.map(frame => frame.db).sort((a, b) => a - b)
+    const middle = sorted.length >> 1
+    const autoDb = sorted.length < 10 ? null : sorted.length % 2 ? sorted[middle] : (sorted[middle - 1] + sorted[middle]) / 2
     return {
       liveDb: live?.key === key ? live.db : null,
       typicalDb: estimator ? estimator.typicalDb : null,
-      frames: estimator ? estimator.frames : 0
+      frames: estimator ? estimator.frames : 0,
+      autoDb, autoFrames: frames.length, autoSince: frames[0]?.at ?? null, sampledAt: frames.at(-1)?.at ?? null
     }
   }
 
   function reset() {
     estimators.clear()
+    recent.clear()
     live = null
     settleKey = null
     settleSince = 0

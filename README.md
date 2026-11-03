@@ -8,7 +8,7 @@ Per-participant playback volume controls for Google Meet. Preferences stay in br
 
 1. Install the extension in a supported Chromium browser, then reload any already-open Google Meet tab.
 2. Join a Google Meet call and use each participant's slider or preset to adjust what **you** hear. Start at 100% and raise volume gradually.
-3. Use the toolbar button to reopen a hidden panel; use Reset all to return the listed participants to 100%.
+3. Use the toolbar button to reopen a hidden panel; use Reset to return the listed participants to 100%.
 
 ![Meet Audio Booster participant volume controls, level estimates and Balance](docs/assets/production-panel.png)
 
@@ -17,7 +17,7 @@ Per-participant playback volume controls for Google Meet. Preferences stay in br
 - No panel: confirm the tab is on `meet.google.com`, reload after installing, and click the extension toolbar button.
 - No participants: join the call and wait for remote participants. The extension cannot adjust your microphone or other people's playback.
 - A setting seems inactive: speaker handoffs, overlapping speech or uncertain speaker/stream association can return playback to 100%. The same routing policy applies whether the meeting tab is visible or in the background. Browser restrictions or meeting changes can also prevent audio interception; see the limitations below.
-- Balance is unavailable: wait until at least two unmuted participants have spoken alone long enough for typical level estimates. Estimates may be unavailable; Balance does not continuously adjust volume.
+- Auto Balance is learning: it needs fresh, confidently attributed speech from at least two unmuted participants to establish its target. Adjustments happen gradually during usable speech; silence, overlap and uncertain attribution pause them.
 - Preferences: clear Google Meet site data to remove local settings; uninstalling alone may leave them behind.
 
 [Get help or report an issue](https://github.com/andreclemente/meet-audio-booster/issues) · [Open a new issue](https://github.com/andreclemente/meet-audio-booster/issues/new). Include browser/extension versions and reproduction steps, not private meeting details or participant names.
@@ -26,16 +26,18 @@ Optional: [Buy Me a Coffee](https://buymeacoffee.com/andreclemente) to support d
 
 ## Features
 
-- Per-participant 0–600% controls, Mute, 50%, 100% and 250% presets, and Reset all
+- Per-participant 0–600% controls, Mute, 50%, 100% and 250% presets, and Reset
 - Draggable panel; collapse or expand with the button beside × or by double-clicking the title. Reopen a hidden panel with the extension toolbar button.
 - Volume preferences, panel position and the collapsed/expanded preference saved locally and restored after reload
-- Speaking-level estimates and a one-time Balance action, described below
+- Speaking-level estimates and optional continuous Auto Balance, described below
 
-### Level estimates and Balance
+### Level estimates and Auto Balance
 
 The thin line beneath each slider estimates the speaking level after your volume setting; a marker shows the typical level once enough speech has been heard. Estimates are collected only while a single speaker can be confidently associated with the audio. They are session-only, kept in memory rather than saved or transmitted, and may be unavailable.
 
-Once at least two unmuted participants have usable typical estimates, **Balance** makes a one-time volume adjustment toward the median of their estimated typical levels after your current volume settings. Muted participants and those without estimates are left unchanged. Results are approximate and limited by the available volume range. **Undo** restores the pre-Balance volumes until another volume change, including Reset all, clears that option. This is not continuous automatic leveling.
+Turn on **Auto Balance** to gradually bring speaking levels closer together. It first learns a fixed target from fresh estimates for at least two unmuted participants, then adjusts each person only while their speech can be confidently measured. Silence, overlap and uncertain attribution do not drive adjustments. Muted participants remain muted. Results are approximate and limited by the available volume range; this does not isolate simultaneous voices.
+
+Moving any slider, using a preset or pressing **Reset** immediately stops Auto Balance before applying your manual change. Switching it off keeps the current volumes; there is no Undo or rollback. Reset returns listed participants to 100%. Auto Balance starts off each session, and automatic volume changes are not saved; your saved manual settings remain authoritative after reload or rejoin.
 
 ## Supported sites
 

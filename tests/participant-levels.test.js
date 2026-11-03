@@ -6,6 +6,7 @@ import {
 } from '../src/platforms/google-meet/levels.js'
 import { installAudioWorkletHook, createPooledSlot } from '../src/platforms/google-meet/audio-worklet.js'
 import { createGoogleMeetController } from '../src/platforms/google-meet/index.js'
+import { createAutoBalance } from '../src/ui/auto-balance.js'
 
 const dbToPower = db => 10 ** (db / 10)
 
@@ -254,7 +255,7 @@ function nativeRoot(participantId) {
   return { root, level }
 }
 
-function controllerFixture() {
+function controllerFixture(callbacks = {}) {
   const a = nativeRoot('device-a'), b = nativeRoot('device-b')
   const doc = { hidden: false, querySelectorAll: selector => selector === '[data-participant-id]' ? [a.root, b.root] : [] }
   const person = (key, id, root, value) => ({ key, participantId: id, element: root, name: key, platform: 'google-meet', present: true, speaking: false, lastSpeakingAt: 0, value, muted: false })
@@ -274,7 +275,7 @@ function controllerFixture() {
       routing: {}, rosterSignature: '', localPresentationActive: false
     }
   }
-  const controller = createGoogleMeetController({ state, context: {}, setStatus() {}, renderSoon() {}, updateLiveUi() {} })
+  const controller = createGoogleMeetController({ state, context: {}, setStatus() {}, renderSoon() {}, updateLiveUi() {}, ...callbacks })
   return { a, b, doc, state, slot, writes, controller, power, reads: () => reads }
 }
 
@@ -330,4 +331,37 @@ test('controller does not attribute during local presentation', () => {
   })
   assert.equal(f.reads(), 0)
   assert.equal(f.controller.levelFor('A').frames, 0)
+})
+
+test('actual routing samples drive auto; overlap, unknown, graph mutation and teardown cannot reuse evidence', () => {
+  let auto, f, resets=0, stops=0
+  const automaticWrites=[]
+  f=controllerFixture({
+    onLevelSample:(now,key)=>auto.tick(now,key),
+    onLevelReset:now=>{resets++;auto.invalidate(now)},
+    onStop:()=>{stops++;auto.stop()}
+  })
+  auto=createAutoBalance({participants:()=>[...f.state.participants.values()],levels:k=>f.controller.levelFor(k),onGain:(p,v)=>{automaticWrites.push([p.key,v]);p.value=v;f.controller.applyParticipantGain(p)}})
+  withClock(f.doc,setNow=>{
+    auto.start(0)
+    const run=(from,to)=>{for(let t=from;t<to;t+=30){setNow(t);f.controller.route()}}
+    f.a.level.value=0.6;f.power.value=dbToPower(-40);run(0,3000)
+    f.a.level.value=0;f.b.level.value=0.6;f.power.value=dbToPower(-20);run(3000,6000)
+    assert.ok(automaticWrites.some(([k])=>k==='B'))
+    const before=automaticWrites.length
+    f.a.level.value=0.6;run(6000,8000)
+    assert.equal(automaticWrites.length,before,'overlap')
+    f.a.root.__jsmodel.A0Tiaf.pending.value.wy.disposed=true
+    f.b.level.value=0;run(8000,10000)
+    assert.equal(automaticWrites.length,before,'unavailable')
+    const resetsBefore=resets
+    f.slot.tap={readMeanSquare:()=>dbToPower(-10)}
+    run(10000,10100)
+    assert.equal(resets,resetsBefore+1)
+    assert.equal(f.controller.levelFor('B').autoDb,null)
+    f.controller.stop();run(11000,12000)
+    assert.equal(stops,1)
+    assert.equal(auto.enabled,false)
+    assert.equal(automaticWrites.length,before)
+  })
 })

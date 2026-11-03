@@ -643,6 +643,8 @@
     window = LEVEL_WINDOW_FRAMES
   } = {}) {
     const estimators = /* @__PURE__ */ new Map();
+    const recent = /* @__PURE__ */ new Map();
+    let clock = 0;
     let lastSampleAt = -Infinity;
     let settleKey = null;
     let settleSince = 0;
@@ -651,9 +653,12 @@
       if (!estimators.size) return;
       const present = participantKeys instanceof Set ? participantKeys : new Set(participantKeys || []);
       for (const key of estimators.keys()) if (!present.has(key)) estimators.delete(key);
+      for (const key of recent.keys()) if (!present.has(key)) recent.delete(key);
       if (live && !present.has(live.key)) live = null;
     }
     function tick({ now, participantKeys, attributedKey = null, readPower }) {
+      if (now < clock) reset();
+      clock = now;
       prune(participantKeys);
       if (attributedKey !== settleKey) {
         settleKey = attributedKey;
@@ -670,18 +675,32 @@
       let estimator = estimators.get(attributedKey);
       if (!estimator) estimators.set(attributedKey, estimator = createTypicalLevelEstimator({ warmupFrames, window }));
       estimator.add(live.db);
+      let frames = recent.get(attributedKey) || [];
+      if (frames.length && now - frames.at(-1).at > 1e3) frames = [];
+      frames = frames.filter((frame) => now - frame.at <= 1500);
+      frames.push({ at: now, db: live.db });
+      recent.set(attributedKey, frames);
       return true;
     }
     function levelFor(key) {
       const estimator = estimators.get(key);
+      const frames = (recent.get(key) || []).filter((frame) => clock - frame.at <= 1500);
+      const sorted = frames.map((frame) => frame.db).sort((a, b) => a - b);
+      const middle = sorted.length >> 1;
+      const autoDb = sorted.length < 10 ? null : sorted.length % 2 ? sorted[middle] : (sorted[middle - 1] + sorted[middle]) / 2;
       return {
         liveDb: live?.key === key ? live.db : null,
         typicalDb: estimator ? estimator.typicalDb : null,
-        frames: estimator ? estimator.frames : 0
+        frames: estimator ? estimator.frames : 0,
+        autoDb,
+        autoFrames: frames.length,
+        autoSince: frames[0]?.at ?? null,
+        sampledAt: frames.at(-1)?.at ?? null
       };
     }
     function reset() {
       estimators.clear();
+      recent.clear();
       live = null;
       settleKey = null;
       settleSince = 0;
@@ -2068,13 +2087,17 @@
   function resolveLocalPresentationActive({ captureActive, domActive, captureLifecycleSeen }) {
     return captureLifecycleSeen ? captureActive : captureActive || domActive;
   }
-  function createGoogleMeetController({ state, context, setStatus, renderSoon, updateLiveUi, mediaOwnership = installRemoteMediaOwnership() }) {
+  function createGoogleMeetController({ state, context, setStatus, renderSoon, updateLiveUi, onLevelSample = () => {
+  }, onLevelReset = () => {
+  }, onStop = () => {
+  }, mediaOwnership = installRemoteMediaOwnership() }) {
     const learner = createAssociationLearner();
     const alignmentTracker = createFreshAlignmentTracker();
     const media = createMediaPipelineManager(context, { accepts: (stream) => mediaOwnership.accepts(stream) });
     const workletSpeakerTracker = createWorkletSpeakerTracker();
     const nativeActivity = createNativeActivitySource();
     const levelMeter = createParticipantLevelMeter();
+    let measurementGraph = [], stopped = false;
     const selfIds = /* @__PURE__ */ new Set(), presentationIds = /* @__PURE__ */ new Set();
     let restoreHook, restoreCaptureHook, observer, mutationTimer, reconcileTimer, mediaTimer, routingTimer, visibilityHandler, slotCounter = 0;
     let capturePresentationActive = false;
@@ -2256,6 +2279,12 @@
     }
     function sampleLevels(now, activity = null) {
       const g = state.google;
+      const graph = [g.mode, ...g.mode === "media" ? media.pipelines.flatMap((pipeline) => [pipeline, pipeline.stream, ...pipeline.tracks || []]) : g.slots.flatMap((slot) => [slot, slot.tap])];
+      if (graph.length !== measurementGraph.length || graph.some((value, index) => value !== measurementGraph[index])) {
+        measurementGraph = graph;
+        levelMeter.reset();
+        onLevelReset(now);
+      }
       const attributedKey = activity && attributeLevelSample({
         available: activity.available,
         speakers: activity.speakers,
@@ -2266,19 +2295,19 @@
         localPresentationActive: g.localPresentationActive && g.mode !== "media"
       });
       try {
-        levelMeter.tick({
-          // Keep estimates for everyone known in this call, not only the currently
-          // visible participants: Meet hides tiles (e.g. while presenting), and a
-          // temporarily hidden person must not lose their level.
+        const accepted = levelMeter.tick({
+          // A hidden tile is not a departure; keep known membership evidence.
           now,
-          participantKeys: [...state.participants.keys()],
+          participantKeys: knownParticipants().map((person) => person.key),
           attributedKey,
           readPower: () => g.mode === "media" ? sumPipelinePower(media.pipelines) : g.mode === "worklet" ? sumTapPower(g.slots) : 0
         });
+        onLevelSample(now, accepted ? attributedKey : null);
       } catch {
       }
     }
     function route() {
+      if (stopped) return;
       refreshMediaOwnership();
       const now = Date.now();
       const activity = currentSpeakers(now);
@@ -2298,6 +2327,7 @@
       updateLiveUi();
     }
     function start() {
+      stopped = false;
       restoreCaptureHook = installLocalPresentationCaptureHook(setCapturePresentationActive);
       restoreHook = installAudioWorkletHook(registerSlot, unregisterSlot);
       reconcile();
@@ -2314,6 +2344,8 @@
       document.addEventListener("visibilitychange", visibilityHandler);
     }
     function stop() {
+      stopped = true;
+      onStop();
       observer?.disconnect();
       clearTimeout(mutationTimer);
       clearInterval(reconcileTimer);
@@ -2486,9 +2518,6 @@
 
   // src/ui/balance.js
   var LEVEL_SCALE_MIN_DB = -60;
-  var VOLUME_MIN = 0.05;
-  var VOLUME_MAX = 6;
-  var VOLUME_STEP = 0.05;
   function dbToScale(db) {
     if (typeof db !== "number" || Number.isNaN(db)) return 0;
     return Math.min(1, Math.max(0, (db - LEVEL_SCALE_MIN_DB) / -LEVEL_SCALE_MIN_DB));
@@ -2497,40 +2526,62 @@
     if (!Number.isFinite(preDb) || !Number.isFinite(volume) || volume <= 0) return null;
     return preDb + 20 * Math.log10(volume);
   }
-  function roundVolume(value) {
-    const stepped = Math.round(value / VOLUME_STEP) * VOLUME_STEP;
-    return Number(Math.min(VOLUME_MAX, Math.max(VOLUME_MIN, stepped)).toFixed(2));
-  }
-  function typicalOf(participant, levels) {
-    const typical = levels?.(participant.key)?.typicalDb;
-    return Number.isFinite(typical) ? typical : null;
-  }
-  function isBalanceEligible(participant, levels) {
-    return Number.isFinite(participant?.value) && participant.value > 0 && typicalOf(participant, levels) !== null;
-  }
-  function median(values) {
-    const sorted = [...values].sort((a, b) => a - b);
-    const middle = sorted.length >> 1;
-    return sorted.length % 2 ? sorted[middle] : (sorted[middle - 1] + sorted[middle]) / 2;
-  }
-  function planBalance(participants, levels) {
-    const eligible = participants.filter((participant) => isBalanceEligible(participant, levels));
-    if (eligible.length < 2) return { eligible, target: null, changes: [] };
-    const post = eligible.map((participant) => postVolumeDb(typicalOf(participant, levels), participant.value));
-    const target = median(post);
-    const changes = eligible.map((participant, index) => ({
-      participant,
-      from: participant.value,
-      to: roundVolume(participant.value * 10 ** ((target - post[index]) / 20))
-    }));
-    return { eligible, target, changes };
+
+  // src/ui/auto-balance.js
+  function createAutoBalance({ participants, levels, onGain }) {
+    let enabled = false, startedAt = 0, targetDb = null;
+    const heard = /* @__PURE__ */ new Map(), consumed = /* @__PURE__ */ new Map();
+    function stop() {
+      enabled = false;
+      targetDb = null;
+      heard.clear();
+      consumed.clear();
+    }
+    function invalidate(now) {
+      startedAt = now;
+      heard.clear();
+      consumed.clear();
+    }
+    function start(now) {
+      stop();
+      enabled = true;
+      invalidate(now);
+    }
+    function tick(now, sampledKey) {
+      if (!enabled) return;
+      const people = participants();
+      const present = new Map(people.map((person2) => [person2.key, person2]));
+      for (const key of consumed.keys()) if (!present.has(key)) consumed.delete(key);
+      for (const [key, record] of heard) {
+        if (present.get(key) !== record.person || now - record.at > 15e3 || record.person.value <= 0) heard.delete(key);
+      }
+      const person = present.get(sampledKey);
+      const level = person && levels(person.key);
+      if (!person || !(person.value > 0 && person.value <= 6) || !Number.isFinite(level?.autoDb) || level.autoFrames < 10 || !Number.isFinite(level.autoSince) || level.autoSince < startedAt || level.sampledAt !== now || now - startedAt < 1e3 || consumed.get(person.key) === now) return;
+      consumed.set(person.key, now);
+      heard.set(person.key, { person, at: now, db: level.autoDb });
+      if (targetDb === null) {
+        if (heard.size < 2) return;
+        const post = [...heard.values()].map((record) => record.db + 20 * Math.log10(record.person.value)).sort((a, b) => a - b);
+        const middle = post.length >> 1;
+        targetDb = post.length % 2 ? post[middle] : (post[middle - 1] + post[middle]) / 2;
+      }
+      const error = targetDb - (level.autoDb + 20 * Math.log10(person.value));
+      if (Math.abs(error) <= 1.5) return;
+      const step = Math.max(-0.1, Math.min(0.1, error));
+      const value = Math.max(0.05, Math.min(6, person.value * 10 ** (step / 20)));
+      if (value !== person.value) onGain(person, value, { automatic: true });
+    }
+    return { start, stop, tick, invalidate, get enabled() {
+      return enabled;
+    }, get targetDb() {
+      return targetDb;
+    } };
   }
 
   // src/ui/panel.js
-  var NOTICE_MS = 4e3;
-  var BALANCE_LABEL = "Balance volumes of participants already heard";
-  var UNDO_LABEL = "Undo balance";
   function statusText(state, now = Date.now()) {
+    if (state.autoBalanceEnabled) return state.autoBalanceReady ? "Auto Balance on" : "Learning levels…";
     const notice = state.statusNotice;
     return notice && now < notice.until ? notice.message : state.status;
   }
@@ -2551,63 +2602,50 @@
     if (track.title !== title) track.title = title;
   }
   function createPanelController(state, { participants, levels = () => null, onGain, onSave, onCollapse }) {
-    let balanceUndo = null;
+    const auto = createAutoBalance({ participants, levels, onGain });
+    state.autoBalanceEnabled = false;
     let balanceButton = null;
-    function notify(message) {
-      state.statusNotice = { message, until: Date.now() + NOTICE_MS };
-      const status = document.getElementById(`${PANEL_ID}_status`);
-      if (status) status.textContent = message;
-    }
     function updateBalanceButton() {
       const button = balanceButton;
       if (!button) return;
-      const undo = Boolean(balanceUndo);
-      const eligible = undo ? 2 : participants().filter((participant) => isBalanceEligible(participant, levels)).length;
-      const text = undo ? "Undo" : "Balance";
-      if (button.textContent !== text) button.textContent = text;
-      if (button.getAttribute("aria-label") !== (undo ? UNDO_LABEL : BALANCE_LABEL)) button.setAttribute("aria-label", undo ? UNDO_LABEL : BALANCE_LABEL);
-      setStyle(button, "color", undo ? buttonStyles.color : "#8ab4f8");
-      setStyle(button, "borderColor", undo ? "#5f6368" : "#8ab4f8");
-      const disabled = eligible < 2;
-      if (button.disabled !== disabled) button.disabled = disabled;
-      setStyle(button, "opacity", disabled ? ".5" : "1");
-      setStyle(button, "cursor", disabled ? "default" : "pointer");
+      button.textContent = "Auto Balance";
+      button.setAttribute("aria-label", "Auto Balance");
+      button.setAttribute("aria-pressed", String(auto.enabled));
+      setStyle(button, "color", auto.enabled ? "#202124" : "#8ab4f8");
+      setStyle(button, "background", auto.enabled ? "#8ab4f8" : "#303134");
+      setStyle(button, "borderColor", "#8ab4f8");
+      button.disabled = false;
     }
-    function clearUndo() {
-      if (!balanceUndo) return;
-      balanceUndo = null;
+    function stopAuto() {
+      auto.stop();
+      state.autoBalanceEnabled = false;
+      state.autoBalanceReady = false;
       updateBalanceButton();
+      const status = document.getElementById(`${PANEL_ID}_status`);
+      if (status) status.textContent = statusText(state);
     }
     function manualGain(participant, value) {
-      clearUndo();
+      stopAuto();
       onGain(participant, value);
     }
-    function balanceOrUndo() {
-      if (balanceUndo) {
-        const previous2 = balanceUndo;
-        balanceUndo = null;
-        for (const participant of participants()) if (previous2.has(participant.key)) onGain(participant, previous2.get(participant.key));
-        updateBalanceButton();
-        return;
+    function toggleAuto() {
+      if (auto.enabled) stopAuto();
+      else {
+        auto.start(Date.now());
+        state.autoBalanceEnabled = true;
+        state.autoBalanceReady = false;
       }
-      const plan = planBalance(participants(), levels);
-      if (plan.eligible.length < 2) {
-        notify("Not enough voices heard yet");
-        return;
-      }
-      if (plan.changes.every((change) => change.to === change.from)) {
-        notify("Volumes already balanced");
-        return;
-      }
-      const previous = new Map(plan.changes.map((change) => [change.participant.key, change.from]));
-      for (const change of plan.changes) if (change.to !== change.from) onGain(change.participant, change.to);
-      balanceUndo = previous;
-      updateBalanceButton();
-      notify(`Balanced ${plan.eligible.length} voices`);
+      updateLiveUi();
+    }
+    function autoTick(now, sampledKey) {
+      auto.tick(now, sampledKey);
+      state.autoBalanceReady = auto.targetDb !== null;
     }
     function updateLiveUi() {
       if (!state.panel?.isConnected) return;
       updateBalanceButton();
+      const status = document.getElementById(`${PANEL_ID}_status`);
+      if (status) status.textContent = statusText(state);
       for (const participant of participants()) {
         const row = [...state.panel.querySelectorAll("[data-participant-key]")].find((item) => item.dataset.participantKey === participant.key);
         if (!row) continue;
@@ -2704,13 +2742,15 @@
       status.id = `${PANEL_ID}_status`;
       status.textContent = statusText(state);
       Object.assign(status.style, { minHeight: "14px", marginTop: "0", color: "#bdc1c6", fontSize: "11px", lineHeight: "14px", flex: "1 1 auto", minWidth: "0", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" });
-      const reset = makeButton("Reset all", () => {
-        balanceUndo = null;
-        for (const participant of listItems) onGain(participant, 1);
+      const reset = makeButton("Reset", () => {
+        stopAuto();
+        for (const participant of participants()) onGain(participant, 1);
         render();
       });
+      reset.setAttribute("aria-label", "Reset all participant volumes to 100%");
       reset.style.flex = "0 0 auto";
-      balanceButton = makeButton("Balance", balanceOrUndo);
+      balanceButton = makeButton("Auto Balance", toggleAuto);
+      balanceButton.onmouseenter = balanceButton.onmouseleave = updateBalanceButton;
       balanceButton.style.flex = "0 0 auto";
       footer.append(status, balanceButton, reset);
       const support = document.createElement("a");
@@ -2744,7 +2784,7 @@
     function toggle() {
       state.closed ? show() : hide();
     }
-    return { render, show, hide, toggle, updateLiveUi };
+    return { render, show, hide, toggle, updateLiveUi, autoTick, stopAuto, invalidateAuto: (now) => auto.invalidate(now) };
   }
   function recoverPosition(panel) {
     const rect = panel.getBoundingClientRect();
@@ -2868,10 +2908,13 @@
       if (state.closed) return;
       clearTimeout(state.renderTimer);
       state.renderTimer = setTimeout(() => panel.render(), 120);
-    }, applyGain = function(participant, value) {
-      participant.value = Number.isFinite(value) ? Math.max(0, value) : 1;
-      setParticipantGain(state.settings, participant, participant.value);
-      saveSettings(globalThis.localStorage, state.settings);
+    }, applyGain = function(participant, value, { automatic = false } = {}) {
+      if (!automatic) panel.stopAuto();
+      participant.value = Number.isFinite(value) ? Math.min(6, Math.max(0, value)) : 1;
+      if (!automatic) {
+        setParticipantGain(state.settings, participant, participant.value);
+        saveSettings(globalThis.localStorage, state.settings);
+      }
       platformController?.applyParticipantGain(participant, participant.value);
       panel.updateLiveUi();
     }, boot = function() {
@@ -2882,7 +2925,7 @@
       state.platform = detectPlatform();
       const context = getContext();
       state.audioUnavailable = !context;
-      const common = { state, context, setStatus, renderSoon, updateLiveUi: panel.updateLiveUi, mediaOwnership };
+      const common = { state, context, setStatus, renderSoon, updateLiveUi: panel.updateLiveUi, onLevelSample: panel.autoTick, onLevelReset: panel.invalidateAuto, onStop: panel.stopAuto, mediaOwnership };
       platformController = createGoogleMeetController(common);
       platformController.start();
       if (!context) setStatus("Audio unavailable · controls are inactive");

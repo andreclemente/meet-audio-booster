@@ -134,7 +134,7 @@ test('panel starts expanded with collapse immediately left of close and one comp
   assert.match(header.children[0].children[1].textContent, /1 participant/)
   assert.equal(body.children.length, 3)
   assert.equal(body.children[0].querySelectorAll('[data-participant-key]').length, 1)
-  assert.equal(parts().reset.textContent, 'Reset all')
+  assert.equal(parts().reset.textContent, 'Reset')
   assert.equal(body.children[1].children[0].textContent, state.status)
   assert.equal(body.children[2].textContent, 'Support development')
   assertExpanded(parts(), true)
@@ -229,8 +229,8 @@ test('approved support layout keeps exact dynamic status left of Reset all and s
   assert.equal(list.querySelectorAll('[data-participant-key]').length, 1)
   const [balance, reset] = footer.querySelectorAll('button')
   assert.deepEqual(footer.children, [status, balance, reset])
-  assert.equal(balance.textContent, 'Balance')
-  assert.equal(reset.textContent, 'Reset all')
+  assert.equal(balance.textContent, 'Auto Balance')
+  assert.equal(reset.textContent, 'Reset')
   assert.equal(footer.style.justifyContent, 'space-between')
   assert.equal(status.textContent, state.status)
   assert.equal(status.style.marginTop, '0')
@@ -472,101 +472,57 @@ test('live updates move fill/tick after volume without re-rendering rows', t => 
   assert.deepEqual(f.gains, [])
 })
 
-test('Balance sits before Reset all with blue accent and is disabled until two voices are heard', t => {
+test('Auto Balance defaults off and is available before voices are heard', t => {
   const f = fixture(t)
   const { balance, reset } = f.parts()
   assert.equal(balance.parentElement, reset.parentElement)
-  assert.equal(balance.textContent, 'Balance')
-  assert.equal(balance.getAttribute('aria-label'), 'Balance volumes of participants already heard')
+  assert.equal(balance.textContent, 'Auto Balance')
+  assert.equal(balance.getAttribute('aria-pressed'), 'false')
   assert.equal(balance.style.color, '#8ab4f8')
-  assert.equal(balance.style.borderColor, '#8ab4f8')
-  assert.equal(balance.disabled, true)
-  withBob(f)
-  f.levelData.set('alice', { typicalDb: -30 })
-  f.controller.updateLiveUi()
-  assert.equal(f.parts().balance.disabled, true)
-  f.levelData.set('bob', { typicalDb: -30 })
-  f.controller.updateLiveUi()
-  assert.equal(f.parts().balance.disabled, false)
-  // Muted participant does not count.
-  f.people[1].value = 0
-  f.controller.updateLiveUi()
-  assert.equal(f.parts().balance.disabled, true)
-})
-
-test('Balance with fewer than two eligible voices is a no-op with a status notice', t => {
-  const f = fixture(t)
-  f.levelData.set('alice', { typicalDb: -30 })
-  f.parts().balance.onclick()
+  assert.equal(balance.style.background, '#303134')
+  assert.equal(balance.disabled, false)
+  balance.click()
+  assert.equal(balance.getAttribute('aria-pressed'), 'true')
+  assert.equal(balance.style.background, '#8ab4f8')
+  assert.equal(statusText(f.state), 'Learning levels…')
   assert.deepEqual(f.gains, [])
-  assert.equal(f.document.getElementById(`${PANEL_ID}_status`).textContent, 'Not enough voices heard yet')
-  assert.equal(f.parts().balance.textContent, 'Balance')
-})
-
-test('Balance when volumes already line up changes nothing and offers no Undo', t => {
-  const f = fixture(t)
-  withBob(f, 1)
-  f.controller.render()
-  // Alice post = -40 + 7.96 = -32.04, Bob post = -32.04
-  f.levelData.set('alice', { typicalDb: -40 })
-  f.levelData.set('bob', { typicalDb: -32.04 })
-  f.controller.updateLiveUi()
-  f.parts().balance.click()
+  balance.click()
+  assert.equal(balance.getAttribute('aria-pressed'), 'false')
   assert.deepEqual(f.gains, [])
-  assert.equal(f.document.getElementById(`${PANEL_ID}_status`).textContent, 'Volumes already balanced')
-  assert.equal(f.parts().balance.textContent, 'Balance')
 })
 
-test('Balance applies median-aligned volumes through onGain, then Undo restores them', t => {
-  const f = fixture(t)
-  withBob(f, 1)
-  f.people.push({ key: 'cara', name: 'Cara', platform: 'google-meet', value: 0 })
-  f.people.push({ key: 'dan', name: 'Dan', platform: 'google-meet', value: 1 })
-  f.controller.render()
-  // Alice post = -40 + 7.96 = -32.04, Bob post = -20 => median -26.02
-  f.levelData.set('alice', { typicalDb: -40 })
-  f.levelData.set('bob', { typicalDb: -20 })
-  f.levelData.set('cara', { typicalDb: -10 })
-  f.controller.updateLiveUi()
-  f.parts().balance.click()
-  assert.deepEqual(f.gains.map(([key]) => key).sort(), ['alice', 'bob'])
-  assert.equal(f.alice.value, 5)
-  assert.equal(f.people[1].value, 0.5)
-  assert.equal(f.people[2].value, 0)
-  assert.equal(f.people[3].value, 1)
-  assert.equal(f.document.getElementById(`${PANEL_ID}_status`).textContent, 'Balanced 2 voices')
-  const undo = f.parts().balance
-  assert.equal(undo.textContent, 'Undo')
-  assert.equal(undo.getAttribute('aria-label'), 'Undo balance')
-  assert.equal(undo.style.color, '#fff')
-  assert.equal(undo.style.borderColor, '#5f6368')
-  assert.equal(undo.disabled, false)
-  // Undo survives live updates and a roster render.
-  f.controller.updateLiveUi(); f.controller.render()
-  assert.equal(f.parts().balance.textContent, 'Undo')
-  f.gains.length = 0
-  f.parts().balance.click()
-  assert.deepEqual(f.gains.sort(), [['alice', 2.5], ['bob', 1]])
-  assert.equal(f.parts().balance.textContent, 'Balance')
-  assert.equal(f.parts().balance.getAttribute('aria-label'), 'Balance volumes of participants already heard')
-})
-
-test('Undo disappears after any manual volume change or Reset all', t => {
-  for (const action of ['slider', 'preset', 'reset']) {
+test('every slider, preset and Reset synchronously stops auto before applying manual gains', t => {
+  for (const action of ['slider', 'preset0', 'preset1', 'preset2', 'preset3', 'reset']) {
     const f = fixture(t)
     withBob(f, 1)
-    f.levelData.set('alice', { typicalDb: -40 })
-    f.levelData.set('bob', { typicalDb: -20 })
-    f.controller.updateLiveUi()
     f.parts().balance.click()
-    assert.equal(f.parts().balance.textContent, 'Undo')
     const row = rowOf(f.state, 'bob')
+    // Observe the pressed state at the gain boundary, not just afterwards.
+    Object.defineProperty(f.people[1], 'value', { configurable: true, get: () => 1, set: () => {
+      assert.equal(f.parts().balance.getAttribute('aria-pressed'), 'false', action)
+    } })
     if (action === 'slider') { const slider = row.querySelector('[data-role="slider"]'); slider.value = '1.5'; slider.oninput() }
-    if (action === 'preset') row.querySelectorAll('button')[1].click()
+    if (action.startsWith('preset')) row.querySelectorAll('button')[Number(action.at(-1))].click()
     if (action === 'reset') f.parts().reset.click()
-    assert.equal(f.parts().balance.textContent, 'Balance', action)
-    assert.equal(f.parts().balance.getAttribute('aria-label'), 'Balance volumes of participants already heard')
+    assert.equal(f.parts().balance.getAttribute('aria-pressed'), 'false', action)
+    assert.equal(f.gains.at(-1)[1], action === 'slider' ? 1.5 : action === 'reset' ? 1 : [0, 0.5, 1, 2.5][Number(action.at(-1))])
+    f.controller.autoTick?.(Date.now()+10000, 'alice')
+    assert.equal(f.parts().balance.getAttribute('aria-pressed'), 'false')
   }
+})
+
+test('toggle off and teardown retain gains without rollback or automatic restart', t => {
+  const f = fixture(t)
+  f.parts().balance.click()
+  f.alice.value = 3.14
+  f.parts().balance.click()
+  assert.equal(f.alice.value, 3.14)
+  f.parts().balance.click()
+  f.controller.stopAuto()
+  f.controller.render()
+  assert.equal(f.parts().balance.getAttribute('aria-pressed'), 'false')
+  assert.equal(f.alice.value, 3.14)
+  assert.deepEqual(f.gains, [])
 })
 
 test('status notice briefly overrides routing status, then routing status returns', () => {
