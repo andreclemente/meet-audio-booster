@@ -118,13 +118,14 @@ export function resolveLocalPresentationActive({ captureActive, domActive, captu
   return captureLifecycleSeen ? captureActive : (captureActive || domActive)
 }
 
-export function createGoogleMeetController({ state, context, setStatus, renderSoon, updateLiveUi, mediaOwnership = installRemoteMediaOwnership() }) {
+export function createGoogleMeetController({ state, context, setStatus, renderSoon, updateLiveUi, onLevelSample = () => {}, onLevelReset = () => {}, onStop = () => {}, mediaOwnership = installRemoteMediaOwnership() }) {
   const learner = createAssociationLearner()
   const alignmentTracker = createFreshAlignmentTracker()
   const media = createMediaPipelineManager(context, { accepts: stream => mediaOwnership.accepts(stream) })
   const workletSpeakerTracker = createWorkletSpeakerTracker()
   const nativeActivity = createNativeActivitySource()
   const levelMeter = createParticipantLevelMeter()
+  let measurementGraph = [], stopped = false
   const selfIds = new Set(), presentationIds = new Set()
   let restoreHook, restoreCaptureHook, observer, mutationTimer, reconcileTimer, mediaTimer, routingTimer, visibilityHandler, slotCounter = 0
   let capturePresentationActive = false
@@ -299,9 +300,17 @@ export function createGoogleMeetController({ state, context, setStatus, renderSo
     setStatus(!media.pipelines.length ? 'Remote audio ownership unavailable · using native playback'
       : active ? `${active.name} · automatic routing` : labels[routing.routingState] || `${participants().length} participants ready`)
   }
-  // Measurement only: runs after routing decisions and never feeds back into them.
+  // Sample after routing; only accepted fresh frames can drive Auto Balance.
   function sampleLevels(now, activity = null) {
     const g = state.google
+    const graph = [g.mode, ...(g.mode === 'media'
+      ? media.pipelines.flatMap(pipeline => [pipeline, pipeline.stream, ...(pipeline.tracks || [])])
+      : g.slots.flatMap(slot => [slot, slot.tap]))]
+    if (graph.length !== measurementGraph.length || graph.some((value, index) => value !== measurementGraph[index])) {
+      measurementGraph = graph
+      levelMeter.reset()
+      onLevelReset(now)
+    }
     const attributedKey = activity && attributeLevelSample({
       available: activity.available, speakers: activity.speakers, routingState: g.routingState,
       appliedParticipantKey: g.appliedParticipantKey,
@@ -310,16 +319,16 @@ export function createGoogleMeetController({ state, context, setStatus, renderSo
       localPresentationActive: g.localPresentationActive && g.mode !== 'media'
     })
     try {
-      levelMeter.tick({
-        // Keep estimates for everyone known in this call, not only the currently
-        // visible participants: Meet hides tiles (e.g. while presenting), and a
-        // temporarily hidden person must not lose their level.
-        now, participantKeys: [...state.participants.keys()], attributedKey,
+      const accepted = levelMeter.tick({
+        // A hidden tile is not a departure; keep known membership evidence.
+        now, participantKeys: knownParticipants().map(person => person.key), attributedKey,
         readPower: () => g.mode === 'media' ? sumPipelinePower(media.pipelines) : g.mode === 'worklet' ? sumTapPower(g.slots) : 0
       })
+      onLevelSample(now, accepted ? attributedKey : null)
     } catch {}
   }
   function route() {
+    if (stopped) return
     refreshMediaOwnership()
     const now = Date.now()
     const activity = currentSpeakers(now)
@@ -341,6 +350,7 @@ export function createGoogleMeetController({ state, context, setStatus, renderSo
     updateLiveUi()
   }
   function start() {
+    stopped = false
     restoreCaptureHook = installLocalPresentationCaptureHook(setCapturePresentationActive)
     restoreHook = installAudioWorkletHook(registerSlot, unregisterSlot)
     reconcile(); scanMedia()
@@ -356,6 +366,8 @@ export function createGoogleMeetController({ state, context, setStatus, renderSo
     document.addEventListener('visibilitychange', visibilityHandler)
   }
   function stop() {
+    stopped = true
+    onStop()
     observer?.disconnect(); clearTimeout(mutationTimer); clearInterval(reconcileTimer); clearInterval(mediaTimer); clearInterval(routingTimer)
     if (visibilityHandler) document.removeEventListener('visibilitychange', visibilityHandler)
     restoreCaptureHook?.()
@@ -373,9 +385,7 @@ export function createGoogleMeetController({ state, context, setStatus, renderSo
   }
   function applyParticipantGain(participant) {
     syncPresentationState()
-    // Pooled worklets expose no stable per-participant energy identity. Keep
-    // the confirmed speaker latched through quiet activity; concrete speaker
-    // changes, overlap, presentation and unknown speaker data neutralize it.
+    // Preserve the router's confirmed ownership, including its safety guards.
     if (state.google.activeParticipantKey === participant.key) setOutputs(participant.value)
   }
   return {

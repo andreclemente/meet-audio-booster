@@ -32,10 +32,13 @@ if (detectPlatform() === 'google-meet' && !globalThis.__meetingAudioBoosterInsta
     clearTimeout(state.renderTimer)
     state.renderTimer = setTimeout(() => panel.render(), 120)
   }
-  function applyGain(participant, value) {
-    participant.value = Number.isFinite(value) ? Math.max(0, value) : 1
-    setParticipantGain(state.settings, participant, participant.value)
-    saveSettings(globalThis.localStorage, state.settings)
+  function applyGain(participant, value, { automatic = false } = {}) {
+    if (!automatic) panel.stopAuto()
+    participant.value = Number.isFinite(value) ? Math.min(6, Math.max(0, value)) : 1
+    if (!automatic) {
+      setParticipantGain(state.settings, participant, participant.value)
+      saveSettings(globalThis.localStorage, state.settings)
+    }
     platformController?.applyParticipantGain(participant, participant.value)
     panel.updateLiveUi()
   }
@@ -66,7 +69,7 @@ if (detectPlatform() === 'google-meet' && !globalThis.__meetingAudioBoosterInsta
     state.platform = detectPlatform()
     const context = getContext()
     state.audioUnavailable = !context
-    const common = { state, context, setStatus, renderSoon, updateLiveUi: panel.updateLiveUi, mediaOwnership }
+    const common = { state, context, setStatus, renderSoon, updateLiveUi: panel.updateLiveUi, onLevelSample: panel.autoTick, onLevelReset: panel.invalidateAuto, onStop: panel.stopAuto, mediaOwnership }
     platformController = createGoogleMeetController(common)
     platformController.start()
     if (!context) setStatus('Audio unavailable · controls are inactive')
