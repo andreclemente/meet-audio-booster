@@ -2,6 +2,7 @@ import { createState, visibleParticipants } from './state.js'
 import { saveSettings, setParticipantGain } from './storage.js'
 import { detectPlatform } from './platforms/google-meet/platform.js'
 import { createGoogleMeetController } from './platforms/google-meet/index.js'
+import { installRemoteMediaOwnership } from './platforms/google-meet/media-ownership.js'
 import { createPanelController, statusText } from './ui/panel.js'
 import { installDebugApi } from './shared/debug.js'
 import { PANEL_ID } from './shared/constants.js'
@@ -9,6 +10,9 @@ import { createAudioContext } from './shared/audio.js'
 
 if (detectPlatform() === 'google-meet' && !globalThis.__meetingAudioBoosterInstalled) {
   globalThis.__meetingAudioBoosterInstalled = true
+  // Install synchronously at document_start, before boot waits for the DOM:
+  // negotiation and track cloning can precede documentElement creation.
+  const mediaOwnership = installRemoteMediaOwnership()
   const state = createState()
   let platformController = null
 
@@ -62,7 +66,7 @@ if (detectPlatform() === 'google-meet' && !globalThis.__meetingAudioBoosterInsta
     state.platform = detectPlatform()
     const context = getContext()
     state.audioUnavailable = !context
-    const common = { state, context, setStatus, renderSoon, updateLiveUi: panel.updateLiveUi }
+    const common = { state, context, setStatus, renderSoon, updateLiveUi: panel.updateLiveUi, mediaOwnership }
     platformController = createGoogleMeetController(common)
     platformController.start()
     if (!context) setStatus('Audio unavailable · controls are inactive')

@@ -9,6 +9,12 @@ export function installLocalPresentationCaptureHook(onActive, mediaDevices = glo
   const captures = new Set()
   let active = false
   let disposed = false
+  let captureTimer = null
+  const stopPolling = () => {
+    if (captureTimer === null) return
+    clearInterval(captureTimer)
+    captureTimer = null
+  }
   const emit = next => {
     if (disposed || active === next) return
     active = next
@@ -17,6 +23,7 @@ export function installLocalPresentationCaptureHook(onActive, mediaDevices = glo
   const removeCapture = capture => {
     if (!captures.delete(capture)) return
     for (const track of capture.tracks) track.removeEventListener?.('ended', capture.checkEnded)
+    if (!captures.size) stopPolling()
     emit(captures.size > 0)
   }
 
@@ -34,6 +41,11 @@ export function installLocalPresentationCaptureHook(onActive, mediaDevices = glo
     }
     captures.add(capture)
     for (const track of tracks) track.addEventListener?.('ended', capture.checkEnded)
+    // MediaStreamTrack.stop() sets readyState to ended without an ended event.
+    // Observe state as well, without wrapping Meet's tracks or weakening bypass.
+    if (captureTimer === null) captureTimer = setInterval(() => {
+      for (const current of captures) current.checkEnded()
+    }, 250)
     emit(true)
     return stream
   }
@@ -44,6 +56,7 @@ export function installLocalPresentationCaptureHook(onActive, mediaDevices = glo
   return () => {
     if (disposed) return
     disposed = true
+    stopPolling()
     for (const capture of captures) {
       for (const track of capture.tracks) track.removeEventListener?.('ended', capture.checkEnded)
     }

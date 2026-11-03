@@ -196,7 +196,7 @@ test('discovering self invalidates only self media routing and writes neutral pi
     const values = []
     h.controller.pipelines.push({
       id: 'self-pipe', participantKey: 'id:self', associationReliable: true,
-      elements: new Set(), set(value) { values.push(value) }, destroy() {}
+      elements: new Set(), eligible: () => true, set(value) { values.push(value) }, destroy() {}
     })
     h.roots([self(), remote()]); h.tick()
     assert.equal(h.state.participants.get('id:self').present, false)
