@@ -1,5 +1,6 @@
 import { readAudioParam, writeAudioParam } from '../../shared/audio.js'
 import { meanSquare } from './levels.js'
+import { createAudibleMeter } from './audible-meter.js'
 
 const TAP_FFT_SIZE = 2048
 
@@ -52,12 +53,17 @@ export function installAudioWorkletHook(onSlot, onRemove = () => {}) {
   const originalDisconnect = AudioNode.prototype.disconnect
   const mappings = []
   let disposed = false
+  const meter = createAudibleMeter({ mappings: () => mappings, connect: originalConnect, disconnect: originalDisconnect })
 
   const connectWrapper = function (...args) {
     if (disposed) return originalConnect.apply(this, args)
     const destination = args[0]
     const isPooledConnection = this?.constructor?.name === 'AudioWorkletNode' && destination?.constructor?.name === 'GainNode'
-    if (!isPooledConnection || typeof destination?.context?.createGain !== 'function') return originalConnect.apply(this, args)
+    if (!isPooledConnection || typeof destination?.context?.createGain !== 'function') {
+      const result = originalConnect.apply(this, args)
+      meter.connected(this, args)
+      return result
+    }
     const output = normalizeIndex(args[1])
     const input = normalizeIndex(args[2])
     const existing = mappings.find(item => item.source === this && item.destination === destination && item.output === output && item.input === input)
@@ -92,15 +98,17 @@ export function installAudioWorkletHook(onSlot, onRemove = () => {}) {
       throw error
     }
     const tap = createSourceTap(this, output, destination.context, originalConnect, originalDisconnect)
+    if (tap) tap.audibleMeter = meter
     mappings.push({ source: this, destination, booster, output, input, tap, originalArgs: [...args] })
-    try { onSlot(booster, tap) } catch {}
+    meter.connected(this, args)
+    try { onSlot(booster, tap, meter) } catch {}
     return destination
   }
 
   const disconnectWrapper = function (...args) {
     if (disposed) return originalDisconnect.apply(this, args)
     const matched = mappings.filter(mapping => mapping.source === this && connectionMatches(mapping, args))
-    if (!matched.length) return originalDisconnect.apply(this, args)
+    if (!matched.length) { const result = originalDisconnect.apply(this, args); meter.disconnected(this, args); return result }
 
     let nativeError = null
     if (!args.length || typeof args[0] === 'number') originalDisconnect.apply(this, args)
@@ -118,6 +126,7 @@ export function installAudioWorkletHook(onSlot, onRemove = () => {}) {
       try { onRemove(mapping.booster) } catch {}
     }
     if (nativeError && nativeError.name !== 'InvalidAccessError') throw nativeError
+    meter.disconnected(this, args)
   }
 
   AudioNode.prototype.connect = connectWrapper
@@ -127,6 +136,7 @@ export function installAudioWorkletHook(onSlot, onRemove = () => {}) {
   return () => {
     if (disposed) return
     disposed = true
+    meter.dispose()
     for (const mapping of [...mappings]) {
       // The direct route is connected before the owned route is removed. Make
       // that synchronous overlap neutral even if the slot was boosted.
@@ -150,7 +160,7 @@ export function installAudioWorkletHook(onSlot, onRemove = () => {}) {
   }
 }
 
-export function createPooledSlot(gain, id, tap = null) {
+export function createPooledSlot(gain, id, tap = null, audibleMeter = tap?.audibleMeter ?? null) {
   const baseGain = readAudioParam(gain.gain)
   let neutralized = true
   return {
@@ -162,6 +172,7 @@ export function createPooledSlot(gain, id, tap = null) {
     targetValue: baseGain,
     participantKey: null,
     tap,
+    audibleMeter,
     get actualValue() { return readAudioParam(gain.gain) },
     set(multiplier, immediate = false) {
       const safe = Number.isFinite(multiplier) ? Math.max(0, multiplier) : 1

@@ -43,7 +43,9 @@ test('rms helpers: mean square, dBFS and summed energy across slots/pipelines', 
   assert.equal(powerToDb(1), 0)
   assert.equal(powerToDb(0), -Infinity)
   assert.ok(Math.abs(powerToDb(0.01) + 20) < 1e-9)
-  const taps = [{ tap: { readMeanSquare: () => 0.01 } }, { tap: null }, { tap: { readMeanSquare: () => 0.03 } }]
+  // Declared numeric fixture, not proof of a native audible audio graph.
+  const audibleMeter = { read: () => 0.04 }
+  const taps = [{ audibleMeter, tap: { readMeanSquare: () => 0.01 } }, { audibleMeter, tap: null }, { audibleMeter, tap: { readMeanSquare: () => 0.03 } }]
   assert.ok(Math.abs(sumTapPower(taps) - 0.04) < 1e-12)
   assert.ok(Math.abs(sumPipelinePower([{ rms: 0.1 }, { rms: 0.2 }, { rms: NaN }]) - 0.05) < 1e-12)
 })
@@ -234,6 +236,141 @@ test('pooled slot destroy also disconnects its tap exactly once', () => {
   assert.equal(createPooledSlot(gain, 'plain').tap, null)
 })
 
+test('pooled slot keeps explicit measurement metadata independently of an optional source tap', () => {
+  const gain = { gain: { value: 1, setValueAtTime(value) { this.value = value } }, context: {} }
+  // Numeric contract fixture only, not a verified native audio graph.
+  const audibleMeter = { read: slots => { assert.equal(slots.length, 2); return 0.04 } }
+  const slots = [createPooledSlot(gain, 'first', null, audibleMeter), createPooledSlot(gain, 'second', null, audibleMeter)]
+  assert.equal(slots[0].tap, null)
+  assert.equal(slots[0].audibleMeter, audibleMeter)
+  assert.equal(sumTapPower(slots), 0.04)
+  const legacy = createPooledSlot(gain, 'legacy', { audibleMeter })
+  assert.equal(legacy.audibleMeter, audibleMeter)
+})
+
+for (const failure of ['first-tap', 'all-taps', 'mixed-meters', 'missing-first-metadata', 'missing-later-metadata']) {
+  test(`actual hook/controller/auto fail closed with ${failure} despite positive diagnostic power`, () => {
+    const mock = hookMock()
+    const createAnalyser = mock.destination.context.createAnalyser
+    let attempts = 0
+    mock.destination.context.createAnalyser = function () {
+      if (++attempts === 1 || failure === 'all-taps') throw new Error('optional source analyser unavailable')
+      return createAnalyser.call(this)
+    }
+    withHook(mock, () => {
+      const slots = []
+      const restore = installAudioWorkletHook((gain, tap, audibleMeter) => {
+        slots.push(createPooledSlot(gain, `hook-${slots.length}`, tap, audibleMeter))
+      })
+      try {
+        mock.source.connect(mock.destination, 0)
+        mock.source.connect(mock.destination, 1)
+        assert.equal(slots.length, 2)
+        assert.equal(slots[0].tap, null)
+        assert.ok(slots[0].audibleMeter, 'third callback argument survives the absent first tap')
+        assert.equal(slots[0].audibleMeter, slots[1].audibleMeter)
+        if (failure === 'all-taps') assert.equal(slots[1].tap, null)
+        else assert.ok(slots[1].tap.readMeanSquare() > 0, 'later raw tap is readable and positive')
+        // This minimal AudioNode mock has no proof of a complete native graph.
+        // Do not replace its real meter with a numeric stub to make it measurable.
+        assert.ok(Number.isNaN(slots[0].audibleMeter.read(slots)))
+        if (failure === 'mixed-meters') slots[1].audibleMeter = { read: () => 0.01 }
+        if (failure === 'missing-first-metadata') slots[0].audibleMeter = null
+        if (failure === 'missing-later-metadata') slots[1].audibleMeter = null
+        assert.ok(Number.isNaN(sumTapPower(slots)))
+        let auto
+        const automaticWrites = []
+        const f = controllerFixture({
+          onLevelSample: (now, key) => auto.tick(now, key),
+          onLevelReset: now => auto.invalidate(now)
+        })
+        f.state.google.slots = slots
+        auto = createAutoBalance({
+          participants: () => [...f.state.participants.values()], levels: key => f.controller.levelFor(key),
+          onGain: (person, value) => automaticWrites.push([person.key, value])
+        })
+        withClock(f.doc, setNow => {
+          auto.start(0)
+          for (let t = 0; t < 24000; t += 30) {
+            setNow(t)
+            f.a.level.value = t < 12000 ? 0.6 : 0
+            f.b.level.value = t < 12000 ? 0 : 0.6
+            f.controller.route()
+            if (t === 3000) {
+              assert.equal(f.state.google.appliedParticipantKey, 'A')
+              assert.ok(slots.every(slot => slot.appliedMultiplier === 2), 'manual gain routing survives optional analyser failure')
+            }
+          }
+        })
+        assert.deepEqual(automaticWrites, [])
+        assert.equal(auto.targetDb, null)
+        for (const key of ['A', 'B']) {
+          const level = f.controller.levelFor(key)
+          assert.equal(level.frames, 0)
+          assert.equal(level.autoDb, null, 'unproved power never becomes auto-ready')
+          assert.equal(level.typicalDb, null)
+        }
+        assert.equal(f.state.google.appliedParticipantKey, 'B')
+        assert.ok(slots.every(slot => slot.appliedMultiplier === 0.5))
+      } finally { restore() }
+    })
+  })
+}
+
+test('actual hook slots with no source taps can drive controller/auto using a declared shared numeric meter', () => {
+  const mock = hookMock()
+  mock.destination.context.createAnalyser = () => { throw new Error('optional source taps unavailable') }
+  withHook(mock, () => {
+    const slots = []
+    const restore = installAudioWorkletHook((gain, tap, audibleMeter) => {
+      slots.push(createPooledSlot(gain, `positive-${slots.length}`, tap, audibleMeter))
+    })
+    try {
+      mock.source.connect(mock.destination, 0)
+      mock.source.connect(mock.destination, 1)
+      assert.ok(slots.every(slot => slot.tap === null))
+      let auto, reads = 0
+      const automaticWrites = []
+      const f = controllerFixture({
+        onLevelSample: (now, key) => auto.tick(now, key),
+        onLevelReset: now => auto.invalidate(now)
+      })
+      // Explicit test-only numeric input after connecting: tests metadata plumbing
+      // and controller functionality, NOT native audible-path support or proof.
+      const numericMeter = { generation: 0, read: measured => {
+        assert.deepEqual(measured, slots)
+        reads++
+        return f.power.value
+      } }
+      for (const slot of slots) slot.audibleMeter = numericMeter
+      f.state.google.slots = slots
+      for (const person of f.state.participants.values()) person.value = 1
+      auto = createAutoBalance({
+        participants: () => [...f.state.participants.values()], levels: key => f.controller.levelFor(key),
+        onGain: (person, value) => { automaticWrites.push([person.key, value]); person.value = value; f.controller.applyParticipantGain(person) }
+      })
+      withClock(f.doc, setNow => {
+        auto.start(0)
+        for (let t = 0; t < 24000; t += 30) {
+          setNow(t)
+          f.a.level.value = t < 12000 ? 0.6 : 0
+          f.b.level.value = t < 12000 ? 0 : 0.6
+          f.power.value = dbToPower(t < 12000 ? -40 : -20)
+          f.controller.route()
+        }
+        assert.ok(reads > 60)
+        assert.ok(Number.isFinite(f.controller.levelFor('B').autoDb))
+        assert.ok(automaticWrites.some(([key]) => key === 'B'))
+        // Generation belongs to the independent meter even when every tap is null.
+        numericMeter.generation++
+        setNow(24000); f.controller.route()
+        assert.equal(f.controller.levelFor('B').autoDb, null)
+        assert.equal(auto.targetDb, null)
+      })
+    } finally { restore() }
+  })
+})
+
 // Controller integration with Meet's native activity model (see native-activity.test.js).
 class Model {
   constructor(participantId, level) { this.Xa = { Yc: () => participantId, Yec: () => level.value }; this.disposed = false }
@@ -264,7 +401,9 @@ function controllerFixture(callbacks = {}) {
   let reads = 0
   const writes = []
   const slot = {
-    gain: {}, appliedMultiplier: 1, tap: { readMeanSquare: () => { reads++; return power.value } },
+    // Synthetic level/controller input only; this does not establish native audio proof.
+    gain: {}, appliedMultiplier: 1, tap: null,
+    audibleMeter: { read: () => { reads++; return power.value } },
     set(value) { writes.push(value); this.appliedMultiplier = value }, release() { this.appliedMultiplier = 1 }, destroy() {}
   }
   const state = {
@@ -291,7 +430,7 @@ function withClock(doc, run) {
 test('controller learns only the confirmed sole speaker and routing writes are unchanged by measurement', () => {
   const f = controllerFixture()
   const reference = controllerFixture()
-  reference.slot.tap = null
+  reference.slot.audibleMeter = null
   withClock(f.doc, setNow => {
     const run = (fixture, from, to) => { for (let t = from; t < to; t += 30) { setNow(t); fixture.controller.route() } }
     f.a.level.value = 0.6; reference.a.level.value = 0.6
@@ -341,25 +480,26 @@ test('actual routing samples drive auto; overlap, unknown, graph mutation and te
     onLevelReset:now=>{resets++;auto.invalidate(now)},
     onStop:()=>{stops++;auto.stop()}
   })
+  for (const person of f.state.participants.values()) person.value = 1
   auto=createAutoBalance({participants:()=>[...f.state.participants.values()],levels:k=>f.controller.levelFor(k),onGain:(p,v)=>{automaticWrites.push([p.key,v]);p.value=v;f.controller.applyParticipantGain(p)}})
   withClock(f.doc,setNow=>{
     auto.start(0)
     const run=(from,to)=>{for(let t=from;t<to;t+=30){setNow(t);f.controller.route()}}
-    f.a.level.value=0.6;f.power.value=dbToPower(-40);run(0,3000)
-    f.a.level.value=0;f.b.level.value=0.6;f.power.value=dbToPower(-20);run(3000,6000)
+    f.a.level.value=0.6;f.power.value=dbToPower(-40);run(0,12000)
+    f.a.level.value=0;f.b.level.value=0.6;f.power.value=dbToPower(-20);run(12000,24000)
     assert.ok(automaticWrites.some(([k])=>k==='B'))
     const before=automaticWrites.length
-    f.a.level.value=0.6;run(6000,8000)
+    f.a.level.value=0.6;run(24000,26000)
     assert.equal(automaticWrites.length,before,'overlap')
     f.a.root.__jsmodel.A0Tiaf.pending.value.wy.disposed=true
-    f.b.level.value=0;run(8000,10000)
+    f.b.level.value=0;run(26000,28000)
     assert.equal(automaticWrites.length,before,'unavailable')
     const resetsBefore=resets
     f.slot.tap={readMeanSquare:()=>dbToPower(-10)}
-    run(10000,10100)
+    run(28000,28100)
     assert.equal(resets,resetsBefore+1)
     assert.equal(f.controller.levelFor('B').autoDb,null)
-    f.controller.stop();run(11000,12000)
+    f.controller.stop();run(29000,30000)
     assert.equal(stops,1)
     assert.equal(auto.enabled,false)
     assert.equal(automaticWrites.length,before)

@@ -1,42 +1,54 @@
-// Session-only control policy. Driven exclusively by accepted routing samples;
-// no timers, storage, audio ownership or visibility policy belongs here.
+// Session-only policy. Manual unity is the comfort anchor, never an automatic
+// or pre-existing boost. A retained automatic value is not a new preference.
 export function createAutoBalance({ participants, levels, onGain }) {
   let enabled = false, startedAt = 0, targetDb = null
-  const heard = new Map(), consumed = new Map()
-  function stop() { enabled = false; targetDb = null; heard.clear(); consumed.clear() }
-  function invalidate(now) { startedAt = now; heard.clear(); consumed.clear() }
-  function start(now) { stop(); enabled = true; invalidate(now) }
+  const heard = new Map(), consumed = new Map(), qualification = new Map()
+  const baselines = new WeakMap(), automaticValues = new WeakMap(), firstSeen = new WeakMap()
+  function stop() { enabled = false; targetDb = null; heard.clear(); consumed.clear(); qualification.clear() }
+  function invalidate(now) { startedAt = now; targetDb = null; heard.clear(); consumed.clear(); qualification.clear() }
+  function start(now) {
+    stop(); enabled = true; invalidate(now)
+    for (const person of participants()) {
+      firstSeen.set(person, now)
+      if (!baselines.has(person) || person.value !== automaticValues.get(person)) baselines.set(person, person.value)
+    }
+  }
   function tick(now, sampledKey) {
     if (!enabled) return
-    const people = participants()
-    const present = new Map(people.map(person => [person.key, person]))
-    for (const key of consumed.keys()) if (!present.has(key)) consumed.delete(key)
+    const present = new Map(participants().map(person => [person.key, person]))
     for (const [key, record] of heard) {
-      if (present.get(key) !== record.person || now - record.at > 15000 || record.person.value <= 0) heard.delete(key)
+      if (present.get(key) !== record.person || now - record.at > 30000 || record.person.value <= 0) heard.delete(key)
     }
+    for (const key of consumed.keys()) if (!present.has(key)) { consumed.delete(key); qualification.delete(key) }
     const person = present.get(sampledKey)
     const level = person && levels(person.key)
-    // Never write on a mere routing/UI tick, silence, overlap or a reused
-    // estimate. Require a new accepted sole-speaker sample from this session.
+    if (person && !firstSeen.has(person)) firstSeen.set(person, now)
     if (!person || !(person.value > 0 && person.value <= 6) || !Number.isFinite(level?.autoDb)
-      || level.autoFrames < 10 || !Number.isFinite(level.autoSince) || level.autoSince < startedAt
-      || level.sampledAt !== now || now - startedAt < 1000
-      || consumed.get(person.key) === now) return
+      || level.autoFrames < 60 || !(level.autoSpread <= 4) || !Number.isFinite(level.autoSince) || level.autoSince < Math.max(startedAt, firstSeen.get(person))
+      || level.sampledAt !== now || now - startedAt < 1000 || consumed.get(person.key) === now) return
+    if (!baselines.has(person)) baselines.set(person, person.value)
     consumed.set(person.key, now)
     heard.set(person.key, { person, at: now, db: level.autoDb })
     if (targetDb === null) {
       if (heard.size < 2) return
-      const post = [...heard.values()].map(record => record.db + 20 * Math.log10(record.person.value)).sort((a,b) => a-b)
-      const middle = post.length >> 1
-      // Fixed for this activation: never recenter on our own gain changes.
-      targetDb = post.length % 2 ? post[middle] : (post[middle-1] + post[middle]) / 2
+      const references = [...heard.values()].filter(r => Math.abs(baselines.get(r.person) - 1) < 0.001)
+        .map(r => r.db).sort((a, b) => a - b)
+      if (!references.length) return
+      const middle = references.length >> 1
+      targetDb = references.length % 2 ? references[middle] : (references[middle - 1] + references[middle]) / 2
     }
     const error = targetDb - (level.autoDb + 20 * Math.log10(person.value))
-    if (Math.abs(error) <= 1.5) return
-    // At most 0.1 dB per new 100 ms speech sample (1 dB/s); never unmute.
-    const step = Math.max(-0.1, Math.min(0.1, error))
+    const direction = Math.sign(error)
+    if (Math.abs(error) <= 3) { qualification.delete(person.key); return }
+    const old = qualification.get(person.key)
+    const count = old?.person === person && old.direction === direction && now - old.at <= 15000 ? old.count + 1 : 1
+    qualification.set(person.key, { person, direction, count, at: now })
+    // Three seconds of accepted evidence beyond warm-up; no catch-up jumps.
+    if (count < 30) return
+    const step = direction * 0.05
     const value = Math.max(0.05, Math.min(6, person.value * 10 ** (step / 20)))
-    if (value !== person.value) onGain(person, value, { automatic: true })
+    if (value !== person.value) { automaticValues.set(person, value); onGain(person, value, { automatic: true }) }
   }
-  return { start, stop, tick, invalidate, get enabled() { return enabled }, get targetDb() { return targetDb } }
+  function noteManual(person, value) { baselines.set(person, value); automaticValues.delete(person) }
+  return { start, stop, tick, invalidate, noteManual, get enabled() { return enabled }, get targetDb() { return targetDb } }
 }
