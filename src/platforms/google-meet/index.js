@@ -164,9 +164,9 @@ export function createGoogleMeetController({ state, context, setStatus, renderSo
     } else if (mode === 'media') applyMediaPipelineOutputs(media.pipelines, null, 1, true)
     renderSoon()
   }
-  function registerSlot(gain, tap = null) {
+  function registerSlot(gain, tap = null, audibleMeter = null) {
     if (state.google.slots.some(slot => slot.gain === gain)) return
-    state.google.slots.push(createPooledSlot(gain, `slot-${++slotCounter}`, tap))
+    state.google.slots.push(createPooledSlot(gain, `slot-${++slotCounter}`, tap, audibleMeter))
     setMode('worklet')
     syncPresentationState()
     renderSoon()
@@ -305,7 +305,7 @@ export function createGoogleMeetController({ state, context, setStatus, renderSo
     const g = state.google
     const graph = [g.mode, ...(g.mode === 'media'
       ? media.pipelines.flatMap(pipeline => [pipeline, pipeline.stream, ...(pipeline.tracks || [])])
-      : g.slots.flatMap(slot => [slot, slot.tap]))]
+      : g.slots.flatMap(slot => [slot, slot.tap, slot.audibleMeter, slot.audibleMeter?.generation]))]
     if (graph.length !== measurementGraph.length || graph.some((value, index) => value !== measurementGraph[index])) {
       measurementGraph = graph
       levelMeter.reset()

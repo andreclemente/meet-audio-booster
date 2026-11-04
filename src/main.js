@@ -36,6 +36,7 @@ if (detectPlatform() === 'google-meet' && !globalThis.__meetingAudioBoosterInsta
     if (!automatic) panel.stopAuto()
     participant.value = Number.isFinite(value) ? Math.min(6, Math.max(0, value)) : 1
     if (!automatic) {
+      panel.noteManual(participant, participant.value)
       setParticipantGain(state.settings, participant, participant.value)
       saveSettings(globalThis.localStorage, state.settings)
     }

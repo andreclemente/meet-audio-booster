@@ -4,7 +4,8 @@
 // level frame is only attributed to a participant while Meet's own activity
 // model reports them as the one and only speaker AND routing has confirmed
 // them. Levels are measured before the extension's gain (what Meet delivers),
-// so the estimate does not depend on the user's slider. Nothing here is
+// after supported native playback gains, normalized by settled extension gain.
+// Unsupported observed paths abstain; this is not a full-page graph census. Nothing here is
 // persisted, exported or logged; only a few dB numbers per present key.
 
 export const LEVEL_SAMPLE_MS = 100
@@ -24,14 +25,12 @@ export function powerToDb(power) {
   return Number.isFinite(power) && power > 0 ? 10 * Math.log10(power) : -Infinity
 }
 
-// Taps on worklet slots: signal entering each booster gain (pre-volume).
+// Worklet control measurements must use one shared verified audible-path meter.
+// Optional source taps are diagnostic only; failure must never select raw power.
 export function sumTapPower(slots) {
-  let power = 0
-  for (const slot of slots || []) {
-    const value = slot?.tap ? slot.tap.readMeanSquare() : 0
-    if (Number.isFinite(value) && value > 0) power += value
-  }
-  return power
+  const meter = slots?.[0]?.audibleMeter
+  if (!meter || !slots.every(slot => slot.audibleMeter === meter)) return NaN
+  return meter.read(slots)
 }
 
 // Media pipelines already sample their source (before their gain) each tick.
@@ -89,7 +88,12 @@ export function createParticipantLevelMeter({
 } = {}) {
   const estimators = new Map()
   // Auto Balance never consumes the long-lived visual median. Use only the
-  // last 1.5 s of attributable speech, requiring ten fresh accepted samples.
+  // last 30 s / 120 accepted speech frames. Confidence compares independent
+  // 20-frame portions (about 2 s of active speech), NOT syllable amplitudes.
+  // Three complete portions spanning at least 4 s are needed. Each portion's
+  // 10%-trimmed dB mean rejects brief bursts without preferring voiced peaks.
+  // A <=4 dB range of portion summaries establishes temporal agreement;
+  // ordinary 10–20 dB within-portion articulation is not itself instability.
   const recent = new Map()
   let clock = 0
   let lastSampleAt = -Infinity
@@ -125,24 +129,36 @@ export function createParticipantLevelMeter({
     estimator.add(live.db)
     let frames = recent.get(attributedKey) || []
     // A gap invalidates the entire short estimate, not just its timestamp.
-    if (frames.length && now - frames.at(-1).at > 1000) frames = []
-    frames = frames.filter(frame => now - frame.at <= 1500)
-    frames.push({ at: now, db: live.db })
+    if (frames.length && now - frames.at(-1).at > 15000) frames = []
+    frames = frames.filter(frame => now - frame.at <= 30000)
+    frames.push({ at: now, db: live.db, sequence: (frames.at(-1)?.sequence || 0) + 1 })
+    if (frames.length > 120) frames.shift()
     recent.set(attributedKey, frames)
     return true
   }
 
   function levelFor(key) {
     const estimator = estimators.get(key)
-    const frames = (recent.get(key) || []).filter(frame => clock - frame.at <= 1500)
-    const sorted = frames.map(frame => frame.db).sort((a, b) => a - b)
-    const middle = sorted.length >> 1
-    const autoDb = sorted.length < 10 ? null : sorted.length % 2 ? sorted[middle] : (sorted[middle - 1] + sorted[middle]) / 2
+    const frames = (recent.get(key) || []).filter(frame => clock - frame.at <= 30000)
+    const portions = []
+    for (let index = 0; index + 20 <= frames.length; index++) {
+      if (frames[index].sequence % 20 !== 1) continue
+      const portion = frames.slice(index, index + 20)
+      const sorted = portion.map(frame => frame.db).sort((a, b) => a - b)
+      portions.push({ db: sorted.slice(2, 18).reduce((sum, db) => sum + db, 0) / 16,
+        since: portion[0].at, until: portion.at(-1).at })
+      index += 19
+    }
+    const summaries = portions.map(portion => portion.db).sort((a, b) => a - b)
+    const middle = summaries.length >> 1
+    const ready = portions.length >= 3 && portions.at(-1).until - portions[0].since >= 4000
+    const autoDb = !ready ? null : summaries.length % 2 ? summaries[middle] : (summaries[middle - 1] + summaries[middle]) / 2
     return {
       liveDb: live?.key === key ? live.db : null,
       typicalDb: estimator ? estimator.typicalDb : null,
       frames: estimator ? estimator.frames : 0,
-      autoDb, autoFrames: frames.length, autoSince: frames[0]?.at ?? null, sampledAt: frames.at(-1)?.at ?? null
+      autoDb, autoSpread: ready ? summaries.at(-1) - summaries[0] : Infinity,
+      autoPortions: portions.length, autoFrames: frames.length, autoSince: frames[0]?.at ?? null, sampledAt: frames.at(-1)?.at ?? null
     }
   }
 

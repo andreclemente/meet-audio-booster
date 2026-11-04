@@ -320,7 +320,8 @@ test('a participant temporarily hidden by Meet keeps their measured level', () =
   const alice = participant('A', 'device-a', a.root, 1)
   const bob = participant('B', 'device-b', b.root, 1)
   const f = controllerFixture([a.root, b.root], [alice, bob], false)
-  f.slot.tap = { readMeanSquare: () => 0.01 }
+  // Declared numeric fixture for activity retention, not native audio graph proof.
+  f.slot.audibleMeter = { read: () => 0.01 }
   withClock(f.doc, setNow => {
     let t = 0
     for (; t < 6000; t += 30) { setNow(t); f.controller.route() }

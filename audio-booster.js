@@ -583,12 +583,9 @@
     return Number.isFinite(power) && power > 0 ? 10 * Math.log10(power) : -Infinity;
   }
   function sumTapPower(slots) {
-    let power = 0;
-    for (const slot of slots || []) {
-      const value = slot?.tap ? slot.tap.readMeanSquare() : 0;
-      if (Number.isFinite(value) && value > 0) power += value;
-    }
-    return power;
+    const meter = slots?.[0]?.audibleMeter;
+    if (!meter || !slots.every((slot) => slot.audibleMeter === meter)) return NaN;
+    return meter.read(slots);
   }
   function sumPipelinePower(pipelines) {
     let power = 0;
@@ -676,23 +673,39 @@
       if (!estimator) estimators.set(attributedKey, estimator = createTypicalLevelEstimator({ warmupFrames, window }));
       estimator.add(live.db);
       let frames = recent.get(attributedKey) || [];
-      if (frames.length && now - frames.at(-1).at > 1e3) frames = [];
-      frames = frames.filter((frame) => now - frame.at <= 1500);
-      frames.push({ at: now, db: live.db });
+      if (frames.length && now - frames.at(-1).at > 15e3) frames = [];
+      frames = frames.filter((frame) => now - frame.at <= 3e4);
+      frames.push({ at: now, db: live.db, sequence: (frames.at(-1)?.sequence || 0) + 1 });
+      if (frames.length > 120) frames.shift();
       recent.set(attributedKey, frames);
       return true;
     }
     function levelFor(key) {
       const estimator = estimators.get(key);
-      const frames = (recent.get(key) || []).filter((frame) => clock - frame.at <= 1500);
-      const sorted = frames.map((frame) => frame.db).sort((a, b) => a - b);
-      const middle = sorted.length >> 1;
-      const autoDb = sorted.length < 10 ? null : sorted.length % 2 ? sorted[middle] : (sorted[middle - 1] + sorted[middle]) / 2;
+      const frames = (recent.get(key) || []).filter((frame) => clock - frame.at <= 3e4);
+      const portions = [];
+      for (let index = 0; index + 20 <= frames.length; index++) {
+        if (frames[index].sequence % 20 !== 1) continue;
+        const portion = frames.slice(index, index + 20);
+        const sorted = portion.map((frame) => frame.db).sort((a, b) => a - b);
+        portions.push({
+          db: sorted.slice(2, 18).reduce((sum, db) => sum + db, 0) / 16,
+          since: portion[0].at,
+          until: portion.at(-1).at
+        });
+        index += 19;
+      }
+      const summaries = portions.map((portion) => portion.db).sort((a, b) => a - b);
+      const middle = summaries.length >> 1;
+      const ready = portions.length >= 3 && portions.at(-1).until - portions[0].since >= 4e3;
+      const autoDb = !ready ? null : summaries.length % 2 ? summaries[middle] : (summaries[middle - 1] + summaries[middle]) / 2;
       return {
         liveDb: live?.key === key ? live.db : null,
         typicalDb: estimator ? estimator.typicalDb : null,
         frames: estimator ? estimator.frames : 0,
         autoDb,
+        autoSpread: ready ? summaries.at(-1) - summaries[0] : Infinity,
+        autoPortions: portions.length,
         autoFrames: frames.length,
         autoSince: frames[0]?.at ?? null,
         sampledAt: frames.at(-1)?.at ?? null
@@ -707,6 +720,240 @@
       lastSampleAt = -Infinity;
     }
     return { tick, levelFor, reset };
+  }
+
+  // src/platforms/google-meet/audible-meter.js
+  function createAudibleMeter({ mappings, connect, disconnect }) {
+    const edges = [], automated = /* @__PURE__ */ new WeakSet();
+    let revision = 0, overflow = false, probe = null, stable = null, nativeSignature = null, contractActive = false;
+    const type = (node) => node?.constructor?.name;
+    const restores = [], newSources = /* @__PURE__ */ new WeakSet(), newGains = /* @__PURE__ */ new WeakSet();
+    const Gain = globalThis.GainNode;
+    if (typeof Gain === "function") {
+      const wrapper = new Proxy(Gain, { construct(target, args, newTarget) {
+        const node = Reflect.construct(target, args, newTarget);
+        newGains.add(node);
+        return node;
+      } });
+      try {
+        globalThis.GainNode = wrapper;
+        restores.push(() => {
+          if (globalThis.GainNode === wrapper) globalThis.GainNode = Gain;
+        });
+      } catch {
+        overflow = true;
+      }
+    }
+    const Worklet = globalThis.AudioWorkletNode;
+    if (typeof Worklet === "function") {
+      const wrapper = new Proxy(Worklet, { construct(target, args, newTarget) {
+        const node = Reflect.construct(target, args, newTarget);
+        newSources.add(node);
+        return node;
+      } });
+      try {
+        globalThis.AudioWorkletNode = wrapper;
+        restores.push(() => {
+          if (globalThis.AudioWorkletNode === wrapper) globalThis.AudioWorkletNode = Worklet;
+        });
+      } catch {
+        overflow = true;
+      }
+    }
+    for (const Context of [globalThis.BaseAudioContext, globalThis.AudioContext, globalThis.OfflineAudioContext]) {
+      const proto = Context?.prototype;
+      if (!proto || !Object.hasOwn(proto, "createGain")) continue;
+      const original = proto.createGain;
+      const wrapper = function(...args) {
+        const node = original.apply(this, args);
+        newGains.add(node);
+        return node;
+      };
+      try {
+        proto.createGain = wrapper;
+        restores.push(() => {
+          if (proto.createGain === wrapper) proto.createGain = original;
+        });
+      } catch {
+        overflow = true;
+      }
+    }
+    for (const name of ["setValueAtTime", "linearRampToValueAtTime", "exponentialRampToValueAtTime", "setTargetAtTime", "setValueCurveAtTime"]) {
+      const proto = globalThis.AudioParam?.prototype, original = proto?.[name];
+      if (typeof original !== "function") continue;
+      const wrapper = function(...args) {
+        const result = original.apply(this, args);
+        automated.add(this);
+        return result;
+      };
+      try {
+        proto[name] = wrapper;
+        restores.push(() => {
+          if (proto[name] === wrapper) proto[name] = original;
+        });
+      } catch {
+        overflow = true;
+      }
+    }
+    function clearProbe() {
+      if (!probe) return;
+      for (const node of probe.terminals) {
+        try {
+          disconnect.call(node, probe.bus);
+        } catch {
+        }
+      }
+      try {
+        disconnect.call(probe.bus);
+      } catch {
+      }
+      try {
+        disconnect.call(probe.splitter);
+      } catch {
+      }
+      probe = null;
+    }
+    function changed() {
+      revision++;
+      stable = null;
+      clearProbe();
+    }
+    function unavailable() {
+      if (contractActive) {
+        contractActive = false;
+        changed();
+      }
+      return NaN;
+    }
+    function connected(source, args) {
+      const [destination, output = 0, input = 0] = args;
+      if (edges.some((e) => e.source === source && e.destination === destination && e.output === output && e.input === input)) return;
+      if (edges.length >= 1024) {
+        overflow = true;
+        changed();
+        return;
+      }
+      edges.push({ source, destination, output, input });
+      changed();
+    }
+    function disconnected(source, args) {
+      for (let i = edges.length - 1; i >= 0; i--) {
+        const e = edges[i];
+        if (e.source !== source) continue;
+        if (args.length && (typeof args[0] === "number" ? e.output !== args[0] : e.destination !== args[0] || args.length > 1 && e.output !== args[1] || args.length > 2 && e.input !== args[2])) continue;
+        edges.splice(i, 1);
+      }
+      changed();
+    }
+    function read(slots) {
+      const active = mappings();
+      if (overflow || !active.length || slots.length !== active.length) return unavailable();
+      const context = active[0].booster.context;
+      if (!context?.createChannelSplitter || active.some((m) => m.booster.context !== context)) return unavailable();
+      const document2 = globalThis.document;
+      const elements = document2?.querySelectorAll ? [...document2.querySelectorAll("audio,video")] : [document2?.querySelector?.("audio,video")].filter(Boolean);
+      const externalPlayback = elements.some((element) => {
+        if (typeof element?.getAttribute !== "function") return true;
+        const stream = element.srcObject;
+        if (typeof globalThis.MediaStream === "function" && stream instanceof globalThis.MediaStream) {
+          return stream.getAudioTracks().length !== 0;
+        }
+        return !!(stream || element.currentSrc || element.getAttribute?.("src"));
+      });
+      if (externalPlayback) return unavailable();
+      const gains = /* @__PURE__ */ new Set(), terminals = /* @__PURE__ */ new Set(), visiting = /* @__PURE__ */ new Set();
+      let valid = true;
+      function walk(node) {
+        if (visiting.has(node) || type(node) !== "GainNode" || !newGains.has(node) || gains.size > 128) {
+          valid = false;
+          return;
+        }
+        if (gains.has(node)) return;
+        gains.add(node);
+        visiting.add(node);
+        const outgoing = edges.filter((e) => e.source === node);
+        if (!outgoing.length) valid = false;
+        for (const e of outgoing) {
+          if (e.output !== 0 || e.input !== 0) {
+            valid = false;
+            continue;
+          }
+          if (e.destination === context.destination) terminals.add(node);
+          else if (type(e.destination) === "GainNode") walk(e.destination);
+          else valid = false;
+        }
+        visiting.delete(node);
+      }
+      for (const m of active) {
+        if (m.input !== 0 || !newSources.has(m.source)) valid = false;
+        walk(m.destination);
+        if (edges.some((e) => e.destination === m.source)) valid = false;
+        for (const e of edges.filter((e2) => e2.source === m.source)) {
+          if (!active.some((a) => a.source === e.source && a.destination === e.destination && a.output === e.output && a.input === e.input) && type(e.destination) !== "MediaStreamAudioDestinationNode") valid = false;
+        }
+      }
+      for (const e of edges) if (gains.has(e.destination) && !gains.has(e.source) && !active.some((m) => m.source === e.source && m.destination === e.destination && m.output === e.output && m.input === e.input)) valid = false;
+      const multiplier = slots[0].actualValue;
+      if (!(multiplier > 0) || slots.some((s) => Math.abs(s.actualValue - multiplier) > 1e-5 || Math.abs(s.targetValue - multiplier) > 1e-5)) valid = false;
+      for (const gain of gains) if (automated.has(gain.gain) || !Number.isFinite(gain.gain.value) || edges.some((e) => e.destination === gain.gain)) valid = false;
+      if (!valid || !terminals.size) {
+        stable = null;
+        clearProbe();
+        return unavailable();
+      }
+      if (!contractActive) {
+        contractActive = true;
+        changed();
+      }
+      const nextNative = [...gains].map((g) => g.gain.value).join(":");
+      if (nativeSignature !== nextNative) {
+        nativeSignature = nextNative;
+        changed();
+      }
+      const signature = [revision, multiplier, nextNative].join(":");
+      const now = context.currentTime;
+      if (!stable || stable.signature !== signature) {
+        stable = { signature, at: now };
+        return NaN;
+      }
+      if (now - stable.at < 0.1) return NaN;
+      if (!probe) {
+        try {
+          const channels = context.destination.channelCount;
+          if (!(channels >= 1 && channels <= 8)) return unavailable();
+          const bus = context.createGain(), splitter = context.createChannelSplitter(channels);
+          bus.channelCount = channels;
+          bus.channelCountMode = "explicit";
+          connect.call(bus, splitter);
+          const analysers = Array.from({ length: channels }, (_, i) => {
+            const analyser = context.createAnalyser();
+            analyser.fftSize = 2048;
+            connect.call(splitter, analyser, i);
+            return { analyser, buffer: new Float32Array(2048) };
+          });
+          probe = { bus, splitter, analysers, terminals: [...terminals], at: now };
+          for (const node of terminals) connect.call(node, bus);
+        } catch {
+          clearProbe();
+          return unavailable();
+        }
+        return NaN;
+      }
+      if (now - probe.at < 0.1) return NaN;
+      let power = 0;
+      for (const { analyser, buffer } of probe.analysers) {
+        analyser.getFloatTimeDomainData(buffer);
+        power += meanSquare(buffer);
+      }
+      return power / (multiplier * multiplier);
+    }
+    return { connected, disconnected, read, changed, get generation() {
+      return revision;
+    }, dispose() {
+      clearProbe();
+      for (const restore of restores.reverse()) restore();
+      edges.length = 0;
+    } };
   }
 
   // src/platforms/google-meet/audio-worklet.js
@@ -764,11 +1011,16 @@
     const originalDisconnect = AudioNode.prototype.disconnect;
     const mappings = [];
     let disposed = false;
+    const meter = createAudibleMeter({ mappings: () => mappings, connect: originalConnect, disconnect: originalDisconnect });
     const connectWrapper = function(...args) {
       if (disposed) return originalConnect.apply(this, args);
       const destination = args[0];
       const isPooledConnection = this?.constructor?.name === "AudioWorkletNode" && destination?.constructor?.name === "GainNode";
-      if (!isPooledConnection || typeof destination?.context?.createGain !== "function") return originalConnect.apply(this, args);
+      if (!isPooledConnection || typeof destination?.context?.createGain !== "function") {
+        const result = originalConnect.apply(this, args);
+        meter.connected(this, args);
+        return result;
+      }
       const output = normalizeIndex(args[1]);
       const input = normalizeIndex(args[2]);
       const existing = mappings.find((item) => item.source === this && item.destination === destination && item.output === output && item.input === input);
@@ -806,9 +1058,11 @@
         throw error;
       }
       const tap = createSourceTap(this, output, destination.context, originalConnect, originalDisconnect);
+      if (tap) tap.audibleMeter = meter;
       mappings.push({ source: this, destination, booster, output, input, tap, originalArgs: [...args] });
+      meter.connected(this, args);
       try {
-        onSlot(booster, tap);
+        onSlot(booster, tap, meter);
       } catch {
       }
       return destination;
@@ -816,7 +1070,11 @@
     const disconnectWrapper = function(...args) {
       if (disposed) return originalDisconnect.apply(this, args);
       const matched = mappings.filter((mapping) => mapping.source === this && connectionMatches(mapping, args));
-      if (!matched.length) return originalDisconnect.apply(this, args);
+      if (!matched.length) {
+        const result = originalDisconnect.apply(this, args);
+        meter.disconnected(this, args);
+        return result;
+      }
       let nativeError = null;
       if (!args.length || typeof args[0] === "number") originalDisconnect.apply(this, args);
       else {
@@ -846,6 +1104,7 @@
         }
       }
       if (nativeError && nativeError.name !== "InvalidAccessError") throw nativeError;
+      meter.disconnected(this, args);
     };
     AudioNode.prototype.connect = connectWrapper;
     AudioNode.prototype.disconnect = disconnectWrapper;
@@ -853,6 +1112,7 @@
     return () => {
       if (disposed) return;
       disposed = true;
+      meter.dispose();
       for (const mapping of [...mappings]) {
         try {
           writeAudioParam(mapping.booster.gain, 1, { context: mapping.booster.context });
@@ -886,7 +1146,7 @@
       delete globalThis.__meetingAudioBoosterWorkletHook;
     };
   }
-  function createPooledSlot(gain, id, tap = null) {
+  function createPooledSlot(gain, id, tap = null, audibleMeter = tap?.audibleMeter ?? null) {
     const baseGain = readAudioParam(gain.gain);
     let neutralized = true;
     return {
@@ -898,6 +1158,7 @@
       targetValue: baseGain,
       participantKey: null,
       tap,
+      audibleMeter,
       get actualValue() {
         return readAudioParam(gain.gain);
       },
@@ -2138,9 +2399,9 @@
       } else if (mode === "media") applyMediaPipelineOutputs(media.pipelines, null, 1, true);
       renderSoon();
     }
-    function registerSlot(gain, tap = null) {
+    function registerSlot(gain, tap = null, audibleMeter = null) {
       if (state.google.slots.some((slot) => slot.gain === gain)) return;
-      state.google.slots.push(createPooledSlot(gain, `slot-${++slotCounter}`, tap));
+      state.google.slots.push(createPooledSlot(gain, `slot-${++slotCounter}`, tap, audibleMeter));
       setMode("worklet");
       syncPresentationState();
       renderSoon();
@@ -2279,7 +2540,7 @@
     }
     function sampleLevels(now, activity = null) {
       const g = state.google;
-      const graph = [g.mode, ...g.mode === "media" ? media.pipelines.flatMap((pipeline) => [pipeline, pipeline.stream, ...pipeline.tracks || []]) : g.slots.flatMap((slot) => [slot, slot.tap])];
+      const graph = [g.mode, ...g.mode === "media" ? media.pipelines.flatMap((pipeline) => [pipeline, pipeline.stream, ...pipeline.tracks || []]) : g.slots.flatMap((slot) => [slot, slot.tap, slot.audibleMeter, slot.audibleMeter?.generation])];
       if (graph.length !== measurementGraph.length || graph.some((value, index) => value !== measurementGraph[index])) {
         measurementGraph = graph;
         levelMeter.reset();
@@ -2530,49 +2791,77 @@
   // src/ui/auto-balance.js
   function createAutoBalance({ participants, levels, onGain }) {
     let enabled = false, startedAt = 0, targetDb = null;
-    const heard = /* @__PURE__ */ new Map(), consumed = /* @__PURE__ */ new Map();
+    const heard = /* @__PURE__ */ new Map(), consumed = /* @__PURE__ */ new Map(), qualification = /* @__PURE__ */ new Map();
+    const baselines = /* @__PURE__ */ new WeakMap(), automaticValues = /* @__PURE__ */ new WeakMap(), firstSeen = /* @__PURE__ */ new WeakMap();
     function stop() {
       enabled = false;
       targetDb = null;
       heard.clear();
       consumed.clear();
+      qualification.clear();
     }
     function invalidate(now) {
       startedAt = now;
+      targetDb = null;
       heard.clear();
       consumed.clear();
+      qualification.clear();
     }
     function start(now) {
       stop();
       enabled = true;
       invalidate(now);
+      for (const person of participants()) {
+        firstSeen.set(person, now);
+        if (!baselines.has(person) || person.value !== automaticValues.get(person)) baselines.set(person, person.value);
+      }
     }
     function tick(now, sampledKey) {
       if (!enabled) return;
-      const people = participants();
-      const present = new Map(people.map((person2) => [person2.key, person2]));
-      for (const key of consumed.keys()) if (!present.has(key)) consumed.delete(key);
+      const present = new Map(participants().map((person2) => [person2.key, person2]));
       for (const [key, record] of heard) {
-        if (present.get(key) !== record.person || now - record.at > 15e3 || record.person.value <= 0) heard.delete(key);
+        if (present.get(key) !== record.person || now - record.at > 3e4 || record.person.value <= 0) heard.delete(key);
+      }
+      for (const key of consumed.keys()) if (!present.has(key)) {
+        consumed.delete(key);
+        qualification.delete(key);
       }
       const person = present.get(sampledKey);
       const level = person && levels(person.key);
-      if (!person || !(person.value > 0 && person.value <= 6) || !Number.isFinite(level?.autoDb) || level.autoFrames < 10 || !Number.isFinite(level.autoSince) || level.autoSince < startedAt || level.sampledAt !== now || now - startedAt < 1e3 || consumed.get(person.key) === now) return;
+      if (person && !firstSeen.has(person)) firstSeen.set(person, now);
+      if (!person || !(person.value > 0 && person.value <= 6) || !Number.isFinite(level?.autoDb) || level.autoFrames < 60 || !(level.autoSpread <= 4) || !Number.isFinite(level.autoSince) || level.autoSince < Math.max(startedAt, firstSeen.get(person)) || level.sampledAt !== now || now - startedAt < 1e3 || consumed.get(person.key) === now) return;
+      if (!baselines.has(person)) baselines.set(person, person.value);
       consumed.set(person.key, now);
       heard.set(person.key, { person, at: now, db: level.autoDb });
       if (targetDb === null) {
         if (heard.size < 2) return;
-        const post = [...heard.values()].map((record) => record.db + 20 * Math.log10(record.person.value)).sort((a, b) => a - b);
-        const middle = post.length >> 1;
-        targetDb = post.length % 2 ? post[middle] : (post[middle - 1] + post[middle]) / 2;
+        const references = [...heard.values()].filter((r) => Math.abs(baselines.get(r.person) - 1) < 1e-3).map((r) => r.db).sort((a, b) => a - b);
+        if (!references.length) return;
+        const middle = references.length >> 1;
+        targetDb = references.length % 2 ? references[middle] : (references[middle - 1] + references[middle]) / 2;
       }
       const error = targetDb - (level.autoDb + 20 * Math.log10(person.value));
-      if (Math.abs(error) <= 1.5) return;
-      const step = Math.max(-0.1, Math.min(0.1, error));
+      const direction = Math.sign(error);
+      if (Math.abs(error) <= 3) {
+        qualification.delete(person.key);
+        return;
+      }
+      const old = qualification.get(person.key);
+      const count = old?.person === person && old.direction === direction && now - old.at <= 15e3 ? old.count + 1 : 1;
+      qualification.set(person.key, { person, direction, count, at: now });
+      if (count < 30) return;
+      const step = direction * 0.05;
       const value = Math.max(0.05, Math.min(6, person.value * 10 ** (step / 20)));
-      if (value !== person.value) onGain(person, value, { automatic: true });
+      if (value !== person.value) {
+        automaticValues.set(person, value);
+        onGain(person, value, { automatic: true });
+      }
     }
-    return { start, stop, tick, invalidate, get enabled() {
+    function noteManual(person, value) {
+      baselines.set(person, value);
+      automaticValues.delete(person);
+    }
+    return { start, stop, tick, invalidate, noteManual, get enabled() {
       return enabled;
     }, get targetDb() {
       return targetDb;
@@ -2784,7 +3073,7 @@
     function toggle() {
       state.closed ? show() : hide();
     }
-    return { render, show, hide, toggle, updateLiveUi, autoTick, stopAuto, invalidateAuto: (now) => auto.invalidate(now) };
+    return { render, show, hide, toggle, updateLiveUi, autoTick, stopAuto, noteManual: (person, value) => auto.noteManual(person, value), invalidateAuto: (now) => auto.invalidate(now) };
   }
   function recoverPosition(panel) {
     const rect = panel.getBoundingClientRect();
@@ -2912,6 +3201,7 @@
       if (!automatic) panel.stopAuto();
       participant.value = Number.isFinite(value) ? Math.min(6, Math.max(0, value)) : 1;
       if (!automatic) {
+        panel.noteManual(participant, participant.value);
         setParticipantGain(state.settings, participant, participant.value);
         saveSettings(globalThis.localStorage, state.settings);
       }
