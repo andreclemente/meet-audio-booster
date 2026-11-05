@@ -13,6 +13,39 @@ export const LEVEL_NOISE_FLOOR_DB = -55
 export const LEVEL_WARMUP_FRAMES = 30
 export const LEVEL_SETTLE_MS = 250
 export const LEVEL_WINDOW_FRAMES = 300
+// Auto evidence horizon. In a group call each person speaks in short turns
+// spread over minutes, so evidence is bounded by accepted speech, not by a
+// short wall-clock window: up to 120 accepted samples (about 12-15 s of the
+// person's own speech, so a sustained change takes over quickly) from at most
+// the last 3 minutes. Silence alone never discards evidence; graph/meter
+// invalidation still resets it.
+export const AUTO_HORIZON_MS = 180000
+export const AUTO_MAX_FRAMES = 120
+// Level 95% interval about +/-2.9 dB (1.96 * 1.5): on the order of the 3 dB
+// deadband; slow 0.05 dB steps and continued refinement absorb residual error.
+export const AUTO_MAX_STANDARD_ERROR_DB = 1.5
+export const AUTO_MAX_SPREAD_DB = 2 * 1.96 * AUTO_MAX_STANDARD_ERROR_DB
+// The session comfort target locks once its references are known to +/-1 SE dB.
+export const AUTO_LOCK_SPREAD_DB = 2 * 1.96 * 1
+
+function median(values) {
+  if (!values.length) return NaN
+  const sorted = [...values].sort((a, b) => a - b), middle = sorted.length >> 1
+  return sorted.length % 2 ? sorted[middle] : (sorted[middle - 1] + sorted[middle]) / 2
+}
+
+// Duration-weighted median of portion summaries.
+function weightedMedian(portions) {
+  const ordered = [...portions].sort((a, b) => a.db - b.db)
+  const total = ordered.reduce((sum, p) => sum + p.support, 0)
+  let cumulative = 0
+  for (let i = 0; i < ordered.length; i++) {
+    cumulative += ordered[i].support
+    if (cumulative < total / 2) continue
+    return cumulative === total / 2 && ordered[i + 1] ? (ordered[i].db + ordered[i + 1].db) / 2 : ordered[i].db
+  }
+  return NaN
+}
 
 export function meanSquare(buffer) {
   if (!buffer?.length) return 0
@@ -90,7 +123,7 @@ export function createParticipantLevelMeter({
   // Auto evidence is disjoint, cadence-aware speaking-run portions, never the
   // visual median. No portion bridges attribution loss or a >350 ms read gap.
   // A 1.9 s portion is 20 nominal 100 ms samples; completed short turns need
-  // >=600 ms and >=3 samples. Keep the same 30 s / 120 accepted-frame bounds.
+  // >=600 ms and >=3 samples. Bounded by AUTO_MAX_FRAMES / AUTO_HORIZON_MS.
   const recent = new Map()
   const openPortions = new Map()
   function closePortion(key) {
@@ -134,9 +167,7 @@ export function createParticipantLevelMeter({
     if (!estimator) estimators.set(attributedKey, estimator = createTypicalLevelEstimator({ warmupFrames, window }))
     estimator.add(live.db)
     let frames = recent.get(attributedKey) || []
-    // A gap invalidates the entire short estimate, not just its timestamp.
-    if (frames.length && now - frames.at(-1).at > 15000) frames = []
-    frames = frames.filter(frame => now - frame.at <= 30000)
+    frames = frames.filter(frame => now - frame.at <= AUTO_HORIZON_MS)
     let portion = openPortions.get(attributedKey)
     if (portion && now - portion.until > 350) { closePortion(attributedKey); portion = null }
     if (!portion) {
@@ -151,14 +182,14 @@ export function createParticipantLevelMeter({
     portion.count++
     frames.push({ at: now, db: live.db, portion })
     if (now - portion.since >= 1900) closePortion(attributedKey)
-    if (frames.length > 120) frames.shift()
+    if (frames.length > AUTO_MAX_FRAMES) frames.shift()
     recent.set(attributedKey, frames)
     return true
   }
 
   function levelFor(key) {
     const estimator = estimators.get(key)
-    const frames = (recent.get(key) || []).filter(frame => clock - frame.at <= 30000)
+    const frames = (recent.get(key) || []).filter(frame => clock - frame.at <= AUTO_HORIZON_MS)
     const groups = new Map()
     for (const frame of frames) {
       if (!groups.has(frame.portion)) groups.set(frame.portion, [])
@@ -175,33 +206,39 @@ export function createParticipantLevelMeter({
       portions.push({ db: core.reduce((sum, db) => sum + db, 0) / core.length,
         support, count: values.length })
     }
-    // Duration-weighted median and supermajority agreement, not extrema of
-    // every old expression. This is robust consensus, NOT statistical certainty
-    // or an inference of speaker intent. Balanced alternate regimes abstain.
-    const ordered = [...portions].sort((a, b) => a.db - b.db)
+    // Natural speech portions vary by several dB (live calls: MAD 2-3.4 dB),
+    // so agreement of individual portions is not the right confidence test.
+    // Instead: drop robust outliers (coughs, laughs, brief bursts: >3 robust
+    // SD from the duration-weighted median), then estimate the level as the
+    // duration-weighted MEAN of the remaining portions and require that mean
+    // to be precise. A mean, unlike a median, does not flip between modes of
+    // alternating loud/quiet passages as old evidence rolls out, so brief
+    // periodic dynamics cannot produce corrections. Not speaker-intent inference.
+    const center0 = weightedMedian(portions)
+    const scale0 = Math.max(2, 1.4826 * median(portions.map(p => Math.abs(p.db - center0))))
     const totalSupport = portions.reduce((sum, p) => sum + p.support, 0)
-    let cumulative = 0, center = null
-    for (let i = 0; i < ordered.length; i++) {
-      cumulative += ordered[i].support
-      if (cumulative < totalSupport / 2) continue
-      center = cumulative === totalSupport / 2 && ordered[i + 1]
-        ? (ordered[i].db + ordered[i + 1].db) / 2 : ordered[i].db
-      break
-    }
-    const agreeing = portions.filter(p => Math.abs(p.db - center) <= 2)
+    const typical = portions.filter(p => Math.abs(p.db - center0) <= 3 * scale0)
+    // Outliers are a small minority by definition; never discard a whole
+    // regime of bimodal speech (that would report one mode as the level).
+    const agreeing = typical.reduce((sum, p) => sum + p.support, 0) * 4 >= totalSupport * 3 ? typical : portions
     const support = agreeing.reduce((sum, p) => sum + p.support, 0)
     const inlierFrames = agreeing.reduce((sum, p) => sum + p.count, 0)
+    const center = support > 0 ? agreeing.reduce((sum, p) => sum + p.db * p.support, 0) / support : NaN
+    // Standard error of the mean of independent portion summaries.
+    const variance = agreeing.length > 1
+      ? agreeing.reduce((sum, p) => sum + (p.db - center) ** 2, 0) / (agreeing.length - 1) : Infinity
+    const standardError = Math.sqrt(variance / agreeing.length)
     // Preserve six nominal seconds (60 x 100 ms), not sixty callbacks.
     // 24 observations is the minimum at the bounded 250 ms support cadence.
     const ready = agreeing.length >= 3 && inlierFrames >= 24 && support >= 6000
-      && support * 3 >= totalSupport * 2 && Math.abs(portions.at(-1).db - center) <= 2
-    const summaries = agreeing.map(p => p.db)
+      && Number.isFinite(center) && standardError <= AUTO_MAX_STANDARD_ERROR_DB
     const autoDb = ready ? center : null
     return {
       liveDb: live?.key === key ? live.db : null,
       typicalDb: estimator ? estimator.typicalDb : null,
       frames: estimator ? estimator.frames : 0,
-      autoDb, autoSpread: ready ? Math.max(...summaries) - Math.min(...summaries) : Infinity,
+      // Reported spread is the 95% interval width of the level estimate.
+      autoDb, autoSpread: ready ? 2 * 1.96 * standardError : Infinity,
       autoSupportMs: support, autoInlierFrames: inlierFrames, autoInlierPortions: agreeing.length,
       autoPortions: portions.length, autoFrames: frames.length, autoSince: frames[0]?.at ?? null, sampledAt: frames.at(-1)?.at ?? null
     }

@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { createParticipantLevelMeter, attributeLevelSample } from '../src/platforms/google-meet/levels.js'
+import { createParticipantLevelMeter, attributeLevelSample, AUTO_HORIZON_MS } from '../src/platforms/google-meet/levels.js'
 import { createAutoBalance } from '../src/ui/auto-balance.js'
 
 function fixture(values=[1,1]) {
@@ -47,7 +47,9 @@ test('longer robust control window expires and excludes pre-enable history',()=>
  const f=fixture();f.run(0,-30,59);assert.equal(f.meter.levelFor('0').autoDb,null)
  f.run(0,-30,21);assert.equal(f.meter.levelFor('0').autoDb,-30)
  f.auto.start(f.now);f.run(1,-20);assert.equal(f.auto.targetDb,null)
- f.meter.tick({now:f.now+31000,participantKeys:['0','1'],readPower:()=>0});assert.equal(f.meter.levelFor('0').autoDb,null)
+ // Group-call turn-taking: silence alone keeps evidence within the horizon.
+ f.meter.tick({now:f.now+31000,participantKeys:['0','1'],readPower:()=>0});assert.equal(f.meter.levelFor('0').autoDb,-30)
+ f.meter.tick({now:f.now+AUTO_HORIZON_MS+1000,participantKeys:['0','1'],readPower:()=>0});assert.equal(f.meter.levelFor('0').autoDb,null)
 })
 test('retained automatic gains on originally unity references do not ratchet next target',()=>{
  const f=fixture();f.run(0,-40);f.run(1,-20);f.run(0,-40)
@@ -86,7 +88,7 @@ for(const modulation of [13,20]) test(`independent portions positively qualify $
  assert.ok(f.people[0].value>1,'sustained quiet shift must not freeze')
 })
 
-test('confidence uses completed non-overlapping portions, then resets on a long source gap',()=>{
+test('confidence uses completed portions; a brief disagreeing portion is an outlier; evidence survives turn gaps',()=>{
  const meter=createParticipantLevelMeter({settleMs:0})
  const add=(from,count,db)=>{for(let i=0;i<count;i++)meter.tick({now:from+i*100,participantKeys:['x'],attributedKey:'x',readPower:()=>10**(db/10)})}
  add(0,80,-30)
@@ -96,10 +98,19 @@ test('confidence uses completed non-overlapping portions, then resets on a long 
  assert.equal(meter.levelFor('x').autoSpread,0)
  add(9900,1,-20)
  assert.equal(meter.levelFor('x').autoPortions,5)
- assert.equal(meter.levelFor('x').autoDb,null,'newest completed portion disagrees, so stale consensus cannot authorize changes')
- assert.equal(meter.levelFor('x').autoSpread,Infinity)
+ assert.equal(meter.levelFor('x').autoDb,-30,'one brief disagreeing portion is a minority outlier, not a new level')
+ assert.equal(meter.levelFor('x').autoInlierPortions,4)
  add(26000,1,-30)
- assert.equal(meter.levelFor('x').autoFrames,1);assert.equal(meter.levelFor('x').autoDb,null)
+ assert.equal(meter.levelFor('x').autoFrames,101,'another speaker\'s turn or a pause does not discard evidence')
+ assert.equal(meter.levelFor('x').autoDb,-30)
+ // A sustained change is no longer a minority: the stale old level is never
+ // reported; the new level takes over as old evidence rolls out.
+ add(30000,60,-20)
+ assert.notEqual(meter.levelFor('x').autoDb,-30,'sustained new speech must not keep the stale level')
+ add(40000,120,-20)
+ assert.equal(meter.levelFor('x').autoDb,-20)
+ add(40000+AUTO_HORIZON_MS+15000,1,-20)
+ assert.equal(meter.levelFor('x').autoFrames,1,'evidence older than the horizon expires')
 })
 
 test('rapid correlated frames and a single phonetic/cough burst cannot seed confidence or writes',()=>{

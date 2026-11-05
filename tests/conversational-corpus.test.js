@@ -27,7 +27,8 @@ test('known-envelope corpus: persistent steps respond slowly, with unchanged dea
   const steps = corpus.dynamics.filter(r => r.kind.endsWith('-step'))
   assert.equal(steps.length, 8)
   for (const r of steps) {
-    assert.ok(r.firstWriteDelayMs >= 3000 && r.firstWriteDelayMs <= 30000, JSON.stringify(r))
+    // Bounded by memory turnover: 120 accepted samples at the read cadence.
+    assert.ok(r.firstWriteDelayMs >= 3000 && r.firstWriteDelayMs <= Math.max(30000, 120 * r.cadence), JSON.stringify(r))
     assert.ok(r.maxStepDb <= 0.0500001, JSON.stringify(r))
     assert.ok(r.kind === 'quiet-step' ? r.finalGainDb[1] > 0 : r.finalGainDb[1] < 0, JSON.stringify(r))
   }

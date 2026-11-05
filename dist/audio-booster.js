@@ -573,6 +573,27 @@
   var LEVEL_WARMUP_FRAMES = 30;
   var LEVEL_SETTLE_MS = 250;
   var LEVEL_WINDOW_FRAMES = 300;
+  var AUTO_HORIZON_MS = 18e4;
+  var AUTO_MAX_FRAMES = 120;
+  var AUTO_MAX_STANDARD_ERROR_DB = 1.5;
+  var AUTO_MAX_SPREAD_DB = 2 * 1.96 * AUTO_MAX_STANDARD_ERROR_DB;
+  var AUTO_LOCK_SPREAD_DB = 2 * 1.96 * 1;
+  function median(values) {
+    if (!values.length) return NaN;
+    const sorted = [...values].sort((a, b) => a - b), middle = sorted.length >> 1;
+    return sorted.length % 2 ? sorted[middle] : (sorted[middle - 1] + sorted[middle]) / 2;
+  }
+  function weightedMedian(portions) {
+    const ordered = [...portions].sort((a, b) => a.db - b.db);
+    const total = ordered.reduce((sum, p) => sum + p.support, 0);
+    let cumulative = 0;
+    for (let i = 0; i < ordered.length; i++) {
+      cumulative += ordered[i].support;
+      if (cumulative < total / 2) continue;
+      return cumulative === total / 2 && ordered[i + 1] ? (ordered[i].db + ordered[i + 1].db) / 2 : ordered[i].db;
+    }
+    return NaN;
+  }
   function meanSquare(buffer) {
     if (!buffer?.length) return 0;
     let sum = 0;
@@ -686,8 +707,7 @@
       if (!estimator) estimators.set(attributedKey, estimator = createTypicalLevelEstimator({ warmupFrames, window }));
       estimator.add(live.db);
       let frames = recent.get(attributedKey) || [];
-      if (frames.length && now - frames.at(-1).at > 15e3) frames = [];
-      frames = frames.filter((frame) => now - frame.at <= 3e4);
+      frames = frames.filter((frame) => now - frame.at <= AUTO_HORIZON_MS);
       let portion = openPortions.get(attributedKey);
       if (portion && now - portion.until > 350) {
         closePortion(attributedKey);
@@ -702,13 +722,13 @@
       portion.count++;
       frames.push({ at: now, db: live.db, portion });
       if (now - portion.since >= 1900) closePortion(attributedKey);
-      if (frames.length > 120) frames.shift();
+      if (frames.length > AUTO_MAX_FRAMES) frames.shift();
       recent.set(attributedKey, frames);
       return true;
     }
     function levelFor(key) {
       const estimator = estimators.get(key);
-      const frames = (recent.get(key) || []).filter((frame) => clock - frame.at <= 3e4);
+      const frames = (recent.get(key) || []).filter((frame) => clock - frame.at <= AUTO_HORIZON_MS);
       const groups = /* @__PURE__ */ new Map();
       for (const frame of frames) {
         if (!groups.has(frame.portion)) groups.set(frame.portion, []);
@@ -727,27 +747,25 @@
           count: values.length
         });
       }
-      const ordered = [...portions].sort((a, b) => a.db - b.db);
+      const center0 = weightedMedian(portions);
+      const scale0 = Math.max(2, 1.4826 * median(portions.map((p) => Math.abs(p.db - center0))));
       const totalSupport = portions.reduce((sum, p) => sum + p.support, 0);
-      let cumulative = 0, center = null;
-      for (let i = 0; i < ordered.length; i++) {
-        cumulative += ordered[i].support;
-        if (cumulative < totalSupport / 2) continue;
-        center = cumulative === totalSupport / 2 && ordered[i + 1] ? (ordered[i].db + ordered[i + 1].db) / 2 : ordered[i].db;
-        break;
-      }
-      const agreeing2 = portions.filter((p) => Math.abs(p.db - center) <= 2);
+      const typical = portions.filter((p) => Math.abs(p.db - center0) <= 3 * scale0);
+      const agreeing2 = typical.reduce((sum, p) => sum + p.support, 0) * 4 >= totalSupport * 3 ? typical : portions;
       const support = agreeing2.reduce((sum, p) => sum + p.support, 0);
       const inlierFrames = agreeing2.reduce((sum, p) => sum + p.count, 0);
-      const ready = agreeing2.length >= 3 && inlierFrames >= 24 && support >= 6e3 && support * 3 >= totalSupport * 2 && Math.abs(portions.at(-1).db - center) <= 2;
-      const summaries = agreeing2.map((p) => p.db);
+      const center = support > 0 ? agreeing2.reduce((sum, p) => sum + p.db * p.support, 0) / support : NaN;
+      const variance = agreeing2.length > 1 ? agreeing2.reduce((sum, p) => sum + (p.db - center) ** 2, 0) / (agreeing2.length - 1) : Infinity;
+      const standardError = Math.sqrt(variance / agreeing2.length);
+      const ready = agreeing2.length >= 3 && inlierFrames >= 24 && support >= 6e3 && Number.isFinite(center) && standardError <= AUTO_MAX_STANDARD_ERROR_DB;
       const autoDb = ready ? center : null;
       return {
         liveDb: live?.key === key ? live.db : null,
         typicalDb: estimator ? estimator.typicalDb : null,
         frames: estimator ? estimator.frames : 0,
+        // Reported spread is the 95% interval width of the level estimate.
         autoDb,
-        autoSpread: ready ? Math.max(...summaries) - Math.min(...summaries) : Infinity,
+        autoSpread: ready ? 2 * 1.96 * standardError : Infinity,
         autoSupportMs: support,
         autoInlierFrames: inlierFrames,
         autoInlierPortions: agreeing2.length,
@@ -2938,19 +2956,23 @@
 
   // src/ui/auto-balance.js
   function createAutoBalance({ participants, levels, onGain }) {
-    let enabled = false, startedAt = 0, targetDb = null;
+    let enabled = false, startedAt = 0, targetDb = null, anchored = false;
     const heard = /* @__PURE__ */ new Map(), consumed = /* @__PURE__ */ new Map(), qualification = /* @__PURE__ */ new Map();
     const baselines = /* @__PURE__ */ new WeakMap(), automaticValues = /* @__PURE__ */ new WeakMap(), firstSeen = /* @__PURE__ */ new WeakMap();
     function stop() {
       enabled = false;
       targetDb = null;
+      anchored = false;
       heard.clear();
       consumed.clear();
       qualification.clear();
     }
     function invalidate(now, { reason } = {}) {
       startedAt = now;
-      if (reason !== "compatible-native-gain") targetDb = null;
+      if (reason !== "compatible-native-gain") {
+        targetDb = null;
+        anchored = false;
+      } else if (targetDb !== null) anchored = true;
       heard.clear();
       consumed.clear();
       qualification.clear();
@@ -2968,7 +2990,7 @@
       if (!enabled) return;
       const present = new Map(participants().map((person2) => [person2.key, person2]));
       for (const [key, record] of heard) {
-        if (present.get(key) !== record.person || now - record.at > 3e4 || record.person.value <= 0) heard.delete(key);
+        if (present.get(key) !== record.person || now - record.at > AUTO_HORIZON_MS || record.person.value <= 0) heard.delete(key);
       }
       for (const key of consumed.keys()) if (!present.has(key)) {
         consumed.delete(key);
@@ -2977,19 +2999,21 @@
       const person = present.get(sampledKey);
       const level = person && levels(person.key);
       if (person && !firstSeen.has(person)) firstSeen.set(person, now);
-      if (!person || !(person.value > 0 && person.value <= 6) || !Number.isFinite(level?.autoDb) || !(Number.isFinite(level.autoSupportMs) && level.autoSupportMs >= 6e3) || !(Number.isFinite(level.autoInlierFrames) && level.autoInlierFrames >= 24) || !(Number.isFinite(level.autoInlierPortions) && level.autoInlierPortions >= 3) || !(level.autoSpread <= 4) || !Number.isFinite(level.autoSince) || level.autoSince < Math.max(startedAt, firstSeen.get(person)) || level.sampledAt !== now || now - startedAt < 1e3 || consumed.get(person.key) === now) {
+      if (!person || !(person.value > 0 && person.value <= 6) || !Number.isFinite(level?.autoDb) || !(Number.isFinite(level.autoSupportMs) && level.autoSupportMs >= 6e3) || !(Number.isFinite(level.autoInlierFrames) && level.autoInlierFrames >= 24) || !(Number.isFinite(level.autoInlierPortions) && level.autoInlierPortions >= 3) || !(level.autoSpread <= AUTO_MAX_SPREAD_DB) || !Number.isFinite(level.autoSince) || level.autoSince < Math.max(startedAt, firstSeen.get(person)) || level.sampledAt !== now || now - startedAt < 1e3 || consumed.get(person.key) === now) {
         if (person && level?.sampledAt === now && consumed.get(person.key) !== now) qualification.delete(person.key);
         return;
       }
       if (!baselines.has(person)) baselines.set(person, person.value);
       consumed.set(person.key, now);
-      heard.set(person.key, { person, at: now, db: level.autoDb });
-      if (targetDb === null) {
-        if (heard.size < 2) return;
-        const references = [...heard.values()].filter((r) => Math.abs(baselines.get(r.person) - 1) < 1e-3).map((r) => r.db).sort((a, b) => a - b);
-        if (!references.length) return;
-        const middle = references.length >> 1;
-        targetDb = references.length % 2 ? references[middle] : (references[middle - 1] + references[middle]) / 2;
+      heard.set(person.key, { person, at: now, db: level.autoDb, spread: level.autoSpread });
+      if (targetDb === null || !anchored) {
+        const references = heard.size < 2 ? [] : [...heard.values()].filter((r) => Math.abs(baselines.get(r.person) - 1) < 1e-3).sort((a, b) => a.db - b.db);
+        if (references.length) {
+          const middle = references.length >> 1;
+          targetDb = references.length % 2 ? references[middle].db : (references[middle - 1].db + references[middle].db) / 2;
+          if (references.length >= 2 && references.every((r) => r.spread <= AUTO_LOCK_SPREAD_DB)) anchored = true;
+        }
+        if (targetDb === null) return;
       }
       const error = targetDb - (level.autoDb + 20 * Math.log10(person.value));
       const direction = Math.sign(error);
@@ -2998,12 +3022,13 @@
         return;
       }
       const old = qualification.get(person.key);
-      const count = old?.person === person && old.direction === direction && now - old.at <= 15e3 ? old.count + 1 : 1;
+      const count = old?.person === person && old.direction === direction && now - old.at <= AUTO_HORIZON_MS ? old.count + 1 : 1;
       qualification.set(person.key, { person, direction, count, at: now });
       if (count < 30) return;
       const step = direction * 0.05;
       const value = Math.max(0.05, Math.min(6, person.value * 10 ** (step / 20)));
       if (value !== person.value) {
+        anchored = true;
         automaticValues.set(person, value);
         onGain(person, value, { automatic: true });
       }

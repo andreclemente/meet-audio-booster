@@ -137,7 +137,7 @@ for (const gaps of [false, true]) test(`compatible static native attenuation rec
     assert.ok(w.level.autoInlierFrames >= 24)
     assert.ok(w.level.autoInlierPortions >= 3)
     assert.ok(w.qualifiedFrames >= 30, 'fresh confidence loss must rearm sustained qualification')
-    assert.ok(-30 - (w.level.autoDb + gainDb(w.from)) > 3, 'no writes inside the deadband')
+    assert.ok(-30 - (w.level.autoDb + gainDb(w.from)) > 3 - 1e-6, 'no writes inside the deadband')
   }
   assert.ok(lastWriteMs <= 180000, 'deadband convergence has an explicit 180 s budget')
   assert.ok(Math.abs(-30 - (r.level.autoDb + gainDb(r.value))) <= 3, 'same established 3 dB deadband')
