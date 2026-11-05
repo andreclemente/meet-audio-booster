@@ -8,6 +8,7 @@ import { installRemoteMediaOwnership } from './media-ownership.js'
 import { createNativeActivitySource } from './native-activity.js'
 import { createParticipantLevelMeter, attributeLevelSample, sumTapPower, sumPipelinePower } from './levels.js'
 import { createMeasurementContinuity } from './measurement-continuity.js'
+import { createRowAdmission } from './row-admission.js'
 import { upsertParticipant, visibleParticipants } from '../../state.js'
 
 export function collectCurrentUiSpeakers(participants, isSpeaking = participant => isGoogleParticipantSpeaking(participant.element)) {
@@ -119,7 +120,7 @@ export function resolveLocalPresentationActive({ captureActive, domActive, captu
   return captureLifecycleSeen ? captureActive : (captureActive || domActive)
 }
 
-export function createGoogleMeetController({ state, context, setStatus, renderSoon, updateLiveUi, onLevelSample = () => {}, onLevelReset = () => {}, onStop = () => {}, mediaOwnership = installRemoteMediaOwnership() }) {
+export function createGoogleMeetController({ state, context, setStatus, renderSoon, updateLiveUi, onLevelSample = () => {}, onLevelReset = () => {}, onStop = () => {}, mediaOwnership = installRemoteMediaOwnership(), rowAdmissionMs } = {}) {
   const learner = createAssociationLearner()
   const alignmentTracker = createFreshAlignmentTracker()
   const media = createMediaPipelineManager(context, { accepts: stream => mediaOwnership.accepts(stream) })
@@ -129,6 +130,7 @@ export function createGoogleMeetController({ state, context, setStatus, renderSo
   const observeMeasurement = createMeasurementContinuity()
   let stopped = false
   const selfIds = new Set(), presentationIds = new Set()
+  const rowAdmission = createRowAdmission({ minMs: rowAdmissionMs })
   let restoreHook, restoreCaptureHook, observer, mutationTimer, reconcileTimer, mediaTimer, routingTimer, visibilityHandler, slotCounter = 0
   let capturePresentationActive = false
   let domPresentationActive = false
@@ -183,19 +185,21 @@ export function createGoogleMeetController({ state, context, setStatus, renderSo
   function reconcile() {
     const now = Date.now()
     syncPresentationState()
-    const found = new Set()
+    const found = new Set(); rowAdmission.begin()
     for (const data of scanMeetParticipants(document, selfIds, presentationIds)) {
-      // Only a call tile or a confirmed call member is a person in the call;
-      // a People-list or lobby entry (someone asking to join) is not.
+      // Only a call tile or confirmed member is a person (not People-list/lobby entries).
       if (!data.element?.getAttribute?.('data-requested-participant-id') && !nativeActivity.isMember(data.participantId)) continue
-      // A new row needs a person's mic indicator, so a share never flashes in.
-      if (!data.hasMicrophone && !state.participants.has(data.key)) continue
+      // A new row needs a person's mic indicator (a share never flashes in) and a stable name.
+      if (!state.participants.has(data.key) && (!data.hasMicrophone || !rowAdmission.admit(data.key, data.name, now))) continue
       found.add(data.key)
-      upsertParticipant(state, {
+      const before = state.participants.get(data.key)?.value
+      const participant = upsertParticipant(state, {
         ...data, platform: 'google-meet', present: true, lastSeenAt: now,
         extra: { participantId: data.participantId, element: data.element }
       })
+      if (before !== undefined && participant.value !== before) applyParticipantGain(participant)
     }
+    rowAdmission.end()
     updateMissingParticipants(state.participants.values(), found, { now, selfIds, presentationIds, isMember: nativeActivity.isMember })
     const isSelfKey = key => selfIds.has(state.participants.get(key)?.participantId)
     if ([state.google.activeParticipantKey, state.google.appliedParticipantKey,
@@ -377,7 +381,7 @@ export function createGoogleMeetController({ state, context, setStatus, renderSo
     media.destroy()
     state.google.mediaPipelines = []
     mediaOwnership.dispose()
-    selfIds.clear(); presentationIds.clear()
+    selfIds.clear(); presentationIds.clear(); rowAdmission.clear()
     workletSpeakerTracker.reset()
     nativeActivity.reset()
     levelMeter.reset()

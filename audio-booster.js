@@ -169,7 +169,10 @@
   function upsertParticipant(state, data) {
     const existing = state.participants.get(data.key);
     if (existing) {
-      existing.name = data.name || existing.name;
+      if (data.name && data.name !== existing.name) {
+        existing.name = data.name;
+        if (existing.value === existing.restoredValue) existing.value = existing.restoredValue = getParticipantGain(state.settings, existing);
+      }
       existing.present = data.present ?? existing.present;
       existing.speaking = data.speaking ?? existing.speaking;
       existing.lastSeenAt = data.lastSeenAt ?? Date.now();
@@ -187,7 +190,7 @@
       lastSpeakingAt: data.speaking ? Date.now() : 0,
       ...data.extra
     };
-    participant.value = getParticipantGain(state.settings, participant);
+    participant.value = participant.restoredValue = getParticipantGain(state.settings, participant);
     state.participants.set(participant.key, participant);
     return participant;
   }
@@ -266,13 +269,16 @@
     if (!root?.getAttribute?.("data-participant-id")) return null;
     const candidates = root.querySelectorAll?.(PARTICIPANT_NAME_SELECTORS) || [];
     const controlLabels = /* @__PURE__ */ new Set();
+    const ownElement = (element) => !element.closest || element.closest("[data-participant-id]") === root;
     for (const element of root.querySelectorAll?.("[aria-label], [data-tooltip]") || []) {
+      if (!ownElement(element)) continue;
       for (const attr of ["aria-label", "data-tooltip"]) {
         const value = cleanName(element.getAttribute?.(attr)).toLocaleLowerCase();
         if (value) controlLabels.add(value);
       }
     }
     for (const element of candidates) {
+      if (!ownElement(element)) continue;
       if (!element.matches?.(PARTICIPANT_NAME_SELECTORS)) continue;
       if (element.matches?.('button, [role="button"], [aria-hidden="true"]')) continue;
       const name = extractCandidateName(element);
@@ -2460,6 +2466,38 @@
     };
   }
 
+  // src/platforms/google-meet/row-admission.js
+  var ROW_ADMISSION_MS = 400;
+  function createRowAdmission({ minMs = ROW_ADMISSION_MS } = {}) {
+    const pending = /* @__PURE__ */ new Map();
+    let seen = /* @__PURE__ */ new Set();
+    return {
+      begin() {
+        seen = /* @__PURE__ */ new Set();
+      },
+      // True once `key` with `name` is stable; call only for keys not yet rows.
+      admit(key, name, now) {
+        seen.add(key);
+        const entry = pending.get(key);
+        if (!entry || entry.name !== name) {
+          pending.set(key, { name, since: now });
+          return false;
+        }
+        if (now - entry.since < minMs) return false;
+        pending.delete(key);
+        return true;
+      },
+      // Forget candidates that disappeared this scan, so admission restarts.
+      end() {
+        for (const key of pending.keys()) if (!seen.has(key)) pending.delete(key);
+      },
+      clear() {
+        pending.clear();
+        seen = /* @__PURE__ */ new Set();
+      }
+    };
+  }
+
   // src/platforms/google-meet/index.js
   function createWorkletSpeakerTracker({ confirmMs = 50 } = {}) {
     let confirmed = null;
@@ -2529,7 +2567,7 @@
   function createGoogleMeetController({ state, context, setStatus, renderSoon, updateLiveUi, onLevelSample = () => {
   }, onLevelReset = () => {
   }, onStop = () => {
-  }, mediaOwnership = installRemoteMediaOwnership() }) {
+  }, mediaOwnership = installRemoteMediaOwnership(), rowAdmissionMs } = {}) {
     const learner = createAssociationLearner();
     const alignmentTracker = createFreshAlignmentTracker();
     const media = createMediaPipelineManager(context, { accepts: (stream) => mediaOwnership.accepts(stream) });
@@ -2539,6 +2577,7 @@
     const observeMeasurement = createMeasurementContinuity();
     let stopped = false;
     const selfIds = /* @__PURE__ */ new Set(), presentationIds = /* @__PURE__ */ new Set();
+    const rowAdmission = createRowAdmission({ minMs: rowAdmissionMs });
     let restoreHook, restoreCaptureHook, observer, mutationTimer, reconcileTimer, mediaTimer, routingTimer, visibilityHandler, slotCounter = 0;
     let capturePresentationActive = false;
     let domPresentationActive = false;
@@ -2596,18 +2635,22 @@
       const now = Date.now();
       syncPresentationState();
       const found = /* @__PURE__ */ new Set();
+      rowAdmission.begin();
       for (const data of scanMeetParticipants(document, selfIds, presentationIds)) {
         if (!data.element?.getAttribute?.("data-requested-participant-id") && !nativeActivity.isMember(data.participantId)) continue;
-        if (!data.hasMicrophone && !state.participants.has(data.key)) continue;
+        if (!state.participants.has(data.key) && (!data.hasMicrophone || !rowAdmission.admit(data.key, data.name, now))) continue;
         found.add(data.key);
-        upsertParticipant(state, {
+        const before = state.participants.get(data.key)?.value;
+        const participant = upsertParticipant(state, {
           ...data,
           platform: "google-meet",
           present: true,
           lastSeenAt: now,
           extra: { participantId: data.participantId, element: data.element }
         });
+        if (before !== void 0 && participant.value !== before) applyParticipantGain(participant);
       }
+      rowAdmission.end();
       updateMissingParticipants(state.participants.values(), found, { now, selfIds, presentationIds, isMember: nativeActivity.isMember });
       const isSelfKey = (key) => selfIds.has(state.participants.get(key)?.participantId);
       if ([
@@ -2801,6 +2844,7 @@
       mediaOwnership.dispose();
       selfIds.clear();
       presentationIds.clear();
+      rowAdmission.clear();
       workletSpeakerTracker.reset();
       nativeActivity.reset();
       levelMeter.reset();

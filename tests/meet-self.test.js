@@ -145,7 +145,15 @@ function withController(run) {
   const state = createState({ getItem() { return null } })
   state.google.mode = 'worklet'
   const writes = []
-  const make = () => createGoogleMeetController({ state, context: {}, setStatus() {}, renderSoon() {}, updateLiveUi() {} })
+  // These tests cover self discovery AFTER a row exists, so rows are admitted
+  // on the second scan without the production 400 ms stability wait
+  // (row-admission.test.js covers that wait).
+  const make = () => {
+    const created = createGoogleMeetController({ state, context: {}, setStatus() {}, renderSoon() {}, updateLiveUi() {}, rowAdmissionMs: 0 })
+    const start = created.start
+    created.start = (...args) => { const result = start(...args); ticks.get(750)?.(); return result }
+    return created
+  }
   let controller = make()
   const slot = () => ({ set(value) { writes.push(value) }, destroy() {}, release() {} })
   try {
