@@ -7,6 +7,7 @@ import { createMediaPipelineManager } from './media-elements.js'
 import { installRemoteMediaOwnership } from './media-ownership.js'
 import { createNativeActivitySource } from './native-activity.js'
 import { createParticipantLevelMeter, attributeLevelSample, sumTapPower, sumPipelinePower } from './levels.js'
+import { createMeasurementContinuity } from './measurement-continuity.js'
 import { upsertParticipant, visibleParticipants } from '../../state.js'
 
 export function collectCurrentUiSpeakers(participants, isSpeaking = participant => isGoogleParticipantSpeaking(participant.element)) {
@@ -125,7 +126,8 @@ export function createGoogleMeetController({ state, context, setStatus, renderSo
   const workletSpeakerTracker = createWorkletSpeakerTracker()
   const nativeActivity = createNativeActivitySource()
   const levelMeter = createParticipantLevelMeter()
-  let measurementGraph = [], stopped = false
+  const observeMeasurement = createMeasurementContinuity()
+  let stopped = false
   const selfIds = new Set(), presentationIds = new Set()
   let restoreHook, restoreCaptureHook, observer, mutationTimer, reconcileTimer, mediaTimer, routingTimer, visibilityHandler, slotCounter = 0
   let capturePresentationActive = false
@@ -303,13 +305,10 @@ export function createGoogleMeetController({ state, context, setStatus, renderSo
   // Sample after routing; only accepted fresh frames can drive Auto Balance.
   function sampleLevels(now, activity = null) {
     const g = state.google
-    const graph = [g.mode, ...(g.mode === 'media'
-      ? media.pipelines.flatMap(pipeline => [pipeline, pipeline.stream, ...(pipeline.tracks || [])])
-      : g.slots.flatMap(slot => [slot, slot.tap, slot.audibleMeter, slot.audibleMeter?.generation]))]
-    if (graph.length !== measurementGraph.length || graph.some((value, index) => value !== measurementGraph[index])) {
-      measurementGraph = graph
+    const invalidation = observeMeasurement(g, media.pipelines)
+    if (invalidation) {
       levelMeter.reset()
-      onLevelReset(now)
+      onLevelReset(now, invalidation)
     }
     const attributedKey = activity && attributeLevelSample({
       available: activity.available, speakers: activity.speakers, routingState: g.routingState,

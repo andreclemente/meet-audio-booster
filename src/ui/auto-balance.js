@@ -5,7 +5,11 @@ export function createAutoBalance({ participants, levels, onGain }) {
   const heard = new Map(), consumed = new Map(), qualification = new Map()
   const baselines = new WeakMap(), automaticValues = new WeakMap(), firstSeen = new WeakMap()
   function stop() { enabled = false; targetDb = null; heard.clear(); consumed.clear(); qualification.clear() }
-  function invalidate(now) { startedAt = now; targetDb = null; heard.clear(); consumed.clear(); qualification.clear() }
+  function invalidate(now, { reason } = {}) {
+    startedAt = now
+    if (reason !== 'compatible-native-gain') targetDb = null
+    heard.clear(); consumed.clear(); qualification.clear()
+  }
   function start(now) {
     stop(); enabled = true; invalidate(now)
     for (const person of participants()) {

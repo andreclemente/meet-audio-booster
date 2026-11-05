@@ -24,6 +24,7 @@ const MAX_MODELS_PER_ROOT = 16
 const REDISCOVER_MS = 1000
 const GETTER_RETRY_MS = 1000
 const GETTER_STALE_MS = 10000
+const MAX_DISCOVERY_MODELS = 64
 
 function isObject(value) {
   return value !== null && typeof value === 'object' && !Array.isArray(value) &&
@@ -227,7 +228,9 @@ export function createNativeActivitySource({ rediscoverMs = REDISCOVER_MS } = {}
     const tileModels = []
     const selfTiles = [...selfIds].filter(id => rootsByParticipantId.has(id)).map(id => ({ key: `self:${id}`, participantId: id }))
     for (const key of entries.keys()) {
-      if (!participants.some(participant => participant.key === key) && !selfTiles.some(item => item.key === key)) entries.delete(key)
+      const discoveryId = key.startsWith('discovery:') ? key.slice('discovery:'.length) : null
+      if (!participants.some(participant => participant.key === key) && !selfTiles.some(item => item.key === key) &&
+        !(discoveryId && rootsByParticipantId.has(discoveryId))) entries.delete(key)
     }
     for (const participant of getter ? participants : []) {
       const roots = rootsFor(participant, rootsByParticipantId)
@@ -247,12 +250,26 @@ export function createNativeActivitySource({ rediscoverMs = REDISCOVER_MS } = {}
       const level = strongestLevel(models, getter)
       if (level !== null) selfLevels.set(self.participantId, level)
     }
+    // Admission can itself depend on membership. Verify source identities on
+    // unadmitted roots too, but use them ONLY to discover membership: neither
+    // their activity nor their ids establish routable participants or level
+    // registry trust. A lobby root may have a model without being a member.
+    const discoveryIds = new Set()
+    const discoveryModels = []
+    for (const [id, roots] of getter ? rootsByParticipantId : []) {
+      if (discoveryModels.length >= MAX_DISCOVERY_MODELS) break
+      for (const model of modelsFor({ key: `discovery:${id}`, participantId: id }, roots, now)) {
+        if (discoveryModels.length >= MAX_DISCOVERY_MODELS) break
+        discoveryIds.add(id)
+        discoveryModels.push(model)
+      }
+    }
     // Any read tile level confirms the getter, whichever path answers.
     if (levels.size || selfLevels.size) lastConfirmedAt = now
     // Membership records hold participant models of the tile models' class;
     // they are confirmed with the same identity check.
     const isParticipantModel = getter ? (value, id) => isParticipantSourceModel(value, id, getter, identityCache) : null
-    const registryValues = registry.update({ now, tileLevels, tileModels, selfLevels, isParticipantModel })
+    const registryValues = registry.update({ now, tileLevels, tileModels, selfLevels, isParticipantModel, discoveryIds: [...discoveryIds], discoveryModels })
     if (registryValues) return readRegistryActivity(registryValues, participants, known, selfIds)
     if (!getter) return unavailable(participants)
     const speakers = participants.filter(participant => isSpeakingLevel(levels.get(participant.key)))

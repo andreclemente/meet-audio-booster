@@ -267,6 +267,163 @@ function withController(run) {
 
 const names = state => visibleParticipants(state, 'google-meet').map(item => item.name)
 
+function removeRequestedId(tile) {
+  const get = tile.root.getAttribute
+  tile.root.getAttribute = attr => attr === 'data-requested-participant-id' ? null : get(attr)
+}
+
+function removeMic(tile) {
+  const all = tile.root.querySelectorAll
+  tile.root.querySelectorAll = selector => selector.includes('google-symbols') ? [] : all(selector)
+}
+
+for (const selfPresent of [true, false]) {
+  test(`bootstrap: first remote without requested-id, then second arrival (self present: ${selfPresent})`, () => {
+    const call = makeCall({ ids: ['local'] })
+    const me = call.tile('local', { name: 'Local', selfLabel: true })
+    withController(h => {
+      const roots = selfPresent ? [me.root] : []
+      h.roots(roots); h.controller.start(); h.advance(1500)
+      assert.deepEqual(names(h.state), [])
+      call.join('first')
+      const first = call.tile('first', { name: 'Alice' }); removeRequestedId(first)
+      h.roots([...roots, first.root]); h.advance(4500)
+      assert.deepEqual(names(h.state), ['Alice'], 'silent first remote needs no second admission anchor')
+      assert.equal(h.state.google.membershipTrusted, true)
+      const acquired = h.state.participants.get('id:first')
+      call.join('second')
+      const second = call.tile('second', { name: 'Bob' }); removeRequestedId(second)
+      h.roots([...roots, first.root, second.root]); h.advance(7500)
+      assert.deepEqual(names(h.state), ['Alice', 'Bob'])
+      assert.equal(h.state.participants.get('id:first'), acquired)
+    })
+  })
+}
+
+for (const build of [1, 2]) {
+  test(`bootstrap build ${build}: verified self discovers membership, never activity routing`, () => {
+    const call = makeCall({ build, ids: ['local', 'remote'] })
+    const me = call.tile('local')
+    call.speak('local', 3); call.speak('remote', 4)
+    const source = createNativeActivitySource()
+    const result = runTicks(source, [], documentWith(me.root), 0, 3000, 30, { selfIds: new Set(['local']) })
+    assert.equal(source.membershipTrusted, true)
+    assert.equal(source.isMember('remote'), true)
+    assert.equal(result.available, false)
+    assert.equal(result.source, 'unavailable', 'self activity must not establish level-registry trust')
+    assert.deepEqual(result.speakers, [])
+    assert.equal(result.levels.size, 0)
+  })
+}
+
+for (const selfPresent of [true, false]) {
+  test(`bootstrap: lobby model does not poison member discovery or become a row (self: ${selfPresent})`, () => {
+    const call = makeCall({ ids: ['local', 'remote'] })
+    const me = call.tile('local', { name: 'Local', selfLabel: true })
+    const remote = call.tile('remote', { name: 'Alice' }); removeRequestedId(remote)
+    const lobby = call.tile('knock', { name: 'Kim' }); removeRequestedId(lobby)
+    call.speak('knock', 4)
+    withController(h => {
+      h.roots([...(selfPresent ? [me.root] : []), remote.root, lobby.root])
+      h.controller.start(); h.advance(4500)
+      assert.deepEqual(names(h.state), ['Alice'])
+      assert.equal(h.state.google.membershipTrusted, true)
+      assert.notEqual(h.state.google.routingState, 'confirmed-speaker')
+      call.join('knock'); h.advance(7500)
+      assert.deepEqual(names(h.state), ['Alice', 'Kim'])
+    })
+  })
+}
+
+test('bootstrap: positive candidate activity discovers membership, not level-registry trust', () => {
+  const call = makeCall({ ids: ['remote'] })
+  const remote = call.tile('remote')
+  call.speak('remote', 4)
+  const source = createNativeActivitySource()
+  const result = runTicks(source, [], documentWith(remote.root), 0, 3000)
+  assert.equal(source.membershipTrusted, true)
+  assert.equal(result.available, false)
+  assert.equal(result.source, 'unavailable')
+  assert.equal(result.levels.size, 0)
+  assert.deepEqual(result.speakers, [])
+})
+
+test('bootstrap: ambiguous level registries still prevent tileless activity routing after admission', () => {
+  const call = makeCall({ ids: ['remote', 'tileless'] })
+  call.service.duplicateLevels = new Map(call.levels)
+  const remote = call.tile('remote')
+  call.speak('remote', 4); call.service.duplicateLevels.set('remote', 4)
+  const source = createNativeActivitySource()
+  const doc = documentWith(remote.root)
+  runTicks(source, [], doc, 0, 3000)
+  assert.equal(source.membershipTrusted, true)
+  const people = [participant('id:remote', 'remote', remote.root), participant('id:tileless', 'tileless', null)]
+  const result = runTicks(source, people, doc, 3030, 6000)
+  assert.equal(result.available, false)
+  assert.notEqual(result.source, 'meet-registry')
+  assert.deepEqual(result.unknown, ['id:tileless'])
+})
+
+test('bootstrap: candidate-only source activity without membership cannot admit or route', () => {
+  const call = makeCall({ ids: ['remote'], record: 'none' })
+  const remote = call.tile('remote', { name: 'Alice' }); removeRequestedId(remote)
+  call.speak('remote', 4)
+  const source = createNativeActivitySource()
+  const result = runTicks(source, [], documentWith(remote.root), 0, 3000)
+  assert.equal(source.membershipTrusted, false)
+  assert.equal(result.available, false)
+  assert.equal(result.levels.size, 0)
+  assert.deepEqual(result.speakers, [])
+  withController(h => {
+    h.roots([remote.root]); h.controller.start(); h.advance(4500)
+    assert.deepEqual(names(h.state), [])
+    assert.notEqual(h.state.google.routingState, 'confirmed-speaker')
+  })
+})
+
+for (const options of [{ duplicateMembers: true }, { record: 'mismatch' }]) {
+  test(`bootstrap: ambiguous or mismatched membership is never admitted (${JSON.stringify(options)})`, () => {
+    const call = makeCall({ ids: ['remote'], ...options })
+    const remote = call.tile('remote', { name: 'Alice' }); removeRequestedId(remote)
+    call.speak('remote', 4)
+    withController(h => {
+      h.roots([remote.root]); h.controller.start(); h.advance(4500)
+      assert.deepEqual(names(h.state), [])
+      assert.equal(h.state.google.membershipTrusted, false)
+      assert.notEqual(h.state.google.routingState, 'confirmed-speaker')
+    })
+  })
+}
+
+test('bootstrap: disposed or mismatched source candidates cannot seed discovery', () => {
+  for (const invalid of ['disposed', 'mismatch']) {
+    const call = makeCall({ ids: ['remote'] })
+    const remote = call.tile('remote', { name: 'Alice' }); removeRequestedId(remote)
+    if (invalid === 'disposed') remote.model.disposed = true
+    else remote.model.Xa.Yc = () => 'wrong-id'
+    withController(h => {
+      h.roots([remote.root]); h.controller.start(); h.advance(4500)
+      assert.deepEqual(names(h.state), [])
+      assert.equal(h.state.google.membershipTrusted, false)
+    })
+  }
+})
+
+test('bootstrap: trusted membership does not bypass missing mic or presentation guards', () => {
+  const call = makeCall({ ids: ['local', 'remote', 'share'] })
+  const me = call.tile('local', { name: 'Local', selfLabel: true })
+  const remote = call.tile('remote', { name: 'Alice' }); removeRequestedId(remote); removeMic(remote)
+  const share = call.tile('share', { name: 'Share' }); removeMic(share)
+  withController(h => {
+    h.roots([me.root, remote.root, share.root]); h.controller.start(); h.advance(4500)
+    assert.equal(h.state.google.membershipTrusted, true)
+    assert.deepEqual(names(h.state), [])
+    call.speak('share', 4); h.advance(6000)
+    assert.notEqual(h.state.google.routingState, 'confirmed-speaker')
+    assert.deepEqual(names(h.state), [])
+  })
+})
+
 test('controller: a known participant without a tile stays listed until they leave the call', () => {
   const call = makeCall({ ids: ['device-a', 'device-b', 'device-c'] })
   const a = call.tile('device-a', { name: 'Alice' })

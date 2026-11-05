@@ -726,6 +726,7 @@
   function createAudibleMeter({ mappings, connect, disconnect }) {
     const edges = [], automated = /* @__PURE__ */ new WeakSet();
     let revision = 0, overflow = false, probe = null, stable = null, nativeSignature = null, contractActive = false;
+    let continuity = {}, reason = "unverified", ownership = [], positiveNative = false;
     const type = (node) => node?.constructor?.name;
     const restores = [], newSources = /* @__PURE__ */ new WeakSet(), newGains = /* @__PURE__ */ new WeakSet();
     const Gain = globalThis.GainNode;
@@ -814,7 +815,19 @@
       probe = null;
     }
     function changed() {
+      continuity = {};
+      reason = "unverified";
       revision++;
+      stable = null;
+      clearProbe();
+    }
+    function nativeChanged(compatible) {
+      if (!compatible) {
+        changed();
+        return;
+      }
+      revision++;
+      reason = "static-native-gain";
       stable = null;
       clearProbe();
     }
@@ -864,7 +877,7 @@
       const gains = /* @__PURE__ */ new Set(), terminals = /* @__PURE__ */ new Set(), visiting = /* @__PURE__ */ new Set();
       let valid = true;
       function walk(node) {
-        if (visiting.has(node) || type(node) !== "GainNode" || !newGains.has(node) || gains.size > 128) {
+        if (visiting.has(node) || type(node) !== "GainNode" || !newGains.has(node) || node.context !== context || gains.size > 128) {
           valid = false;
           return;
         }
@@ -885,7 +898,7 @@
         visiting.delete(node);
       }
       for (const m of active) {
-        if (m.input !== 0 || !newSources.has(m.source)) valid = false;
+        if (m.input !== 0 || !newSources.has(m.source) || m.source.context !== context) valid = false;
         walk(m.destination);
         if (edges.some((e) => e.destination === m.source)) valid = false;
         for (const e of edges.filter((e2) => e2.source === m.source)) {
@@ -901,15 +914,30 @@
         clearProbe();
         return unavailable();
       }
+      const nextOwnership = [
+        context,
+        context.destination,
+        context.destination.channelCount,
+        ...slots,
+        ...active.flatMap((m) => [m.source, m.destination, m.booster, m.output, m.input]),
+        ...gains,
+        ...terminals
+      ];
+      if (nextOwnership.length !== ownership.length || nextOwnership.some((v, i) => v !== ownership[i])) {
+        ownership = nextOwnership;
+        changed();
+      }
       if (!contractActive) {
         contractActive = true;
         changed();
       }
       const nextNative = [...gains].map((g) => g.gain.value).join(":");
+      const nextPositive = [...gains].every((g) => g.gain.value > 0);
       if (nativeSignature !== nextNative) {
         nativeSignature = nextNative;
-        changed();
+        nativeChanged(positiveNative && nextPositive);
       }
+      positiveNative = nextPositive;
       const signature = [revision, multiplier, nextNative].join(":");
       const now = context.currentTime;
       if (!stable || stable.signature !== signature) {
@@ -945,15 +973,33 @@
         analyser.getFloatTimeDomainData(buffer);
         power += meanSquare(buffer);
       }
-      return power / (multiplier * multiplier);
+      const normalized = power / (multiplier * multiplier);
+      return Number.isFinite(normalized) ? normalized : unavailable();
     }
-    return { connected, disconnected, read, changed, get generation() {
-      return revision;
-    }, dispose() {
-      clearProbe();
-      for (const restore of restores.reverse()) restore();
-      edges.length = 0;
-    } };
+    return {
+      connected,
+      disconnected,
+      read(slots) {
+        try {
+          return read(slots);
+        } catch {
+          return unavailable();
+        }
+      },
+      changed,
+      get generation() {
+        return revision;
+      },
+      get continuity() {
+        return { token: continuity, reason, generation: revision };
+      },
+      dispose() {
+        contractActive = false;
+        changed();
+        for (const restore of restores.reverse()) restore();
+        edges.length = 0;
+      }
+    };
   }
 
   // src/platforms/google-meet/audio-worklet.js
@@ -1650,13 +1696,13 @@
       map = candidate;
       anchors = tileModels.slice(0, 64);
     }
-    function finish({ state, members, reached }, ids, tileModels, isParticipantModel) {
+    function finish({ state, members, reached }, ids, tileModels, isParticipantModel, discoveryIds = ids) {
       if (state !== "complete") return drop();
-      if (!ids.length) {
+      if (!discoveryIds.length) {
         if (map && !reached.has(map)) drop();
         return;
       }
-      const found = isParticipantModel ? members.filter((candidate) => passesDiscovery(candidate, ids, isParticipantModel)) : [];
+      const found = isParticipantModel ? members.filter((candidate) => discoveryIds.some((id) => validEntry(candidate, id, isParticipantModel)) && passesDiscovery(candidate, ids, isParticipantModel)) : [];
       if (found.length !== 1) return drop();
       if (found[0] !== map) adopt(found[0], tileModels);
     }
@@ -1829,7 +1875,7 @@
       return false;
     }
   }
-  function createRegistryWalk({ anchors, ids = [], target = null, targets = [target], clock = monotonic, sliceMs = SLICE_MS, maxSlices = MAX_SLICES }) {
+  function createRegistryWalk({ anchors, ids = [], discoveryIds = ids, target = null, targets = [target], clock = monotonic, sliceMs = SLICE_MS, maxSlices = MAX_SLICES }) {
     const visited = new Set(anchors);
     const queue = anchors.map((anchor) => [anchor, 0]);
     const candidates = /* @__PURE__ */ new Set();
@@ -1852,9 +1898,10 @@
       if (wanted.has(value)) reached.add(value);
       if (isSkipped(value)) return 1;
       if (isMap(value)) {
-        if (!ids.length || !coversIds(value, ids)) return 1 + ids.length;
-        if (readLevelRegistry(value)) candidates.add(value);
-        else if (isMembershipShaped(value)) members.add(value);
+        if (!coversIds(value, ids)) return 1 + ids.length;
+        if (readLevelRegistry(value)) {
+          if (ids.length) candidates.add(value);
+        } else if (discoveryIds.some((id) => mapHas2.call(value, id)) && isMembershipShaped(value)) members.add(value);
         else return 1 + mapSize2.call(value);
         if (candidates.size > MAX_CANDIDATES || members.size > MAX_CANDIDATES) state = "incomplete";
         return mapSize2.call(value);
@@ -1936,9 +1983,9 @@
       const values = readLevelRegistry(map);
       if (values && compareWithTiles(values, tileLevels).positive) trust(now);
     }
-    function finish({ purpose, target, run, ids }, now, tileLevels, tileModels, isParticipantModel) {
+    function finish({ purpose, target, run, ids }, now, tileLevels, tileModels, isParticipantModel, discoveryIds, discoveryModels) {
       const result = run.result();
-      membership.finish(result, ids, tileModels, isParticipantModel);
+      membership.finish(result, ids, [...tileModels, ...discoveryModels], isParticipantModel, discoveryIds);
       if (purpose === "members") return;
       const { state, candidates, reachedTarget } = result;
       const found = state === "complete" && tileLevels.size ? agreeing(candidates, tileLevels) : [];
@@ -1951,7 +1998,7 @@
       const values = readLevelRegistry(map);
       if (found.length > 1 && values && compareWithTiles(values, tileLevels).positive) drop();
     }
-    function update({ now, tileLevels, tileModels, selfLevels = /* @__PURE__ */ new Map(), isParticipantModel = null }) {
+    function update({ now, tileLevels, tileModels, selfLevels = /* @__PURE__ */ new Map(), isParticipantModel = null, discoveryIds = [...tileLevels.keys()], discoveryModels = [] }) {
       let values = map ? readLevelRegistry(map) : null;
       if (map && !values) drop();
       const checked = map;
@@ -1970,23 +2017,24 @@
         } else if (!anchors.some(isLive2)) drop();
       }
       const ids = [...tileLevels.keys()];
-      const discovering = (!trusted || !membership.map) && ids.length && tileModels.length && now - lastDiscovery >= discoveryMs;
+      const membershipModels = [.../* @__PURE__ */ new Set([...tileModels, ...discoveryModels])];
+      const discovering = (!trusted || !membership.map) && discoveryIds.length && membershipModels.length && now - lastDiscovery >= discoveryMs;
       if (!walk && (discovering || (trusted || membership.map) && now - lastVerify >= verifyMs)) {
         const verify = Boolean(map && trusted);
         if (discovering) lastDiscovery = now;
         if (verify || !discovering) lastVerify = now;
-        const roots = discovering && !verify ? tileModels : [.../* @__PURE__ */ new Set([...tileModels, ...anchors.filter(isLive2), ...membership.anchors])];
+        const roots = discovering && !verify ? membershipModels : [.../* @__PURE__ */ new Set([...membershipModels, ...anchors.filter(isLive2), ...membership.anchors])];
         const target = verify ? map : null;
-        walk = { purpose: verify ? "verify" : discovering ? "discover" : "members", target, ids, run: createRegistryWalk({ anchors: roots, ids, target, targets: [target, membership.map], clock }) };
+        walk = { purpose: verify ? "verify" : discovering ? "discover" : "members", target, ids, run: createRegistryWalk({ anchors: roots, ids, discoveryIds, target, targets: [target, membership.map], clock }) };
       }
       if (walk && walk.run.step() !== "running") {
         const finished = walk;
         walk = null;
-        finish(finished, now, tileLevels, tileModels, isParticipantModel);
+        finish(finished, now, tileLevels, tileModels, isParticipantModel, discoveryIds, discoveryModels);
       }
       if (map !== checked) values = map ? readLevelRegistry(map) : null;
       const levelValues = map && trusted ? values : null;
-      membership.update({ now, tileIds: ids, levelValues, tileModels, isParticipantModel });
+      membership.update({ now, tileIds: ids, levelValues, tileModels: membershipModels, isParticipantModel });
       return mismatchSince === null ? levelValues : null;
     }
     return {
@@ -2033,6 +2081,7 @@
   var REDISCOVER_MS = 1e3;
   var GETTER_RETRY_MS = 1e3;
   var GETTER_STALE_MS = 1e4;
+  var MAX_DISCOVERY_MODELS = 64;
   function isObject(value) {
     return value !== null && typeof value === "object" && !Array.isArray(value) && !(typeof Node === "function" && value instanceof Node) && typeof value.nodeType !== "number";
   }
@@ -2224,7 +2273,8 @@
       const tileModels = [];
       const selfTiles = [...selfIds].filter((id) => rootsByParticipantId.has(id)).map((id) => ({ key: `self:${id}`, participantId: id }));
       for (const key of entries.keys()) {
-        if (!participants.some((participant) => participant.key === key) && !selfTiles.some((item) => item.key === key)) entries.delete(key);
+        const discoveryId = key.startsWith("discovery:") ? key.slice("discovery:".length) : null;
+        if (!participants.some((participant) => participant.key === key) && !selfTiles.some((item) => item.key === key) && !(discoveryId && rootsByParticipantId.has(discoveryId))) entries.delete(key);
       }
       for (const participant of getter ? participants : []) {
         const roots = rootsFor(participant, rootsByParticipantId);
@@ -2245,9 +2295,19 @@
         const level = strongestLevel(models, getter);
         if (level !== null) selfLevels.set(self.participantId, level);
       }
+      const discoveryIds = /* @__PURE__ */ new Set();
+      const discoveryModels = [];
+      for (const [id, roots] of getter ? rootsByParticipantId : []) {
+        if (discoveryModels.length >= MAX_DISCOVERY_MODELS) break;
+        for (const model of modelsFor({ key: `discovery:${id}`, participantId: id }, roots, now)) {
+          if (discoveryModels.length >= MAX_DISCOVERY_MODELS) break;
+          discoveryIds.add(id);
+          discoveryModels.push(model);
+        }
+      }
       if (levels.size || selfLevels.size) lastConfirmedAt = now;
       const isParticipantModel = getter ? (value, id) => isParticipantSourceModel(value, id, getter, identityCache) : null;
-      const registryValues = registry.update({ now, tileLevels, tileModels, selfLevels, isParticipantModel });
+      const registryValues = registry.update({ now, tileLevels, tileModels, selfLevels, isParticipantModel, discoveryIds: [...discoveryIds], discoveryModels });
       if (registryValues) return readRegistryActivity(registryValues, participants, known, selfIds);
       if (!getter) return unavailable(participants);
       const speakers = participants.filter((participant) => isSpeakingLevel(levels.get(participant.key)));
@@ -2279,6 +2339,25 @@
         return registry.membership.trusted;
       },
       isMember: (id) => registry.membership.has(id)
+    };
+  }
+
+  // src/platforms/google-meet/measurement-continuity.js
+  function createMeasurementContinuity() {
+    let previousGraph = [], previousGenerations = [], previous = null;
+    const same = (a, b) => a.length === b.length && a.every((value, i) => value === b[i]);
+    return function observe(g, pipelines) {
+      const graph = [g.mode, ...g.mode === "media" ? pipelines.flatMap((p) => [p, p.stream, ...p.tracks || []]) : g.slots.flatMap((s) => [s, s.tap, s.audibleMeter])];
+      const generations = g.mode === "media" ? [] : g.slots.map((s) => s.audibleMeter?.generation);
+      const sameOwners = same(graph, previousGraph);
+      if (sameOwners && same(generations, previousGenerations)) return null;
+      const meter = g.mode === "worklet" && g.slots[0]?.audibleMeter;
+      const next = meter?.continuity;
+      const compatible = sameOwners && previous?.meter === meter && g.slots.every((s) => s.audibleMeter === meter) && next?.token && next.token === previous.token && next.reason === "static-native-gain" && next.generation === meter.generation && next.generation > previous.generation;
+      previousGraph = graph;
+      previousGenerations = generations;
+      previous = next ? { meter, ...next } : null;
+      return { reason: compatible ? "compatible-native-gain" : "measurement-graph" };
     };
   }
 
@@ -2358,7 +2437,8 @@
     const workletSpeakerTracker = createWorkletSpeakerTracker();
     const nativeActivity = createNativeActivitySource();
     const levelMeter = createParticipantLevelMeter();
-    let measurementGraph = [], stopped = false;
+    const observeMeasurement = createMeasurementContinuity();
+    let stopped = false;
     const selfIds = /* @__PURE__ */ new Set(), presentationIds = /* @__PURE__ */ new Set();
     let restoreHook, restoreCaptureHook, observer, mutationTimer, reconcileTimer, mediaTimer, routingTimer, visibilityHandler, slotCounter = 0;
     let capturePresentationActive = false;
@@ -2540,11 +2620,10 @@
     }
     function sampleLevels(now, activity = null) {
       const g = state.google;
-      const graph = [g.mode, ...g.mode === "media" ? media.pipelines.flatMap((pipeline) => [pipeline, pipeline.stream, ...pipeline.tracks || []]) : g.slots.flatMap((slot) => [slot, slot.tap, slot.audibleMeter, slot.audibleMeter?.generation])];
-      if (graph.length !== measurementGraph.length || graph.some((value, index) => value !== measurementGraph[index])) {
-        measurementGraph = graph;
+      const invalidation = observeMeasurement(g, media.pipelines);
+      if (invalidation) {
         levelMeter.reset();
-        onLevelReset(now);
+        onLevelReset(now, invalidation);
       }
       const attributedKey = activity && attributeLevelSample({
         available: activity.available,
@@ -2800,9 +2879,9 @@
       consumed.clear();
       qualification.clear();
     }
-    function invalidate(now) {
+    function invalidate(now, { reason } = {}) {
       startedAt = now;
-      targetDb = null;
+      if (reason !== "compatible-native-gain") targetDb = null;
       heard.clear();
       consumed.clear();
       qualification.clear();
@@ -3073,7 +3152,7 @@
     function toggle() {
       state.closed ? show() : hide();
     }
-    return { render, show, hide, toggle, updateLiveUi, autoTick, stopAuto, noteManual: (person, value) => auto.noteManual(person, value), invalidateAuto: (now) => auto.invalidate(now) };
+    return { render, show, hide, toggle, updateLiveUi, autoTick, stopAuto, noteManual: (person, value) => auto.noteManual(person, value), invalidateAuto: (now, metadata) => auto.invalidate(now, metadata) };
   }
   function recoverPosition(panel) {
     const rect = panel.getBoundingClientRect();
