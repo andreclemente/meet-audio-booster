@@ -13,6 +13,37 @@ export const LEVEL_NOISE_FLOOR_DB = -55
 export const LEVEL_WARMUP_FRAMES = 30
 export const LEVEL_SETTLE_MS = 250
 export const LEVEL_WINDOW_FRAMES = 300
+// Auto evidence horizon. In a group call each person speaks in short turns
+// spread over minutes, so evidence is bounded by accepted speech, not by a
+// short wall-clock window: up to 120 accepted samples (about 12-15 s of the
+// person's own speech, so a sustained change takes over quickly) from at most
+// the last 3 minutes. Silence alone never discards evidence; graph/meter
+// invalidation still resets it.
+export const AUTO_HORIZON_MS = 180000
+export const AUTO_MAX_FRAMES = 120
+// Level 95% interval about +/-2.9 dB (1.96 * 1.5): on the order of the 3 dB
+// deadband; slow 0.05 dB steps and continued refinement absorb residual error.
+export const AUTO_MAX_STANDARD_ERROR_DB = 1.5
+export const AUTO_MAX_SPREAD_DB = 2 * 1.96 * AUTO_MAX_STANDARD_ERROR_DB
+
+function median(values) {
+  if (!values.length) return NaN
+  const sorted = [...values].sort((a, b) => a - b), middle = sorted.length >> 1
+  return sorted.length % 2 ? sorted[middle] : (sorted[middle - 1] + sorted[middle]) / 2
+}
+
+// Duration-weighted median of portion summaries.
+function weightedMedian(portions) {
+  const ordered = [...portions].sort((a, b) => a.db - b.db)
+  const total = ordered.reduce((sum, p) => sum + p.support, 0)
+  let cumulative = 0
+  for (let i = 0; i < ordered.length; i++) {
+    cumulative += ordered[i].support
+    if (cumulative < total / 2) continue
+    return cumulative === total / 2 && ordered[i + 1] ? (ordered[i].db + ordered[i + 1].db) / 2 : ordered[i].db
+  }
+  return NaN
+}
 
 export function meanSquare(buffer) {
   if (!buffer?.length) return 0
@@ -87,14 +118,17 @@ export function createParticipantLevelMeter({
   settleMs = LEVEL_SETTLE_MS, window = LEVEL_WINDOW_FRAMES
 } = {}) {
   const estimators = new Map()
-  // Auto Balance never consumes the long-lived visual median. Use only the
-  // last 30 s / 120 accepted speech frames. Confidence compares independent
-  // 20-frame portions (about 2 s of active speech), NOT syllable amplitudes.
-  // Three complete portions spanning at least 4 s are needed. Each portion's
-  // 10%-trimmed dB mean rejects brief bursts without preferring voiced peaks.
-  // A <=4 dB range of portion summaries establishes temporal agreement;
-  // ordinary 10–20 dB within-portion articulation is not itself instability.
+  // Auto evidence is disjoint, cadence-aware speaking-run portions, never the
+  // visual median. No portion bridges attribution loss or a >350 ms read gap.
+  // A 1.9 s portion is 20 nominal 100 ms samples; completed short turns need
+  // >=600 ms and >=3 samples. Bounded by AUTO_MAX_FRAMES / AUTO_HORIZON_MS.
   const recent = new Map()
+  const openPortions = new Map()
+  function closePortion(key) {
+    const portion = openPortions.get(key)
+    if (portion) portion.closed = true
+    openPortions.delete(key)
+  }
   let clock = 0
   let lastSampleAt = -Infinity
   let settleKey = null
@@ -105,7 +139,7 @@ export function createParticipantLevelMeter({
     if (!estimators.size) return
     const present = participantKeys instanceof Set ? participantKeys : new Set(participantKeys || [])
     for (const key of estimators.keys()) if (!present.has(key)) estimators.delete(key)
-    for (const key of recent.keys()) if (!present.has(key)) recent.delete(key)
+    for (const key of recent.keys()) if (!present.has(key)) { recent.delete(key); openPortions.delete(key) }
     if (live && !present.has(live.key)) live = null
   }
 
@@ -115,49 +149,100 @@ export function createParticipantLevelMeter({
     if (now < clock) reset()
     clock = now
     prune(participantKeys)
-    if (attributedKey !== settleKey) { settleKey = attributedKey; settleSince = now }
+    if (attributedKey !== settleKey) {
+      closePortion(settleKey)
+      settleKey = attributedKey; settleSince = now
+    }
     if (!attributedKey || live?.key !== attributedKey) live = null
     if (now - lastSampleAt < sampleMs) return false
     lastSampleAt = now
     live = null
     if (!attributedKey || now - settleSince < settleMs) return false
     const db = powerToDb(readPower())
-    if (!(db >= noiseFloorDb)) return false
+    if (!(db >= noiseFloorDb)) { closePortion(attributedKey); return false }
     live = { key: attributedKey, db: Math.min(db, 0) }
     let estimator = estimators.get(attributedKey)
     if (!estimator) estimators.set(attributedKey, estimator = createTypicalLevelEstimator({ warmupFrames, window }))
     estimator.add(live.db)
     let frames = recent.get(attributedKey) || []
-    // A gap invalidates the entire short estimate, not just its timestamp.
-    if (frames.length && now - frames.at(-1).at > 15000) frames = []
-    frames = frames.filter(frame => now - frame.at <= 30000)
-    frames.push({ at: now, db: live.db, sequence: (frames.at(-1)?.sequence || 0) + 1 })
-    if (frames.length > 120) frames.shift()
+    frames = frames.filter(frame => now - frame.at <= AUTO_HORIZON_MS)
+    let portion = openPortions.get(attributedKey)
+    if (portion && now - portion.until > 350) { closePortion(attributedKey); portion = null }
+    if (!portion) {
+      portion = { since: now, until: now, support: 0, count: 0, closed: false }
+      openPortions.set(attributedKey, portion)
+    }
+    // Only consecutive accepted same-speaker observations support elapsed
+    // speech. Bound interpolation to 250 ms; never credit the first sample,
+    // attribution interruptions, invalid power, or gaps over 350 ms.
+    portion.support += Math.min(250, now - portion.until)
+    portion.until = now
+    portion.count++
+    frames.push({ at: now, db: live.db, portion })
+    if (now - portion.since >= 1900) closePortion(attributedKey)
+    if (frames.length > AUTO_MAX_FRAMES) frames.shift()
     recent.set(attributedKey, frames)
     return true
   }
 
-  function levelFor(key) {
+  // options.since: ignore evidence before this time (e.g. before Auto was
+  // enabled). A portion straddling it is a truncated edge and is excluded.
+  function levelFor(key, { since = -Infinity } = {}) {
     const estimator = estimators.get(key)
-    const frames = (recent.get(key) || []).filter(frame => clock - frame.at <= 30000)
-    const portions = []
-    for (let index = 0; index + 20 <= frames.length; index++) {
-      if (frames[index].sequence % 20 !== 1) continue
-      const portion = frames.slice(index, index + 20)
-      const sorted = portion.map(frame => frame.db).sort((a, b) => a - b)
-      portions.push({ db: sorted.slice(2, 18).reduce((sum, db) => sum + db, 0) / 16,
-        since: portion[0].at, until: portion.at(-1).at })
-      index += 19
+    const frames = (recent.get(key) || []).filter(frame => clock - frame.at <= AUTO_HORIZON_MS && frame.at >= since)
+    const groups = new Map()
+    for (const frame of frames) {
+      if (!groups.has(frame.portion)) groups.set(frame.portion, [])
+      groups.get(frame.portion).push(frame.db)
     }
-    const summaries = portions.map(portion => portion.db).sort((a, b) => a - b)
-    const middle = summaries.length >> 1
-    const ready = portions.length >= 3 && portions.at(-1).until - portions[0].since >= 4000
-    const autoDb = !ready ? null : summaries.length % 2 ? summaries[middle] : (summaries[middle - 1] + summaries[middle]) / 2
+    const portions = []
+    for (const [portion, values] of groups) {
+      const support = portion.support
+      // Never reuse a truncated edge as a new, conveniently rephased vote.
+      if (!portion.closed || values.length !== portion.count || values.length < 3 || support < 600) continue
+      values.sort((a, b) => a - b)
+      const trim = Math.floor(values.length / 10)
+      const core = values.slice(trim, values.length - trim)
+      portions.push({ db: core.reduce((sum, db) => sum + db, 0) / core.length,
+        support, count: values.length })
+    }
+    // Natural speech portions vary by several dB (live calls: MAD 2-3.4 dB),
+    // so agreement of individual portions is not the right confidence test.
+    // Instead: drop robust outliers (coughs, laughs, brief bursts: >3 robust
+    // SD from the duration-weighted median), then estimate the level as the
+    // duration-weighted MEAN of the remaining portions and require that mean
+    // to be precise. A mean, unlike a median, does not flip between modes of
+    // alternating loud/quiet passages as old evidence rolls out, so brief
+    // periodic dynamics cannot produce corrections. Not speaker-intent inference.
+    const center0 = weightedMedian(portions)
+    const scale0 = Math.max(2, 1.4826 * median(portions.map(p => Math.abs(p.db - center0))))
+    const totalSupport = portions.reduce((sum, p) => sum + p.support, 0)
+    const typical = portions.filter(p => Math.abs(p.db - center0) <= 3 * scale0)
+    // Outliers are a small minority by definition; never discard a whole
+    // regime of bimodal speech (that would report one mode as the level).
+    const agreeing = typical.reduce((sum, p) => sum + p.support, 0) * 4 >= totalSupport * 3 ? typical : portions
+    const support = agreeing.reduce((sum, p) => sum + p.support, 0)
+    const inlierFrames = agreeing.reduce((sum, p) => sum + p.count, 0)
+    const center = support > 0 ? agreeing.reduce((sum, p) => sum + p.db * p.support, 0) / support : NaN
+    // Standard error of the mean of independent portion summaries.
+    const variance = agreeing.length > 1
+      ? agreeing.reduce((sum, p) => sum + (p.db - center) ** 2, 0) / (agreeing.length - 1) : Infinity
+    const standardError = Math.sqrt(variance / agreeing.length)
+    // Preserve six nominal seconds (60 x 100 ms), not sixty callbacks.
+    // 24 observations is the minimum at the bounded 250 ms support cadence.
+    const ready = agreeing.length >= 3 && inlierFrames >= 24 && support >= 6000
+      && Number.isFinite(center) && standardError <= AUTO_MAX_STANDARD_ERROR_DB
+    const autoDb = ready ? center : null
     return {
       liveDb: live?.key === key ? live.db : null,
       typicalDb: estimator ? estimator.typicalDb : null,
       frames: estimator ? estimator.frames : 0,
-      autoDb, autoSpread: ready ? summaries.at(-1) - summaries[0] : Infinity,
+      // Reported spread is the 95% interval width of the level estimate.
+      autoDb, autoSpread: ready ? 2 * 1.96 * standardError : Infinity,
+      // False while the newest completed portion is excluded as an outlier:
+      // a sustained change starts as outliers, so the stale level must not act.
+      autoLatestAgrees: ready && agreeing.includes(portions.at(-1)),
+      autoSupportMs: support, autoInlierFrames: inlierFrames, autoInlierPortions: agreeing.length,
       autoPortions: portions.length, autoFrames: frames.length, autoSince: frames[0]?.at ?? null, sampledAt: frames.at(-1)?.at ?? null
     }
   }
@@ -165,6 +250,7 @@ export function createParticipantLevelMeter({
   function reset() {
     estimators.clear()
     recent.clear()
+    openPortions.clear()
     live = null
     settleKey = null
     settleSince = 0

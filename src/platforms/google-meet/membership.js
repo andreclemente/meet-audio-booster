@@ -91,8 +91,9 @@ function passesDiscovery(map, ids, isParticipantModel) {
 // Trust rules (documented policy):
 // - a walk that finishes with ids yields the candidate only when exactly one
 //   distinct Map passes the discovery check; zero or several => untrusted;
-// - a walk without tile ids (all tiles hidden) only re-checks that the current
-//   Map is still reachable; an unfinished walk drops it;
+// - verified discovery-only ids may seed membership before tile admission;
+//   without any such ids a walk only re-checks the current Map's reachability;
+//   an unfinished walk drops it;
 // - every key is validated once (bounded per tick); trust requires all keys
 //   validated, and any failing entry drops the Map;
 // - each tick, every tile-resolved id must be a key and, while the level Map
@@ -118,10 +119,16 @@ export function createMembershipTracker({ mismatchMs = MISMATCH_MS, entriesPerTi
   }
 
   // result: walk result; ids: tile ids the walk required the Map to cover.
-  function finish({ state, members, reached }, ids, tileModels, isParticipantModel) {
+  function finish({ state, members, reached }, ids, tileModels, isParticipantModel, discoveryIds = ids) {
     if (state !== 'complete') return drop()
-    if (!ids.length) { if (map && !reached.has(map)) drop(); return }
-    const found = isParticipantModel ? members.filter(candidate => passesDiscovery(candidate, ids, isParticipantModel)) : []
+    if (!discoveryIds.length) { if (map && !reached.has(map)) drop(); return }
+    // Discovery-only source models (including self) can break the admission
+    // bootstrap cycle. Require at least one matching record, not every such
+    // id: a lobby source is not membership evidence. Admitted tile ids must
+    // still ALL be covered, and uniqueness/full-record validation still apply.
+    const found = isParticipantModel ? members.filter(candidate =>
+      discoveryIds.some(id => validEntry(candidate, id, isParticipantModel)) &&
+      passesDiscovery(candidate, ids, isParticipantModel)) : []
     if (found.length !== 1) return drop()
     if (found[0] !== map) adopt(found[0], tileModels)
   }

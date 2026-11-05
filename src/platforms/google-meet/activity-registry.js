@@ -123,10 +123,11 @@ function coversIds(map, ids) {
 // Resumable, time-budgeted walk over own data properties from the anchors.
 // Collects distinct Maps whose keys cover `ids` and that satisfy the value
 // invariant (values are compared with tiles by the caller when it finishes),
-// distinct membership-shaped Maps covering `ids`, and which `targets` were
+// distinct membership-shaped Maps covering `ids` and at least one verified
+// discovery id (which need not be admitted), and which `targets` were
 // reached. step() returns 'running', 'complete' or 'incomplete' (time budget
 // or candidate cap exhausted).
-export function createRegistryWalk({ anchors, ids = [], target = null, targets = [target], clock = monotonic, sliceMs = SLICE_MS, maxSlices = MAX_SLICES }) {
+export function createRegistryWalk({ anchors, ids = [], discoveryIds = ids, target = null, targets = [target], clock = monotonic, sliceMs = SLICE_MS, maxSlices = MAX_SLICES }) {
   const visited = new Set(anchors)
   const queue = anchors.map(anchor => [anchor, 0])
   const candidates = new Set()
@@ -147,9 +148,9 @@ export function createRegistryWalk({ anchors, ids = [], target = null, targets =
     if (wanted.has(value)) reached.add(value)
     if (isSkipped(value)) return 1
     if (isMap(value)) {
-      if (!ids.length || !coversIds(value, ids)) return 1 + ids.length
-      if (readLevelRegistry(value)) candidates.add(value)
-      else if (isMembershipShaped(value)) members.add(value)
+      if (!coversIds(value, ids)) return 1 + ids.length
+      if (readLevelRegistry(value)) { if (ids.length) candidates.add(value) }
+      else if (discoveryIds.some(id => mapHas.call(value, id)) && isMembershipShaped(value)) members.add(value)
       else return 1 + mapSize.call(value)
       if (candidates.size > MAX_CANDIDATES || members.size > MAX_CANDIDATES) state = 'incomplete'
       return mapSize.call(value)
@@ -246,9 +247,9 @@ export function createActivityRegistry({ discoveryMs = DISCOVERY_MS, mismatchMs 
     if (values && compareWithTiles(values, tileLevels).positive) trust(now)
   }
 
-  function finish({ purpose, target, run, ids }, now, tileLevels, tileModels, isParticipantModel) {
+  function finish({ purpose, target, run, ids }, now, tileLevels, tileModels, isParticipantModel, discoveryIds, discoveryModels) {
     const result = run.result()
-    membership.finish(result, ids, tileModels, isParticipantModel)
+    membership.finish(result, ids, [...tileModels, ...discoveryModels], isParticipantModel, discoveryIds)
     if (purpose === 'members') return
     const { state, candidates, reachedTarget } = result
     const found = state === 'complete' && tileLevels.size ? agreeing(candidates, tileLevels) : []
@@ -265,10 +266,12 @@ export function createActivityRegistry({ discoveryMs = DISCOVERY_MS, mismatchMs 
   }
 
   // selfLevels: local participant id -> local tile level, a cross-check only.
+  // discoveryIds/Models: identity-verified membership-only anchors. They do
+  // not supply tileLevels or relax the level registry's positive cross-check.
   // isParticipantModel(value, id): the tile path's identity check (null while
   // no activity getter is known). Returns the trusted registry values for
   // this tick, or null.
-  function update({ now, tileLevels, tileModels, selfLevels = new Map(), isParticipantModel = null }) {
+  function update({ now, tileLevels, tileModels, selfLevels = new Map(), isParticipantModel = null, discoveryIds = [...tileLevels.keys()], discoveryModels = [] }) {
     let values = map ? readLevelRegistry(map) : null
     if (map && !values) drop()
     const checked = map
@@ -289,25 +292,26 @@ export function createActivityRegistry({ discoveryMs = DISCOVERY_MS, mismatchMs 
     // An untrusted candidate is re-checked by discovery too, so a second
     // agreeing Map appearing later makes the choice ambiguous again.
     const ids = [...tileLevels.keys()]
-    const discovering = (!trusted || !membership.map) && ids.length && tileModels.length && now - lastDiscovery >= discoveryMs
+    const membershipModels = [...new Set([...tileModels, ...discoveryModels])]
+    const discovering = (!trusted || !membership.map) && discoveryIds.length && membershipModels.length && now - lastDiscovery >= discoveryMs
     if (!walk && (discovering || ((trusted || membership.map) && now - lastVerify >= verifyMs))) {
       const verify = Boolean(map && trusted)
       if (discovering) lastDiscovery = now
       if (verify || !discovering) lastVerify = now
-      const roots = discovering && !verify ? tileModels : [...new Set([...tileModels, ...anchors.filter(isLive), ...membership.anchors])]
+      const roots = discovering && !verify ? membershipModels : [...new Set([...membershipModels, ...anchors.filter(isLive), ...membership.anchors])]
       const target = verify ? map : null
       // 'members': only the membership Map is re-validated by this walk.
-      walk = { purpose: verify ? 'verify' : discovering ? 'discover' : 'members', target, ids, run: createRegistryWalk({ anchors: roots, ids, target, targets: [target, membership.map], clock }) }
+      walk = { purpose: verify ? 'verify' : discovering ? 'discover' : 'members', target, ids, run: createRegistryWalk({ anchors: roots, ids, discoveryIds, target, targets: [target, membership.map], clock }) }
     }
     if (walk && walk.run.step() !== 'running') {
       const finished = walk
       walk = null
-      finish(finished, now, tileLevels, tileModels, isParticipantModel)
+      finish(finished, now, tileLevels, tileModels, isParticipantModel, discoveryIds, discoveryModels)
     }
     // One O(size) copy per tick unless a walk switched to another Map.
     if (map !== checked) values = map ? readLevelRegistry(map) : null
     const levelValues = map && trusted ? values : null
-    membership.update({ now, tileIds: ids, levelValues, tileModels, isParticipantModel })
+    membership.update({ now, tileIds: ids, levelValues, tileModels: membershipModels, isParticipantModel })
     // While the registry disagrees with the rendered tiles (tolerated for
     // mismatchMs before trust is dropped), do not route from it: the caller
     // falls back to the tile path, which reports tileless participants as

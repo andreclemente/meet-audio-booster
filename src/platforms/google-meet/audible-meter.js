@@ -6,6 +6,9 @@ import { meanSquare } from './levels.js'
 export function createAudibleMeter({ mappings, connect, disconnect }) {
   const edges = [], automated = new WeakSet()
   let revision = 0, overflow = false, probe = null, stable = null, nativeSignature = null, contractActive = false
+  // An opaque coordinate-system epoch. Only a positive static native-gain
+  // change may retain it; an unsafe intermediate transition cannot be bridged.
+  let continuity = {}, reason = 'unverified', ownership = [], positiveNative = false
   const type = node => node?.constructor?.name
   const restores = [], newSources = new WeakSet(), newGains = new WeakSet()
   const Gain = globalThis.GainNode
@@ -42,7 +45,11 @@ export function createAudibleMeter({ mappings, connect, disconnect }) {
     try { disconnect.call(probe.splitter) } catch {}
     probe = null
   }
-  function changed() { revision++; stable = null; clearProbe() }
+  function changed() { continuity = {}; reason = 'unverified'; revision++; stable = null; clearProbe() }
+  function nativeChanged(compatible) {
+    if (!compatible) { changed(); return }
+    revision++; reason = 'static-native-gain'; stable = null; clearProbe()
+  }
   function unavailable() {
     if (contractActive) { contractActive = false; changed() }
     return NaN
@@ -88,7 +95,7 @@ export function createAudibleMeter({ mappings, connect, disconnect }) {
     const gains = new Set(), terminals = new Set(), visiting = new Set()
     let valid = true
     function walk(node) {
-      if (visiting.has(node) || type(node) !== 'GainNode' || !newGains.has(node) || gains.size > 128) { valid = false; return }
+      if (visiting.has(node) || type(node) !== 'GainNode' || !newGains.has(node) || node.context !== context || gains.size > 128) { valid = false; return }
       if (gains.has(node)) return
       gains.add(node); visiting.add(node)
       const outgoing = edges.filter(e => e.source === node)
@@ -102,7 +109,7 @@ export function createAudibleMeter({ mappings, connect, disconnect }) {
       visiting.delete(node)
     }
     for (const m of active) {
-      if (m.input !== 0 || !newSources.has(m.source)) valid = false
+      if (m.input !== 0 || !newSources.has(m.source) || m.source.context !== context) valid = false
       walk(m.destination)
       if (edges.some(e => e.destination === m.source)) valid = false
       // A known stream side branch is not a hardware contribution. DOM playback
@@ -118,9 +125,29 @@ export function createAudibleMeter({ mappings, connect, disconnect }) {
     if (!(multiplier > 0) || slots.some(s => Math.abs(s.actualValue - multiplier) > 0.00001 || Math.abs(s.targetValue - multiplier) > 0.00001)) valid = false
     for (const gain of gains) if (automated.has(gain.gain) || !Number.isFinite(gain.gain.value) || edges.some(e => e.destination === gain.gain)) valid = false
     if (!valid || !terminals.size) { stable = null; clearProbe(); return unavailable() }
+    // Channel mixing changes the measured power coordinate system independently
+    // of scalar gain. Observe it on every read, before a later native gain can
+    // overwrite the reason, and fail closed on missing/invalid/throwing reads.
+    const channelContract = []
+    for (const node of new Set([context.destination, ...active.map(m => m.source), ...gains])) {
+      const { channelCount, channelCountMode, channelInterpretation } = node
+      if (!Number.isInteger(channelCount) || channelCount < 1 || channelCount > 32 ||
+        !['max', 'clamped-max', 'explicit'].includes(channelCountMode) ||
+        !['speakers', 'discrete'].includes(channelInterpretation)) return unavailable()
+      channelContract.push(node, channelCount, channelCountMode, channelInterpretation)
+    }
+    const nextOwnership = [context, ...channelContract, ...slots,
+      ...active.flatMap(m => [m.source, m.destination, m.booster, m.output, m.input]), ...gains, ...terminals]
+    if (nextOwnership.length !== ownership.length || nextOwnership.some((v, i) => v !== ownership[i])) {
+      ownership = nextOwnership; changed()
+    }
     if (!contractActive) { contractActive = true; changed() }
     const nextNative = [...gains].map(g => g.gain.value).join(':')
-    if (nativeSignature !== nextNative) { nativeSignature = nextNative; changed() }
+    const nextPositive = [...gains].every(g => g.gain.value > 0)
+    if (nativeSignature !== nextNative) {
+      nativeSignature = nextNative; nativeChanged(positiveNative && nextPositive)
+    }
+    positiveNative = nextPositive
     const signature = [revision, multiplier, nextNative].join(':')
     const now = context.currentTime
     if (!stable || stable.signature !== signature) { stable = { signature, at: now }; return NaN }
@@ -145,7 +172,12 @@ export function createAudibleMeter({ mappings, connect, disconnect }) {
     if (now - probe.at < 0.1) return NaN
     let power = 0
     for (const { analyser, buffer } of probe.analysers) { analyser.getFloatTimeDomainData(buffer); power += meanSquare(buffer) }
-    return power / (multiplier * multiplier)
+    const normalized = power / (multiplier * multiplier)
+    return Number.isFinite(normalized) ? normalized : unavailable()
   }
-  return { connected, disconnected, read, changed, get generation() { return revision }, dispose() { clearProbe(); for (const restore of restores.reverse()) restore(); edges.length = 0 } }
+  return { connected, disconnected, read(slots) {
+    try { return read(slots) } catch { return unavailable() }
+  }, changed, get generation() { return revision },
+    get continuity() { return { token: continuity, reason, generation: revision } },
+    dispose() { contractActive = false; changed(); for (const restore of restores.reverse()) restore(); edges.length = 0 } }
 }

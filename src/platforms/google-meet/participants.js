@@ -15,17 +15,31 @@ function ownIcons(root) {
   return icons
 }
 
+// Some layouts (e.g. a 1:1 call's large tile) draw the mic indicator as an
+// inline SVG instead of an icon ligature. Material mic / mic_off geometry is
+// identical in every UI language.
+const MICROPHONE_PATH_PREFIXES = ['M12 14c1.66 0 3-1.34 3-3V5', 'M19 11h-1.7c0 .74-.16 1.43-.43 2.05']
+
+function hasOwnMicrophonePath(root) {
+  for (const path of root?.querySelectorAll?.('svg path') || []) {
+    if (path.closest && path.closest('[data-participant-id]') !== root) continue
+    const d = (path.getAttribute?.('d') || '').replace(/\s+/g, ' ').trim()
+    if (MICROPHONE_PATH_PREFIXES.some(prefix => d.startsWith(prefix))) return true
+  }
+  return false
+}
+
 // Every person's tile shows a microphone indicator; a screen share never does.
 // Language-independent, and present before a share's own controls render.
 export function hasMicrophoneIndicator(root) {
   const icons = ownIcons(root)
-  return [...MICROPHONE_ICONS].some(icon => icons.has(icon))
+  return [...MICROPHONE_ICONS].some(icon => icons.has(icon)) || hasOwnMicrophonePath(root)
 }
 
 export function isPresentationRoot(root) {
   if (!root?.getAttribute?.('data-participant-id')) return false
+  if (hasMicrophoneIndicator(root)) return false
   const icons = ownIcons(root)
-  if ([...MICROPHONE_ICONS].some(icon => icons.has(icon))) return false
   return [...PRESENTATION_ICONS].some(icon => icons.has(icon))
 }
 

@@ -26,7 +26,12 @@ export function createState(storage = globalThis.localStorage) {
 export function upsertParticipant(state, data) {
   const existing = state.participants.get(data.key)
   if (existing) {
-    existing.name = data.name || existing.name
+    if (data.name && data.name !== existing.name) {
+      existing.name = data.name
+      // The saved volume is looked up by name for a new id (rejoin). If the
+      // first read name was wrong, follow the rename until anything changes it.
+      if (!existing.adjusted) existing.value = getParticipantGain(state.settings, existing)
+    }
     existing.present = data.present ?? existing.present
     existing.speaking = data.speaking ?? existing.speaking
     existing.lastSeenAt = data.lastSeenAt ?? Date.now()

@@ -35,8 +35,8 @@ if (detectPlatform() === 'google-meet' && !globalThis.__meetingAudioBoosterInsta
   function applyGain(participant, value, { automatic = false } = {}) {
     if (!automatic) panel.stopAuto()
     participant.value = Number.isFinite(value) ? Math.min(6, Math.max(0, value)) : 1
+    participant.adjusted = true // manual or automatic: a later rename never replaces it
     if (!automatic) {
-      panel.noteManual(participant, participant.value)
       setParticipantGain(state.settings, participant, participant.value)
       saveSettings(globalThis.localStorage, state.settings)
     }
@@ -46,7 +46,7 @@ if (detectPlatform() === 'google-meet' && !globalThis.__meetingAudioBoosterInsta
   const panel = createPanelController(state, {
     participants: () => visibleParticipants(state),
     // In-memory pre-volume levels from the controller; never persisted.
-    levels: key => platformController?.levelFor?.(key) ?? null,
+    levels: (key, options) => platformController?.levelFor?.(key, options) ?? null,
     onGain: applyGain,
     onCollapse: collapsed => { state.settings.collapsed = collapsed; saveSettings(globalThis.localStorage, state.settings) },
     onSave: position => { state.settings.position = position; saveSettings(globalThis.localStorage, state.settings) }

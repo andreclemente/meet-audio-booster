@@ -61,13 +61,18 @@ export function extractNameFromParticipantRoot(root) {
   // Meet's own control labels/tooltips in this tile, in whatever language the
   // UI uses: text equal to one of them is a control, not a person.
   const controlLabels = new Set()
+  // Only this tile's own elements: a nested tile (e.g. the self thumbnail
+  // during a layout change) must never lend its name or labels.
+  const ownElement = element => !element.closest || element.closest('[data-participant-id]') === root
   for (const element of root.querySelectorAll?.('[aria-label], [data-tooltip]') || []) {
+    if (!ownElement(element)) continue
     for (const attr of ['aria-label', 'data-tooltip']) {
       const value = cleanName(element.getAttribute?.(attr)).toLocaleLowerCase()
       if (value) controlLabels.add(value)
     }
   }
   for (const element of candidates) {
+    if (!ownElement(element)) continue
     if (!element.matches?.(PARTICIPANT_NAME_SELECTORS)) continue
     if (element.matches?.('button, [role="button"], [aria-hidden="true"]')) continue
     const name = extractCandidateName(element)

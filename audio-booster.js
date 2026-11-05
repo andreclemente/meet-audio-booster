@@ -169,7 +169,10 @@
   function upsertParticipant(state, data) {
     const existing = state.participants.get(data.key);
     if (existing) {
-      existing.name = data.name || existing.name;
+      if (data.name && data.name !== existing.name) {
+        existing.name = data.name;
+        if (!existing.adjusted) existing.value = getParticipantGain(state.settings, existing);
+      }
       existing.present = data.present ?? existing.present;
       existing.speaking = data.speaking ?? existing.speaking;
       existing.lastSeenAt = data.lastSeenAt ?? Date.now();
@@ -266,13 +269,16 @@
     if (!root?.getAttribute?.("data-participant-id")) return null;
     const candidates = root.querySelectorAll?.(PARTICIPANT_NAME_SELECTORS) || [];
     const controlLabels = /* @__PURE__ */ new Set();
+    const ownElement = (element) => !element.closest || element.closest("[data-participant-id]") === root;
     for (const element of root.querySelectorAll?.("[aria-label], [data-tooltip]") || []) {
+      if (!ownElement(element)) continue;
       for (const attr of ["aria-label", "data-tooltip"]) {
         const value = cleanName(element.getAttribute?.(attr)).toLocaleLowerCase();
         if (value) controlLabels.add(value);
       }
     }
     for (const element of candidates) {
+      if (!ownElement(element)) continue;
       if (!element.matches?.(PARTICIPANT_NAME_SELECTORS)) continue;
       if (element.matches?.('button, [role="button"], [aria-hidden="true"]')) continue;
       const name = extractCandidateName(element);
@@ -296,14 +302,23 @@
     }
     return icons;
   }
+  var MICROPHONE_PATH_PREFIXES = ["M12 14c1.66 0 3-1.34 3-3V5", "M19 11h-1.7c0 .74-.16 1.43-.43 2.05"];
+  function hasOwnMicrophonePath(root) {
+    for (const path of root?.querySelectorAll?.("svg path") || []) {
+      if (path.closest && path.closest("[data-participant-id]") !== root) continue;
+      const d = (path.getAttribute?.("d") || "").replace(/\s+/g, " ").trim();
+      if (MICROPHONE_PATH_PREFIXES.some((prefix) => d.startsWith(prefix))) return true;
+    }
+    return false;
+  }
   function hasMicrophoneIndicator(root) {
     const icons = ownIcons(root);
-    return [...MICROPHONE_ICONS].some((icon) => icons.has(icon));
+    return [...MICROPHONE_ICONS].some((icon) => icons.has(icon)) || hasOwnMicrophonePath(root);
   }
   function isPresentationRoot(root) {
     if (!root?.getAttribute?.("data-participant-id")) return false;
+    if (hasMicrophoneIndicator(root)) return false;
     const icons = ownIcons(root);
-    if ([...MICROPHONE_ICONS].some((icon) => icons.has(icon))) return false;
     return [...PRESENTATION_ICONS].some((icon) => icons.has(icon));
   }
   function isLocalPresentationRoot(root) {
@@ -573,6 +588,26 @@
   var LEVEL_WARMUP_FRAMES = 30;
   var LEVEL_SETTLE_MS = 250;
   var LEVEL_WINDOW_FRAMES = 300;
+  var AUTO_HORIZON_MS = 18e4;
+  var AUTO_MAX_FRAMES = 120;
+  var AUTO_MAX_STANDARD_ERROR_DB = 1.5;
+  var AUTO_MAX_SPREAD_DB = 2 * 1.96 * AUTO_MAX_STANDARD_ERROR_DB;
+  function median(values) {
+    if (!values.length) return NaN;
+    const sorted = [...values].sort((a, b) => a - b), middle = sorted.length >> 1;
+    return sorted.length % 2 ? sorted[middle] : (sorted[middle - 1] + sorted[middle]) / 2;
+  }
+  function weightedMedian(portions) {
+    const ordered = [...portions].sort((a, b) => a.db - b.db);
+    const total = ordered.reduce((sum, p) => sum + p.support, 0);
+    let cumulative = 0;
+    for (let i = 0; i < ordered.length; i++) {
+      cumulative += ordered[i].support;
+      if (cumulative < total / 2) continue;
+      return cumulative === total / 2 && ordered[i + 1] ? (ordered[i].db + ordered[i + 1].db) / 2 : ordered[i].db;
+    }
+    return NaN;
+  }
   function meanSquare(buffer) {
     if (!buffer?.length) return 0;
     let sum = 0;
@@ -641,6 +676,12 @@
   } = {}) {
     const estimators = /* @__PURE__ */ new Map();
     const recent = /* @__PURE__ */ new Map();
+    const openPortions = /* @__PURE__ */ new Map();
+    function closePortion(key) {
+      const portion = openPortions.get(key);
+      if (portion) portion.closed = true;
+      openPortions.delete(key);
+    }
     let clock = 0;
     let lastSampleAt = -Infinity;
     let settleKey = null;
@@ -650,7 +691,10 @@
       if (!estimators.size) return;
       const present = participantKeys instanceof Set ? participantKeys : new Set(participantKeys || []);
       for (const key of estimators.keys()) if (!present.has(key)) estimators.delete(key);
-      for (const key of recent.keys()) if (!present.has(key)) recent.delete(key);
+      for (const key of recent.keys()) if (!present.has(key)) {
+        recent.delete(key);
+        openPortions.delete(key);
+      }
       if (live && !present.has(live.key)) live = null;
     }
     function tick({ now, participantKeys, attributedKey = null, readPower }) {
@@ -658,6 +702,7 @@
       clock = now;
       prune(participantKeys);
       if (attributedKey !== settleKey) {
+        closePortion(settleKey);
         settleKey = attributedKey;
         settleSince = now;
       }
@@ -667,44 +712,80 @@
       live = null;
       if (!attributedKey || now - settleSince < settleMs) return false;
       const db = powerToDb(readPower());
-      if (!(db >= noiseFloorDb)) return false;
+      if (!(db >= noiseFloorDb)) {
+        closePortion(attributedKey);
+        return false;
+      }
       live = { key: attributedKey, db: Math.min(db, 0) };
       let estimator = estimators.get(attributedKey);
       if (!estimator) estimators.set(attributedKey, estimator = createTypicalLevelEstimator({ warmupFrames, window }));
       estimator.add(live.db);
       let frames = recent.get(attributedKey) || [];
-      if (frames.length && now - frames.at(-1).at > 15e3) frames = [];
-      frames = frames.filter((frame) => now - frame.at <= 3e4);
-      frames.push({ at: now, db: live.db, sequence: (frames.at(-1)?.sequence || 0) + 1 });
-      if (frames.length > 120) frames.shift();
+      frames = frames.filter((frame) => now - frame.at <= AUTO_HORIZON_MS);
+      let portion = openPortions.get(attributedKey);
+      if (portion && now - portion.until > 350) {
+        closePortion(attributedKey);
+        portion = null;
+      }
+      if (!portion) {
+        portion = { since: now, until: now, support: 0, count: 0, closed: false };
+        openPortions.set(attributedKey, portion);
+      }
+      portion.support += Math.min(250, now - portion.until);
+      portion.until = now;
+      portion.count++;
+      frames.push({ at: now, db: live.db, portion });
+      if (now - portion.since >= 1900) closePortion(attributedKey);
+      if (frames.length > AUTO_MAX_FRAMES) frames.shift();
       recent.set(attributedKey, frames);
       return true;
     }
-    function levelFor(key) {
+    function levelFor(key, { since = -Infinity } = {}) {
       const estimator = estimators.get(key);
-      const frames = (recent.get(key) || []).filter((frame) => clock - frame.at <= 3e4);
-      const portions = [];
-      for (let index = 0; index + 20 <= frames.length; index++) {
-        if (frames[index].sequence % 20 !== 1) continue;
-        const portion = frames.slice(index, index + 20);
-        const sorted = portion.map((frame) => frame.db).sort((a, b) => a - b);
-        portions.push({
-          db: sorted.slice(2, 18).reduce((sum, db) => sum + db, 0) / 16,
-          since: portion[0].at,
-          until: portion.at(-1).at
-        });
-        index += 19;
+      const frames = (recent.get(key) || []).filter((frame) => clock - frame.at <= AUTO_HORIZON_MS && frame.at >= since);
+      const groups = /* @__PURE__ */ new Map();
+      for (const frame of frames) {
+        if (!groups.has(frame.portion)) groups.set(frame.portion, []);
+        groups.get(frame.portion).push(frame.db);
       }
-      const summaries = portions.map((portion) => portion.db).sort((a, b) => a - b);
-      const middle = summaries.length >> 1;
-      const ready = portions.length >= 3 && portions.at(-1).until - portions[0].since >= 4e3;
-      const autoDb = !ready ? null : summaries.length % 2 ? summaries[middle] : (summaries[middle - 1] + summaries[middle]) / 2;
+      const portions = [];
+      for (const [portion, values] of groups) {
+        const support2 = portion.support;
+        if (!portion.closed || values.length !== portion.count || values.length < 3 || support2 < 600) continue;
+        values.sort((a, b) => a - b);
+        const trim = Math.floor(values.length / 10);
+        const core = values.slice(trim, values.length - trim);
+        portions.push({
+          db: core.reduce((sum, db) => sum + db, 0) / core.length,
+          support: support2,
+          count: values.length
+        });
+      }
+      const center0 = weightedMedian(portions);
+      const scale0 = Math.max(2, 1.4826 * median(portions.map((p) => Math.abs(p.db - center0))));
+      const totalSupport = portions.reduce((sum, p) => sum + p.support, 0);
+      const typical = portions.filter((p) => Math.abs(p.db - center0) <= 3 * scale0);
+      const agreeing2 = typical.reduce((sum, p) => sum + p.support, 0) * 4 >= totalSupport * 3 ? typical : portions;
+      const support = agreeing2.reduce((sum, p) => sum + p.support, 0);
+      const inlierFrames = agreeing2.reduce((sum, p) => sum + p.count, 0);
+      const center = support > 0 ? agreeing2.reduce((sum, p) => sum + p.db * p.support, 0) / support : NaN;
+      const variance = agreeing2.length > 1 ? agreeing2.reduce((sum, p) => sum + (p.db - center) ** 2, 0) / (agreeing2.length - 1) : Infinity;
+      const standardError = Math.sqrt(variance / agreeing2.length);
+      const ready = agreeing2.length >= 3 && inlierFrames >= 24 && support >= 6e3 && Number.isFinite(center) && standardError <= AUTO_MAX_STANDARD_ERROR_DB;
+      const autoDb = ready ? center : null;
       return {
         liveDb: live?.key === key ? live.db : null,
         typicalDb: estimator ? estimator.typicalDb : null,
         frames: estimator ? estimator.frames : 0,
+        // Reported spread is the 95% interval width of the level estimate.
         autoDb,
-        autoSpread: ready ? summaries.at(-1) - summaries[0] : Infinity,
+        autoSpread: ready ? 2 * 1.96 * standardError : Infinity,
+        // False while the newest completed portion is excluded as an outlier:
+        // a sustained change starts as outliers, so the stale level must not act.
+        autoLatestAgrees: ready && agreeing2.includes(portions.at(-1)),
+        autoSupportMs: support,
+        autoInlierFrames: inlierFrames,
+        autoInlierPortions: agreeing2.length,
         autoPortions: portions.length,
         autoFrames: frames.length,
         autoSince: frames[0]?.at ?? null,
@@ -714,6 +795,7 @@
     function reset() {
       estimators.clear();
       recent.clear();
+      openPortions.clear();
       live = null;
       settleKey = null;
       settleSince = 0;
@@ -726,6 +808,7 @@
   function createAudibleMeter({ mappings, connect, disconnect }) {
     const edges = [], automated = /* @__PURE__ */ new WeakSet();
     let revision = 0, overflow = false, probe = null, stable = null, nativeSignature = null, contractActive = false;
+    let continuity = {}, reason = "unverified", ownership = [], positiveNative = false;
     const type = (node) => node?.constructor?.name;
     const restores = [], newSources = /* @__PURE__ */ new WeakSet(), newGains = /* @__PURE__ */ new WeakSet();
     const Gain = globalThis.GainNode;
@@ -814,7 +897,19 @@
       probe = null;
     }
     function changed() {
+      continuity = {};
+      reason = "unverified";
       revision++;
+      stable = null;
+      clearProbe();
+    }
+    function nativeChanged(compatible) {
+      if (!compatible) {
+        changed();
+        return;
+      }
+      revision++;
+      reason = "static-native-gain";
       stable = null;
       clearProbe();
     }
@@ -864,7 +959,7 @@
       const gains = /* @__PURE__ */ new Set(), terminals = /* @__PURE__ */ new Set(), visiting = /* @__PURE__ */ new Set();
       let valid = true;
       function walk(node) {
-        if (visiting.has(node) || type(node) !== "GainNode" || !newGains.has(node) || gains.size > 128) {
+        if (visiting.has(node) || type(node) !== "GainNode" || !newGains.has(node) || node.context !== context || gains.size > 128) {
           valid = false;
           return;
         }
@@ -885,7 +980,7 @@
         visiting.delete(node);
       }
       for (const m of active) {
-        if (m.input !== 0 || !newSources.has(m.source)) valid = false;
+        if (m.input !== 0 || !newSources.has(m.source) || m.source.context !== context) valid = false;
         walk(m.destination);
         if (edges.some((e) => e.destination === m.source)) valid = false;
         for (const e of edges.filter((e2) => e2.source === m.source)) {
@@ -901,15 +996,35 @@
         clearProbe();
         return unavailable();
       }
+      const channelContract = [];
+      for (const node of /* @__PURE__ */ new Set([context.destination, ...active.map((m) => m.source), ...gains])) {
+        const { channelCount, channelCountMode, channelInterpretation } = node;
+        if (!Number.isInteger(channelCount) || channelCount < 1 || channelCount > 32 || !["max", "clamped-max", "explicit"].includes(channelCountMode) || !["speakers", "discrete"].includes(channelInterpretation)) return unavailable();
+        channelContract.push(node, channelCount, channelCountMode, channelInterpretation);
+      }
+      const nextOwnership = [
+        context,
+        ...channelContract,
+        ...slots,
+        ...active.flatMap((m) => [m.source, m.destination, m.booster, m.output, m.input]),
+        ...gains,
+        ...terminals
+      ];
+      if (nextOwnership.length !== ownership.length || nextOwnership.some((v, i) => v !== ownership[i])) {
+        ownership = nextOwnership;
+        changed();
+      }
       if (!contractActive) {
         contractActive = true;
         changed();
       }
       const nextNative = [...gains].map((g) => g.gain.value).join(":");
+      const nextPositive = [...gains].every((g) => g.gain.value > 0);
       if (nativeSignature !== nextNative) {
         nativeSignature = nextNative;
-        changed();
+        nativeChanged(positiveNative && nextPositive);
       }
+      positiveNative = nextPositive;
       const signature = [revision, multiplier, nextNative].join(":");
       const now = context.currentTime;
       if (!stable || stable.signature !== signature) {
@@ -945,15 +1060,33 @@
         analyser.getFloatTimeDomainData(buffer);
         power += meanSquare(buffer);
       }
-      return power / (multiplier * multiplier);
+      const normalized = power / (multiplier * multiplier);
+      return Number.isFinite(normalized) ? normalized : unavailable();
     }
-    return { connected, disconnected, read, changed, get generation() {
-      return revision;
-    }, dispose() {
-      clearProbe();
-      for (const restore of restores.reverse()) restore();
-      edges.length = 0;
-    } };
+    return {
+      connected,
+      disconnected,
+      read(slots) {
+        try {
+          return read(slots);
+        } catch {
+          return unavailable();
+        }
+      },
+      changed,
+      get generation() {
+        return revision;
+      },
+      get continuity() {
+        return { token: continuity, reason, generation: revision };
+      },
+      dispose() {
+        contractActive = false;
+        changed();
+        for (const restore of restores.reverse()) restore();
+        edges.length = 0;
+      }
+    };
   }
 
   // src/platforms/google-meet/audio-worklet.js
@@ -1650,13 +1783,13 @@
       map = candidate;
       anchors = tileModels.slice(0, 64);
     }
-    function finish({ state, members, reached }, ids, tileModels, isParticipantModel) {
+    function finish({ state, members, reached }, ids, tileModels, isParticipantModel, discoveryIds = ids) {
       if (state !== "complete") return drop();
-      if (!ids.length) {
+      if (!discoveryIds.length) {
         if (map && !reached.has(map)) drop();
         return;
       }
-      const found = isParticipantModel ? members.filter((candidate) => passesDiscovery(candidate, ids, isParticipantModel)) : [];
+      const found = isParticipantModel ? members.filter((candidate) => discoveryIds.some((id) => validEntry(candidate, id, isParticipantModel)) && passesDiscovery(candidate, ids, isParticipantModel)) : [];
       if (found.length !== 1) return drop();
       if (found[0] !== map) adopt(found[0], tileModels);
     }
@@ -1829,7 +1962,7 @@
       return false;
     }
   }
-  function createRegistryWalk({ anchors, ids = [], target = null, targets = [target], clock = monotonic, sliceMs = SLICE_MS, maxSlices = MAX_SLICES }) {
+  function createRegistryWalk({ anchors, ids = [], discoveryIds = ids, target = null, targets = [target], clock = monotonic, sliceMs = SLICE_MS, maxSlices = MAX_SLICES }) {
     const visited = new Set(anchors);
     const queue = anchors.map((anchor) => [anchor, 0]);
     const candidates = /* @__PURE__ */ new Set();
@@ -1852,9 +1985,10 @@
       if (wanted.has(value)) reached.add(value);
       if (isSkipped(value)) return 1;
       if (isMap(value)) {
-        if (!ids.length || !coversIds(value, ids)) return 1 + ids.length;
-        if (readLevelRegistry(value)) candidates.add(value);
-        else if (isMembershipShaped(value)) members.add(value);
+        if (!coversIds(value, ids)) return 1 + ids.length;
+        if (readLevelRegistry(value)) {
+          if (ids.length) candidates.add(value);
+        } else if (discoveryIds.some((id) => mapHas2.call(value, id)) && isMembershipShaped(value)) members.add(value);
         else return 1 + mapSize2.call(value);
         if (candidates.size > MAX_CANDIDATES || members.size > MAX_CANDIDATES) state = "incomplete";
         return mapSize2.call(value);
@@ -1936,9 +2070,9 @@
       const values = readLevelRegistry(map);
       if (values && compareWithTiles(values, tileLevels).positive) trust(now);
     }
-    function finish({ purpose, target, run, ids }, now, tileLevels, tileModels, isParticipantModel) {
+    function finish({ purpose, target, run, ids }, now, tileLevels, tileModels, isParticipantModel, discoveryIds, discoveryModels) {
       const result = run.result();
-      membership.finish(result, ids, tileModels, isParticipantModel);
+      membership.finish(result, ids, [...tileModels, ...discoveryModels], isParticipantModel, discoveryIds);
       if (purpose === "members") return;
       const { state, candidates, reachedTarget } = result;
       const found = state === "complete" && tileLevels.size ? agreeing(candidates, tileLevels) : [];
@@ -1951,7 +2085,7 @@
       const values = readLevelRegistry(map);
       if (found.length > 1 && values && compareWithTiles(values, tileLevels).positive) drop();
     }
-    function update({ now, tileLevels, tileModels, selfLevels = /* @__PURE__ */ new Map(), isParticipantModel = null }) {
+    function update({ now, tileLevels, tileModels, selfLevels = /* @__PURE__ */ new Map(), isParticipantModel = null, discoveryIds = [...tileLevels.keys()], discoveryModels = [] }) {
       let values = map ? readLevelRegistry(map) : null;
       if (map && !values) drop();
       const checked = map;
@@ -1970,23 +2104,24 @@
         } else if (!anchors.some(isLive2)) drop();
       }
       const ids = [...tileLevels.keys()];
-      const discovering = (!trusted || !membership.map) && ids.length && tileModels.length && now - lastDiscovery >= discoveryMs;
+      const membershipModels = [.../* @__PURE__ */ new Set([...tileModels, ...discoveryModels])];
+      const discovering = (!trusted || !membership.map) && discoveryIds.length && membershipModels.length && now - lastDiscovery >= discoveryMs;
       if (!walk && (discovering || (trusted || membership.map) && now - lastVerify >= verifyMs)) {
         const verify = Boolean(map && trusted);
         if (discovering) lastDiscovery = now;
         if (verify || !discovering) lastVerify = now;
-        const roots = discovering && !verify ? tileModels : [.../* @__PURE__ */ new Set([...tileModels, ...anchors.filter(isLive2), ...membership.anchors])];
+        const roots = discovering && !verify ? membershipModels : [.../* @__PURE__ */ new Set([...membershipModels, ...anchors.filter(isLive2), ...membership.anchors])];
         const target = verify ? map : null;
-        walk = { purpose: verify ? "verify" : discovering ? "discover" : "members", target, ids, run: createRegistryWalk({ anchors: roots, ids, target, targets: [target, membership.map], clock }) };
+        walk = { purpose: verify ? "verify" : discovering ? "discover" : "members", target, ids, run: createRegistryWalk({ anchors: roots, ids, discoveryIds, target, targets: [target, membership.map], clock }) };
       }
       if (walk && walk.run.step() !== "running") {
         const finished = walk;
         walk = null;
-        finish(finished, now, tileLevels, tileModels, isParticipantModel);
+        finish(finished, now, tileLevels, tileModels, isParticipantModel, discoveryIds, discoveryModels);
       }
       if (map !== checked) values = map ? readLevelRegistry(map) : null;
       const levelValues = map && trusted ? values : null;
-      membership.update({ now, tileIds: ids, levelValues, tileModels, isParticipantModel });
+      membership.update({ now, tileIds: ids, levelValues, tileModels: membershipModels, isParticipantModel });
       return mismatchSince === null ? levelValues : null;
     }
     return {
@@ -2033,6 +2168,9 @@
   var REDISCOVER_MS = 1e3;
   var GETTER_RETRY_MS = 1e3;
   var GETTER_STALE_MS = 1e4;
+  var MAX_DISCOVERY_MODELS = 64;
+  var MAX_DISCOVERY_ROOTS = 64;
+  var MAX_DISCOVERY_VALUES = 4096;
   function isObject(value) {
     return value !== null && typeof value === "object" && !Array.isArray(value) && !(typeof Node === "function" && value instanceof Node) && typeof value.nodeType !== "number";
   }
@@ -2058,10 +2196,10 @@
     const nested = [...root?.querySelectorAll?.(selector) || []];
     return [root, ...nested].slice(0, MAX_ELEMENTS_PER_ROOT);
   }
-  function holdersOf(element) {
+  function holdersOf(element, budget) {
     const holders = [];
     const models = element?.__jsmodel;
-    if (isObject(models)) for (const entry of Object.values(models)) holders.push(entry?.pending?.value);
+    if (isObject(models)) for (const entry of valuesOf(models, budget)) holders.push(entry?.pending?.value);
     holders.push(element?.__jscontroller?.pending?.value);
     return holders.filter(isObject);
   }
@@ -2109,14 +2247,25 @@
     }
     return false;
   }
-  function valuesOf(object) {
+  function valuesOf(object, budget) {
+    if (budget) return boundedValuesOf(object, budget);
     try {
       return Object.values(object);
     } catch {
       return [];
     }
   }
-  function discoverParticipantSourceModels(root, participantId, activityGetter, identityCache) {
+  function* boundedValuesOf(object, budget) {
+    try {
+      for (const key in object) {
+        if (budget.values <= 0) return;
+        budget.values--;
+        if (Object.hasOwn(object, key)) yield object[key];
+      }
+    } catch {
+    }
+  }
+  function discoverParticipantSourceModels(root, participantId, activityGetter, identityCache, budget) {
     const found = [];
     const seen = /* @__PURE__ */ new Set();
     const consider = (value) => {
@@ -2132,16 +2281,17 @@
       return true;
     };
     for (const element of elementsOf(root, "[jsmodel],[jscontroller]")) {
+      if (budget && budget.values <= 0) break;
       let holders = [];
       try {
-        holders = holdersOf(element);
+        holders = holdersOf(element, budget);
       } catch {
       }
       for (const holder of holders) {
-        for (const value of valuesOf(holder)) {
+        for (const value of valuesOf(holder, budget)) {
           if (found.length >= MAX_MODELS_PER_ROOT) return found;
           if (consider(value) || !seen.has(value)) continue;
-          for (const nested of valuesOf(value)) {
+          for (const nested of valuesOf(value, budget)) {
             if (found.length >= MAX_MODELS_PER_ROOT) return found;
             consider(nested);
           }
@@ -2181,13 +2331,14 @@
       if (participant.element && !roots.includes(participant.element)) roots.push(participant.element);
       return roots.filter((root) => root && root.isConnected !== false);
     }
-    function modelsFor(participant, roots, now) {
+    function modelsFor(participant, roots, now, budget) {
       const cached = entries.get(participant.key);
       const valid = cached?.models.filter((model) => isParticipantSourceModel(model, participant.participantId, getter, identityCache));
       if (cached && cached.participantId === participant.participantId && valid.length === cached.models.length && now - cached.discoveredAt < rediscoverMs) return valid;
       const models = [];
       for (const root of roots) {
-        for (const model of discoverParticipantSourceModels(root, participant.participantId, getter, identityCache)) {
+        if (budget && (budget.roots-- <= 0 || budget.values <= 0)) break;
+        for (const model of discoverParticipantSourceModels(root, participant.participantId, getter, identityCache, budget)) {
           if (!models.includes(model)) models.push(model);
         }
       }
@@ -2224,7 +2375,8 @@
       const tileModels = [];
       const selfTiles = [...selfIds].filter((id) => rootsByParticipantId.has(id)).map((id) => ({ key: `self:${id}`, participantId: id }));
       for (const key of entries.keys()) {
-        if (!participants.some((participant) => participant.key === key) && !selfTiles.some((item) => item.key === key)) entries.delete(key);
+        const discoveryId = key.startsWith("discovery:") ? key.slice("discovery:".length) : null;
+        if (!participants.some((participant) => participant.key === key) && !selfTiles.some((item) => item.key === key) && !(discoveryId && rootsByParticipantId.has(discoveryId))) entries.delete(key);
       }
       for (const participant of getter ? participants : []) {
         const roots = rootsFor(participant, rootsByParticipantId);
@@ -2245,9 +2397,21 @@
         const level = strongestLevel(models, getter);
         if (level !== null) selfLevels.set(self.participantId, level);
       }
+      const discoveryIds = /* @__PURE__ */ new Set();
+      const discoveryModels = [];
+      const budget = { roots: MAX_DISCOVERY_ROOTS, values: MAX_DISCOVERY_VALUES };
+      let attemptedIds = 0;
+      for (const [id, roots] of getter ? rootsByParticipantId : []) {
+        if (attemptedIds++ >= MAX_DISCOVERY_MODELS || budget.roots <= 0 || budget.values <= 0 || discoveryModels.length >= MAX_DISCOVERY_MODELS) break;
+        for (const model of modelsFor({ key: `discovery:${id}`, participantId: id }, roots, now, budget)) {
+          if (discoveryModels.length >= MAX_DISCOVERY_MODELS) break;
+          discoveryIds.add(id);
+          discoveryModels.push(model);
+        }
+      }
       if (levels.size || selfLevels.size) lastConfirmedAt = now;
       const isParticipantModel = getter ? (value, id) => isParticipantSourceModel(value, id, getter, identityCache) : null;
-      const registryValues = registry.update({ now, tileLevels, tileModels, selfLevels, isParticipantModel });
+      const registryValues = registry.update({ now, tileLevels, tileModels, selfLevels, isParticipantModel, discoveryIds: [...discoveryIds], discoveryModels });
       if (registryValues) return readRegistryActivity(registryValues, participants, known, selfIds);
       if (!getter) return unavailable(participants);
       const speakers = participants.filter((participant) => isSpeakingLevel(levels.get(participant.key)));
@@ -2279,6 +2443,57 @@
         return registry.membership.trusted;
       },
       isMember: (id) => registry.membership.has(id)
+    };
+  }
+
+  // src/platforms/google-meet/measurement-continuity.js
+  function createMeasurementContinuity() {
+    let previousGraph = [], previousGenerations = [], previous = null;
+    const same = (a, b) => a.length === b.length && a.every((value, i) => value === b[i]);
+    return function observe(g, pipelines) {
+      const graph = [g.mode, ...g.mode === "media" ? pipelines.flatMap((p) => [p, p.stream, ...p.tracks || []]) : g.slots.flatMap((s) => [s, s.tap, s.audibleMeter])];
+      const generations = g.mode === "media" ? [] : g.slots.map((s) => s.audibleMeter?.generation);
+      const sameOwners = same(graph, previousGraph);
+      if (sameOwners && same(generations, previousGenerations)) return null;
+      const meter = g.mode === "worklet" && g.slots[0]?.audibleMeter;
+      const next = meter?.continuity;
+      const compatible = sameOwners && previous?.meter === meter && g.slots.every((s) => s.audibleMeter === meter) && next?.token && next.token === previous.token && next.reason === "static-native-gain" && next.generation === meter.generation && next.generation > previous.generation;
+      previousGraph = graph;
+      previousGenerations = generations;
+      previous = next ? { meter, ...next } : null;
+      return { reason: compatible ? "compatible-native-gain" : "measurement-graph" };
+    };
+  }
+
+  // src/platforms/google-meet/row-admission.js
+  var ROW_ADMISSION_MS = 400;
+  function createRowAdmission({ minMs = ROW_ADMISSION_MS } = {}) {
+    const pending = /* @__PURE__ */ new Map();
+    let seen = /* @__PURE__ */ new Set();
+    return {
+      begin() {
+        seen = /* @__PURE__ */ new Set();
+      },
+      // True once `key` with `name` is stable; call only for keys not yet rows.
+      admit(key, name, now) {
+        seen.add(key);
+        const entry = pending.get(key);
+        if (!entry || entry.name !== name) {
+          pending.set(key, { name, since: now });
+          return false;
+        }
+        if (now - entry.since < minMs) return false;
+        pending.delete(key);
+        return true;
+      },
+      // Forget candidates that disappeared this scan, so admission restarts.
+      end() {
+        for (const key of pending.keys()) if (!seen.has(key)) pending.delete(key);
+      },
+      clear() {
+        pending.clear();
+        seen = /* @__PURE__ */ new Set();
+      }
     };
   }
 
@@ -2351,15 +2566,17 @@
   function createGoogleMeetController({ state, context, setStatus, renderSoon, updateLiveUi, onLevelSample = () => {
   }, onLevelReset = () => {
   }, onStop = () => {
-  }, mediaOwnership = installRemoteMediaOwnership() }) {
+  }, mediaOwnership = installRemoteMediaOwnership(), rowAdmissionMs } = {}) {
     const learner = createAssociationLearner();
     const alignmentTracker = createFreshAlignmentTracker();
     const media = createMediaPipelineManager(context, { accepts: (stream) => mediaOwnership.accepts(stream) });
     const workletSpeakerTracker = createWorkletSpeakerTracker();
     const nativeActivity = createNativeActivitySource();
     const levelMeter = createParticipantLevelMeter();
-    let measurementGraph = [], stopped = false;
+    const observeMeasurement = createMeasurementContinuity();
+    let stopped = false;
     const selfIds = /* @__PURE__ */ new Set(), presentationIds = /* @__PURE__ */ new Set();
+    const rowAdmission = createRowAdmission({ minMs: rowAdmissionMs });
     let restoreHook, restoreCaptureHook, observer, mutationTimer, reconcileTimer, mediaTimer, routingTimer, visibilityHandler, slotCounter = 0;
     let capturePresentationActive = false;
     let domPresentationActive = false;
@@ -2417,18 +2634,22 @@
       const now = Date.now();
       syncPresentationState();
       const found = /* @__PURE__ */ new Set();
+      rowAdmission.begin();
       for (const data of scanMeetParticipants(document, selfIds, presentationIds)) {
         if (!data.element?.getAttribute?.("data-requested-participant-id") && !nativeActivity.isMember(data.participantId)) continue;
-        if (!data.hasMicrophone && !state.participants.has(data.key)) continue;
+        if (!state.participants.has(data.key) && (!data.hasMicrophone || !rowAdmission.admit(data.key, data.name, now))) continue;
         found.add(data.key);
-        upsertParticipant(state, {
+        const before = state.participants.get(data.key)?.value;
+        const participant = upsertParticipant(state, {
           ...data,
           platform: "google-meet",
           present: true,
           lastSeenAt: now,
           extra: { participantId: data.participantId, element: data.element }
         });
+        if (before !== void 0 && participant.value !== before) applyParticipantGain(participant);
       }
+      rowAdmission.end();
       updateMissingParticipants(state.participants.values(), found, { now, selfIds, presentationIds, isMember: nativeActivity.isMember });
       const isSelfKey = (key) => selfIds.has(state.participants.get(key)?.participantId);
       if ([
@@ -2540,11 +2761,10 @@
     }
     function sampleLevels(now, activity = null) {
       const g = state.google;
-      const graph = [g.mode, ...g.mode === "media" ? media.pipelines.flatMap((pipeline) => [pipeline, pipeline.stream, ...pipeline.tracks || []]) : g.slots.flatMap((slot) => [slot, slot.tap, slot.audibleMeter, slot.audibleMeter?.generation])];
-      if (graph.length !== measurementGraph.length || graph.some((value, index) => value !== measurementGraph[index])) {
-        measurementGraph = graph;
+      const invalidation = observeMeasurement(g, media.pipelines);
+      if (invalidation) {
         levelMeter.reset();
-        onLevelReset(now);
+        onLevelReset(now, invalidation);
       }
       const attributedKey = activity && attributeLevelSample({
         available: activity.available,
@@ -2623,6 +2843,7 @@
       mediaOwnership.dispose();
       selfIds.clear();
       presentationIds.clear();
+      rowAdmission.clear();
       workletSpeakerTracker.reset();
       nativeActivity.reset();
       levelMeter.reset();
@@ -2637,7 +2858,7 @@
       route,
       applyParticipantGain,
       setOutputs,
-      levelFor: (key) => levelMeter.levelFor(key),
+      levelFor: (key, options) => levelMeter.levelFor(key, options),
       get pipelines() {
         return media.pipelines;
       }
@@ -2789,21 +3010,20 @@
   }
 
   // src/ui/auto-balance.js
+  var AUTO_TARGET_DB = -20;
   function createAutoBalance({ participants, levels, onGain }) {
     let enabled = false, startedAt = 0, targetDb = null;
-    const heard = /* @__PURE__ */ new Map(), consumed = /* @__PURE__ */ new Map(), qualification = /* @__PURE__ */ new Map();
-    const baselines = /* @__PURE__ */ new WeakMap(), automaticValues = /* @__PURE__ */ new WeakMap(), firstSeen = /* @__PURE__ */ new WeakMap();
+    const consumed = /* @__PURE__ */ new Map(), qualification = /* @__PURE__ */ new Map();
+    const firstSeen = /* @__PURE__ */ new WeakMap();
     function stop() {
       enabled = false;
       targetDb = null;
-      heard.clear();
       consumed.clear();
       qualification.clear();
     }
-    function invalidate(now) {
+    function invalidate(now, { reason } = {}) {
       startedAt = now;
-      targetDb = null;
-      heard.clear();
+      if (reason !== "compatible-native-gain") targetDb = null;
       consumed.clear();
       qualification.clear();
     }
@@ -2811,35 +3031,25 @@
       stop();
       enabled = true;
       invalidate(now);
-      for (const person of participants()) {
-        firstSeen.set(person, now);
-        if (!baselines.has(person) || person.value !== automaticValues.get(person)) baselines.set(person, person.value);
-      }
+      for (const person of participants()) firstSeen.set(person, now);
     }
     function tick(now, sampledKey) {
       if (!enabled) return;
       const present = new Map(participants().map((person2) => [person2.key, person2]));
-      for (const [key, record] of heard) {
-        if (present.get(key) !== record.person || now - record.at > 3e4 || record.person.value <= 0) heard.delete(key);
-      }
       for (const key of consumed.keys()) if (!present.has(key)) {
         consumed.delete(key);
         qualification.delete(key);
       }
       const person = present.get(sampledKey);
-      const level = person && levels(person.key);
       if (person && !firstSeen.has(person)) firstSeen.set(person, now);
-      if (!person || !(person.value > 0 && person.value <= 6) || !Number.isFinite(level?.autoDb) || level.autoFrames < 60 || !(level.autoSpread <= 4) || !Number.isFinite(level.autoSince) || level.autoSince < Math.max(startedAt, firstSeen.get(person)) || level.sampledAt !== now || now - startedAt < 1e3 || consumed.get(person.key) === now) return;
-      if (!baselines.has(person)) baselines.set(person, person.value);
-      consumed.set(person.key, now);
-      heard.set(person.key, { person, at: now, db: level.autoDb });
-      if (targetDb === null) {
-        if (heard.size < 2) return;
-        const references = [...heard.values()].filter((r) => Math.abs(baselines.get(r.person) - 1) < 1e-3).map((r) => r.db).sort((a, b) => a - b);
-        if (!references.length) return;
-        const middle = references.length >> 1;
-        targetDb = references.length % 2 ? references[middle] : (references[middle - 1] + references[middle]) / 2;
+      const level = person && levels(person.key, { since: Math.max(startedAt, firstSeen.get(person)) });
+      if (!person || !(person.value > 0 && person.value <= 6) || !Number.isFinite(level?.autoDb) || !(Number.isFinite(level.autoSupportMs) && level.autoSupportMs >= 6e3) || !(Number.isFinite(level.autoInlierFrames) && level.autoInlierFrames >= 24) || !(Number.isFinite(level.autoInlierPortions) && level.autoInlierPortions >= 3) || !(level.autoSpread <= AUTO_MAX_SPREAD_DB) || !Number.isFinite(level.autoSince) || level.autoSince < Math.max(startedAt, firstSeen.get(person)) || level.sampledAt !== now || now - startedAt < 1e3 || consumed.get(person.key) === now) {
+        if (person && level?.sampledAt === now && consumed.get(person.key) !== now) qualification.delete(person.key);
+        return;
       }
+      if (level.autoLatestAgrees !== true) return;
+      consumed.set(person.key, now);
+      if (targetDb === null) targetDb = AUTO_TARGET_DB;
       const error = targetDb - (level.autoDb + 20 * Math.log10(person.value));
       const direction = Math.sign(error);
       if (Math.abs(error) <= 3) {
@@ -2847,21 +3057,14 @@
         return;
       }
       const old = qualification.get(person.key);
-      const count = old?.person === person && old.direction === direction && now - old.at <= 15e3 ? old.count + 1 : 1;
+      const count = old?.person === person && old.direction === direction && now - old.at <= AUTO_HORIZON_MS ? old.count + 1 : 1;
       qualification.set(person.key, { person, direction, count, at: now });
       if (count < 30) return;
       const step = direction * 0.05;
       const value = Math.max(0.05, Math.min(6, person.value * 10 ** (step / 20)));
-      if (value !== person.value) {
-        automaticValues.set(person, value);
-        onGain(person, value, { automatic: true });
-      }
+      if (value !== person.value) onGain(person, value, { automatic: true });
     }
-    function noteManual(person, value) {
-      baselines.set(person, value);
-      automaticValues.delete(person);
-    }
-    return { start, stop, tick, invalidate, noteManual, get enabled() {
+    return { start, stop, tick, invalidate, get enabled() {
       return enabled;
     }, get targetDb() {
       return targetDb;
@@ -3073,7 +3276,7 @@
     function toggle() {
       state.closed ? show() : hide();
     }
-    return { render, show, hide, toggle, updateLiveUi, autoTick, stopAuto, noteManual: (person, value) => auto.noteManual(person, value), invalidateAuto: (now) => auto.invalidate(now) };
+    return { render, show, hide, toggle, updateLiveUi, autoTick, stopAuto, invalidateAuto: (now, metadata) => auto.invalidate(now, metadata) };
   }
   function recoverPosition(panel) {
     const rect = panel.getBoundingClientRect();
@@ -3200,8 +3403,8 @@
     }, applyGain = function(participant, value, { automatic = false } = {}) {
       if (!automatic) panel.stopAuto();
       participant.value = Number.isFinite(value) ? Math.min(6, Math.max(0, value)) : 1;
+      participant.adjusted = true;
       if (!automatic) {
-        panel.noteManual(participant, participant.value);
         setParticipantGain(state.settings, participant, participant.value);
         saveSettings(globalThis.localStorage, state.settings);
       }
@@ -3228,7 +3431,7 @@
     const panel = createPanelController(state, {
       participants: () => visibleParticipants(state),
       // In-memory pre-volume levels from the controller; never persisted.
-      levels: (key) => platformController?.levelFor?.(key) ?? null,
+      levels: (key, options) => platformController?.levelFor?.(key, options) ?? null,
       onGain: applyGain,
       onCollapse: (collapsed) => {
         state.settings.collapsed = collapsed;
