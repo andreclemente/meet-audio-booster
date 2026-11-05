@@ -8,7 +8,7 @@ function fixture(values=[1,1]) {
   const meter=createParticipantLevelMeter({settleMs:0})
   const auto=createAutoBalance({participants:()=>people,levels:k=>meter.levelFor(k),onGain:(p,v,o)=>{writes.push({key:p.key,from:p.value,to:v,o});p.value=v}})
   let now=0
-  function run(key,db,count=100){for(let i=0;i<count;i++){now+=100;const value=typeof db==='function'?db(i):db;const accepted=meter.tick({now,participantKeys:people.map(p=>p.key),attributedKey:value===null?null:String(key),readPower:()=>10**(value/10)});auto.tick(now,accepted?String(key):null)}}
+  function run(key,db,count=130){for(let i=0;i<count;i++){now+=100;const value=typeof db==='function'?db(i):db;const accepted=meter.tick({now,participantKeys:people.map(p=>p.key),attributedKey:value===null?null:String(key),readPower:()=>10**(value/10)});auto.tick(now,accepted?String(key):null)}}
   auto.start(now)
   return {people,writes,meter,auto,run,get now(){return now}}
 }
@@ -45,7 +45,7 @@ test('freshness, noise, reset, replacement, disabled state and reused ticks cann
 })
 test('longer robust control window expires and excludes pre-enable history',()=>{
  const f=fixture();f.run(0,-30,59);assert.equal(f.meter.levelFor('0').autoDb,null)
- f.run(0,-30,1);assert.equal(f.meter.levelFor('0').autoDb,-30)
+ f.run(0,-30,21);assert.equal(f.meter.levelFor('0').autoDb,-30)
  f.auto.start(f.now);f.run(1,-20);assert.equal(f.auto.targetDb,null)
  f.meter.tick({now:f.now+31000,participantKeys:['0','1'],readPower:()=>0});assert.equal(f.meter.levelFor('0').autoDb,null)
 })
@@ -89,14 +89,16 @@ for(const modulation of [13,20]) test(`independent portions positively qualify $
 test('confidence uses completed non-overlapping portions, then resets on a long source gap',()=>{
  const meter=createParticipantLevelMeter({settleMs:0})
  const add=(from,count,db)=>{for(let i=0;i<count;i++)meter.tick({now:from+i*100,participantKeys:['x'],attributedKey:'x',readPower:()=>10**(db/10)})}
- add(0,60,-30)
- assert.equal(meter.levelFor('x').autoPortions,3);assert.equal(meter.levelFor('x').autoSpread,0)
- add(6000,19,-20)
- assert.equal(meter.levelFor('x').autoPortions,3,'partial portion is not a fresh confidence vote')
+ add(0,80,-30)
+ assert.equal(meter.levelFor('x').autoPortions,4);assert.equal(meter.levelFor('x').autoSpread,0)
+ add(8000,19,-20)
+ assert.equal(meter.levelFor('x').autoPortions,4,'partial portion is not a fresh confidence vote')
  assert.equal(meter.levelFor('x').autoSpread,0)
- add(7900,1,-20)
- assert.equal(meter.levelFor('x').autoPortions,4);assert.equal(meter.levelFor('x').autoSpread,10)
- add(24000,1,-30)
+ add(9900,1,-20)
+ assert.equal(meter.levelFor('x').autoPortions,5)
+ assert.equal(meter.levelFor('x').autoDb,null,'newest completed portion disagrees, so stale consensus cannot authorize changes')
+ assert.equal(meter.levelFor('x').autoSpread,Infinity)
+ add(26000,1,-30)
  assert.equal(meter.levelFor('x').autoFrames,1);assert.equal(meter.levelFor('x').autoDb,null)
 })
 

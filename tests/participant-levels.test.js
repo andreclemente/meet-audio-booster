@@ -505,3 +505,30 @@ test('actual routing samples drive auto; overlap, unknown, graph mutation and te
     assert.equal(automaticWrites.length,before)
   })
 })
+
+
+test('actual controller acquires two conversational voices despite minority quiet expression', () => {
+  let auto
+  const writes = []
+  const f = controllerFixture({ onLevelSample: (now, key) => auto.tick(now, key), onLevelReset: now => auto.invalidate(now) })
+  for (const person of f.state.participants.values()) person.value = 1
+  auto = createAutoBalance({ participants: () => [...f.state.participants.values()], levels: key => f.controller.levelFor(key),
+    onGain(person, value) { writes.push([person.key, value]); person.value = value; f.controller.applyParticipantGain(person) } })
+  withClock(f.doc, setNow => {
+    auto.start(0)
+    for (let now = 0; now < 28000; now += 30) {
+      setNow(now)
+      const phase = now % 14000
+      f.a.level.value = now < 14000 ? 0.6 : 0
+      f.b.level.value = now < 14000 ? 0 : 0.6
+      // A declared settled numeric meter, NOT a native waveform or live call.
+      f.power.value = dbToPower(phase >= 4500 && phase < 6000 ? -42 : -30)
+      f.controller.route()
+    }
+    assert.equal(auto.targetDb, -30)
+    assert.deepEqual(writes, [])
+    assert.equal(f.state.google.routingState, 'confirmed-speaker')
+    f.controller.stop()
+    assert.equal(f.controller.levelFor('A').autoDb, null)
+  })
+})

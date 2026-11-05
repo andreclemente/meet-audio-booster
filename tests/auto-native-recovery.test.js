@@ -26,12 +26,12 @@ function root(id) {
   const level = { value: 0 }, model = new Model(id, level), ring = { getAttribute: () => 'ring', __jscontroller: { pending: { value: new Ring({ Aa: model }) } } }
   return { level, root: { isConnected: true, getAttribute: n => n === 'data-participant-id' ? id : null, __jsmodel: { A0Tiaf: { pending: { value: { wy: model } } } }, querySelectorAll: () => [ring], querySelector: () => null, matches: () => false } }
 }
-function scenario(change, { initialSingle = false, gaps = false, manual = false } = {}) {
+function scenario(change, { initialSingle = false, gaps = false, manual = false, durationMs = 120000, observe = null } = {}) {
   const keys = ['document', 'addEventListener', 'GainNode', 'AudioWorkletNode', 'BaseAudioContext', 'AudioContext', 'OfflineAudioContext', 'AudioParam']
   const saved = new Map(keys.map(k => [k, Object.getOwnPropertyDescriptor(globalThis, k)])), oldNow = Date.now
   let now = 0, sourcePower = 10 ** (-30 / 10), meter, controller, native, slot, panel
   const a = root('source-a'), b = root('source-b'), roots = initialSingle ? [a.root] : [a.root, b.root], writes = [], resets = []
-  let external = []
+  let external = [], qualifiedFrames = 0, confidenceLosses = 0, missingPower = 0
   const document = { activeElement: null, createElement: tag => new Element(tag, document) }
   document.documentElement = new Element('html', document)
   document.getElementById = id => [document.documentElement, ...document.documentElement.querySelectorAll('div')].find(e => e.id === id)
@@ -57,8 +57,20 @@ function scenario(change, { initialSingle = false, gaps = false, manual = false 
     slot = { gain: {}, tap: null, audibleMeter: meter, actualValue: 1, targetValue: 1, appliedMultiplier: 1, set(v) { this.actualValue = this.targetValue = this.appliedMultiplier = v }, release() { this.set(1) } }
     const people = new Map(roots.map((r, i) => { const key = i ? 'B' : 'A'; return [key, { key, participantId: i ? 'source-b' : 'source-a', element: r, name: key, platform: 'google-meet', present: true, value: 1, muted: false }] }))
     const state = { participants: people, settings: {}, closed: false, google: { slots: [slot], mediaPipelines: [], mode: 'worklet', activeParticipantKey: null, appliedParticipantKey: null, routingState: 'idle', transitionGuard: {}, routing: {}, rosterSignature: '', localPresentationActive: false } }
-    panel = createPanelController(state, { participants: () => [...people.values()], levels: k => controller.levelFor(k), onGain(p, v) { writes.push({ now, key: p.key, from: p.value, to: v }); p.value = v; controller.applyParticipantGain(p) }, onSave() {} })
-    controller = createGoogleMeetController({ state, context: {}, setStatus() {}, renderSoon() {}, updateLiveUi: panel.updateLiveUi, onLevelSample: panel.autoTick, onLevelReset(t, metadata) { resets.push({ now: t, metadata }); panel.invalidateAuto(t, metadata) } })
+    const readMeter = meter.read
+    meter.read = slots => { const power = readMeter(slots); if (!Number.isFinite(power)) missingPower++; return power }
+    panel = createPanelController(state, { participants: () => [...people.values()], levels: k => controller.levelFor(k), onGain(p, v) {
+      const write = { now, key: p.key, from: p.value, to: v, level: controller.levelFor(p.key), qualifiedFrames }
+      writes.push(write); p.value = v; controller.applyParticipantGain(p)
+      write.actualValue = slot.actualValue
+    }, onSave() {} })
+    controller = createGoogleMeetController({ state, context: {}, setStatus() {}, renderSoon() {}, updateLiveUi: panel.updateLiveUi, onLevelSample(t, key) {
+      if (key === 'A') {
+        if (Number.isFinite(controller.levelFor(key).autoDb)) qualifiedFrames++
+        else { if (qualifiedFrames) confidenceLosses++; qualifiedFrames = 0 }
+      }
+      panel.autoTick(t, key)
+    }, onLevelReset(t, metadata) { qualifiedFrames = 0; resets.push({ now: t, metadata }); panel.invalidateAuto(t, metadata) } })
     panel.render()
     const balance = state.panel.querySelectorAll('button').find(e => e.textContent === 'Auto Balance')
     balance.onclick()
@@ -66,16 +78,20 @@ function scenario(change, { initialSingle = false, gaps = false, manual = false 
     for (let i = 0; i < 4000; i++) tick(initialSingle ? 'A' : Math.floor(i / 400) % 2 ? 'B' : 'A')
     assert.equal(state.autoBalanceReady, !initialSingle, 'initial comparative target policy')
     const start = now
+    missingPower = 0; confidenceLosses = 0
     const api = { meter, context, source, native, mappings, slot, state, read: () => meter.read(state.google.slots), external: value => { external = value } }
     change(api)
     if (manual) {
       const slider = state.panel.querySelector('[data-role="slider"]')
       slider.value = '1'; slider.oninput()
     }
-    for (let i = 0; i < 4000; i++) tick(gaps && i % 100 >= 67 ? null : 'A')
+    for (let i = 0; i * 30 < durationMs; i++) {
+      tick(gaps && i % 100 >= 67 ? null : 'A')
+      if (observe) observe({ elapsedMs: now - start, value: people.get('A').value, actualValue: slot.actualValue, slider: Number(state.panel.querySelector('[data-role="slider"]').value), level: controller.levelFor('A'), writes: writes.filter(w => w.now >= start).length, missingPower, confidenceLosses })
+    }
     const dropWrites = writes.filter(w => w.now >= start)
     const slider = state.panel.querySelector('[data-role="slider"]')
-    return { writes: dropWrites, firstMs: dropWrites[0]?.now - start, value: people.get('A').value, slider: Number(slider.value), ready: state.autoBalanceReady, enabled: state.autoBalanceEnabled, level: controller.levelFor('A'), resets: resets.filter(r => r.now >= start) }
+    return { start, writes: dropWrites, firstMs: dropWrites[0]?.now - start, value: people.get('A').value, slider: Number(slider.value), ready: state.autoBalanceReady, enabled: state.autoBalanceEnabled, level: controller.levelFor('A'), resets: resets.filter(r => r.now >= start) }
   } finally {
     meter?.dispose(); Date.now = oldNow
     for (const [k, d] of saved) { if (d) Object.defineProperty(globalThis, k, d); else delete globalThis[k] }
@@ -83,11 +99,57 @@ function scenario(change, { initialSingle = false, gaps = false, manual = false 
 }
 const attenuate = ({ native }) => { native.gain.value = 10 ** (-12 / 20) }
 for (const gaps of [false, true]) test(`compatible static native attenuation recovers with only A, gaps=${gaps}`, t => {
-  const r = scenario(attenuate, { gaps })
-  t.diagnostic(JSON.stringify({ gaps, firstWriteMs: r.firstMs, writes: r.writes.length, value: r.value, slider: r.slider, autoDb: r.level.autoDb, autoFrames: r.level.autoFrames }))
+  const trace = []
+  // Confidence is deliberately re-earned after gain-settling fragments the
+  // speaking portions. Intermittent speech need not finish at exactly 120 s,
+  // but must make bounded progress and then reach and hold the SAME deadband.
+  const r = scenario(attenuate, { gaps, durationMs: gaps ? 360000 : 120000, observe(s) {
+    if (s.elapsedMs % 30000 === 0) trace.push(s)
+  } })
+  const gainDb = value => 20 * Math.log10(value)
+  // The injected source is exactly -42 dB after native attenuation. Progress
+  // remains measurable even at a checkpoint where Auto correctly abstains.
+  const errorDb = s => 12 - gainDb(s.value)
+  const at120 = trace.find(s => s.elapsedMs === 120000)
+  const lastWriteMs = r.writes.at(-1)?.now - r.start
+  t.diagnostic(JSON.stringify({ gaps, firstWriteMs: r.firstMs, lastWriteMs,
+    writes: r.writes.length, value: r.value, slider: r.slider, trace }))
   assert.ok(r.writes.length > 0, 'fresh quiet speech must correct without a second reference returning')
   assert.ok(r.firstMs >= 4000, 'fresh estimator and sustained-error qualification must still warm up')
-  assert.ok(r.value > 2.7 && r.value < 2.9)
+  assert.ok(r.firstMs <= 30000, 'first correction must not stall past 30 s')
+  assert.ok(gainDb(at120.value) >= 6, 'at least 6 dB of the 12 dB error must be removed by 120 s')
+  for (let i = 0; i < trace.length; i++) {
+    const s = trace[i]
+    assert.equal(s.slider, s.value)
+    assert.equal(s.actualValue, s.value, 'panel and settled applied gain must agree')
+    assert.ok(s.level.sampledAt >= r.start + s.elapsedMs - 3000)
+    if (i && errorDb(trace[i - 1]) > 3) {
+      assert.ok(s.value > trace[i - 1].value, 'no 30 s plateau outside the deadband')
+    }
+  }
+  for (const w of r.writes) {
+    assert.equal(w.key, 'A')
+    assert.ok(Math.abs(gainDb(w.to / w.from) - 0.05) < 1e-10, 'only monotonic 0.05 dB earned steps')
+    assert.equal(w.actualValue, w.to, 'gain callback must reach the real slot')
+    assert.equal(w.level.sampledAt, w.now, 'no writes on stale evidence')
+    assert.ok(w.level.autoSince >= r.start, 'no pre-reset evidence')
+    assert.ok(w.level.autoSupportMs >= 6000)
+    assert.ok(w.level.autoInlierFrames >= 24)
+    assert.ok(w.level.autoInlierPortions >= 3)
+    assert.ok(w.qualifiedFrames >= 30, 'fresh confidence loss must rearm sustained qualification')
+    assert.ok(-30 - (w.level.autoDb + gainDb(w.from)) > 3, 'no writes inside the deadband')
+  }
+  assert.ok(lastWriteMs <= 180000, 'deadband convergence has an explicit 180 s budget')
+  assert.ok(Math.abs(-30 - (r.level.autoDb + gainDb(r.value))) <= 3, 'same established 3 dB deadband')
+  if (gaps) {
+    assert.ok(trace.some(s => s.confidenceLosses > 0), 'exercise confidence loss and rearming')
+    assert.ok(trace.some(s => s.missingPower > 0), 'exercise native-meter settling abstentions')
+    const settled = trace.find(s => s.elapsedMs === 180000)
+    for (const s of trace.filter(s => s.elapsedMs >= 180000)) {
+      assert.equal(s.writes, settled.writes, 'no chasing after convergence through 240/360 s')
+      assert.equal(s.value, settled.value)
+    }
+  }
   assert.equal(r.slider, r.value)
   assert.equal(r.enabled, true); assert.equal(r.ready, true)
   assert.ok(r.resets.some(r => r.metadata?.reason === 'compatible-native-gain'))

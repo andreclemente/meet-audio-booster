@@ -28,8 +28,17 @@ export function createAutoBalance({ participants, levels, onGain }) {
     const level = person && levels(person.key)
     if (person && !firstSeen.has(person)) firstSeen.set(person, now)
     if (!person || !(person.value > 0 && person.value <= 6) || !Number.isFinite(level?.autoDb)
-      || level.autoFrames < 60 || !(level.autoSpread <= 4) || !Number.isFinite(level.autoSince) || level.autoSince < Math.max(startedAt, firstSeen.get(person))
-      || level.sampledAt !== now || now - startedAt < 1000 || consumed.get(person.key) === now) return
+      || !(Number.isFinite(level.autoSupportMs) && level.autoSupportMs >= 6000)
+      || !(Number.isFinite(level.autoInlierFrames) && level.autoInlierFrames >= 24)
+      || !(Number.isFinite(level.autoInlierPortions) && level.autoInlierPortions >= 3)
+      || !(level.autoSpread <= 4) || !Number.isFinite(level.autoSince) || level.autoSince < Math.max(startedAt, firstSeen.get(person))
+      || level.sampledAt !== now || now - startedAt < 1000 || consumed.get(person.key) === now) {
+      // Fresh observed loss of confidence breaks sustained-error evidence.
+      // Otherwise intermittent ready islands accumulate into a fictitious
+      // three seconds and eventually chase periodic expression.
+      if (person && level?.sampledAt === now && consumed.get(person.key) !== now) qualification.delete(person.key)
+      return
+    }
     if (!baselines.has(person)) baselines.set(person, person.value)
     consumed.set(person.key, now)
     heard.set(person.key, { person, at: now, db: level.autoDb })
