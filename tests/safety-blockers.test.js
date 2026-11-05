@@ -488,7 +488,7 @@ test('manifest metadata matches the package and product name', async () => {
 
 // Shapes from the live pt-PT capture: a screen-share tile carries the presenter's
 // name but only presentation controls; a camera tile always has a mic indicator.
-function iconTile(id, name, icons) {
+function iconTile(id, name, icons, paths = []) {
   const root = {
     innerText: name, textContent: name,
     getAttribute: attr => (attr === 'data-participant-id' || attr === 'data-requested-participant-id') ? id : null,
@@ -496,11 +496,17 @@ function iconTile(id, name, icons) {
     querySelectorAll(selector) {
       if (selector.includes('.zWGUib')) return [namedNode(name)]
       if (selector.includes('google-symbols')) return icons.map(text => ({ textContent: text, closest: () => root }))
+      if (selector === 'svg path') return paths.map(d => ({ getAttribute: attr => attr === 'd' ? d : null, closest: () => root.pathOwner ?? root }))
       return []
     }
   }
   return root
 }
+
+// Material geometry as observed live in Meet's 1:1 large tile (2026-11-05).
+const MIC_PATH = 'M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3z'
+const MIC_OFF_PATH = 'M19 11h-1.7c0 .74-.16 1.43-.43 2.05l1.23 1.23c.56-.98.9-2.09.9-3.28z'
+const VOLUME_PATH = 'M3 9v6h4l5 5V4L7 9H3zm13.5 3c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02z'
 
 test('a screen share is not a participant in any UI language, even with the presenter name', () => {
   const share = iconTile('share-id', 'André Clemente', ['keep_off', 'volume_off', 'more_vert', 'zoom_in', 'open_in_new', 'open_in_full'])
@@ -542,4 +548,22 @@ test('a share row created before its controls rendered is dropped once they appe
   assert.equal(selfIds.has('share-id'), false)
   updateMissingParticipants([row], found, { now: 1, selfIds, presentationIds, isMember: () => true })
   assert.equal(row.present, false)
+})
+
+test('a 1:1 large tile with an SVG mic indicator (no mic ligature) is a person', () => {
+  for (const d of [MIC_PATH, MIC_OFF_PATH, '  ' + MIC_PATH.replace(' ', '  ')]) {
+    const tile = iconTile('remote', 'Bea', ['devices'], [d, VOLUME_PATH])
+    assert.equal(isPresentationRoot(tile), false)
+    const doc = { querySelectorAll: selector => selector === '[data-participant-id]' ? [tile] : [] }
+    assert.deepEqual(scanMeetParticipants(doc).map(item => [item.participantId, item.hasMicrophone]), [['remote', true]])
+  }
+})
+
+test('SVG mic detection never borrows a nested tile and ignores other geometry', () => {
+  const nested = iconTile('outer', 'Bea', ['devices'], [MIC_PATH])
+  nested.pathOwner = { nested: true }
+  const volumeOnly = iconTile('share', 'Bea', ['zoom_in', 'open_in_full'], [VOLUME_PATH])
+  const doc = { querySelectorAll: selector => selector === '[data-participant-id]' ? [nested, volumeOnly] : [] }
+  assert.deepEqual(scanMeetParticipants(doc).map(item => [item.participantId, item.hasMicrophone]), [['outer', false]])
+  assert.equal(isPresentationRoot(volumeOnly), true)
 })
