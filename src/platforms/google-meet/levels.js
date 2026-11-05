@@ -25,8 +25,6 @@ export const AUTO_MAX_FRAMES = 120
 // deadband; slow 0.05 dB steps and continued refinement absorb residual error.
 export const AUTO_MAX_STANDARD_ERROR_DB = 1.5
 export const AUTO_MAX_SPREAD_DB = 2 * 1.96 * AUTO_MAX_STANDARD_ERROR_DB
-// The session comfort target locks once its references are known to +/-1 SE dB.
-export const AUTO_LOCK_SPREAD_DB = 2 * 1.96 * 1
 
 function median(values) {
   if (!values.length) return NaN

@@ -1,4 +1,5 @@
 // Deterministic scalar envelopes: no recorded audio, identities or live input.
+// Speech sits at the fixed -20 dB Auto target; dynamics are relative to it.
 // Import accepts alternate production modules for unchanged-baseline comparison.
 export function runCorpus({ createParticipantLevelMeter, createAutoBalance }, cadences = [100, 120, 200, 300]) {
   function session(step = 100, single = false) {
@@ -36,7 +37,7 @@ export function runCorpus({ createParticipantLevelMeter, createAutoBalance }, ca
     for (const rhythm of [7, 11, 17]) {
       for (const turnMs of [800, 3000, 14000]) {
         const f = session(cadence)
-        const envelope = phase => t => -30 + 8 * Math.sin((t / (cadence === 'irregular' ? 180 : cadence) + phase) * 2 * Math.PI / rhythm)
+        const envelope = phase => t => -20 + 8 * Math.sin((t / (cadence === 'irregular' ? 180 : cadence) + phase) * 2 * Math.PI / rhythm)
         for (let i = 0; i < Math.ceil(84000 / (2 * (turnMs + 400))); i++) {
           f.run('A', turnMs, envelope(i + 2)); f.run(null, 400, -70)
           f.run('B', turnMs, envelope(i + 5)); f.run(null, 400, -70)
@@ -50,18 +51,18 @@ export function runCorpus({ createParticipantLevelMeter, createAutoBalance }, ca
     for (const kind of ['cough', 'dip', 'reversal', 'periodic', 'quiet-step', 'loud-step', 'drift', 'slow-drift']) {
       const f = session(cadence)
       // Long enough even at 300 ms, but each reference remains <30 s old.
-      f.run('A', 24000, -30); f.run('B', 24000, -30)
+      f.run('A', 24000, -20); f.run('B', 24000, -20)
       const beganAt = f.now, initialWrites = f.writes.length
       if (kind === 'cough' || kind === 'dip') {
-        f.run('B', 600, kind === 'cough' ? -5 : -50); f.run('B', 24000, -30)
+        f.run('B', 600, kind === 'cough' ? 5 : -40); f.run('B', 24000, -20)
       } else if (kind === 'reversal') {
-        f.run('B', 1800, -44); f.run('B', 1800, -16); f.run('B', 24000, -30)
+        f.run('B', 1800, -34); f.run('B', 1800, -6); f.run('B', 24000, -20)
       } else if (kind === 'periodic') {
-        f.run('B', 36000, t => Math.floor(t / 2000) % 2 ? -40 : -20)
+        f.run('B', 36000, t => Math.floor(t / 2000) % 2 ? -30 : -10)
       } else if (kind === 'drift' || kind === 'slow-drift') {
-        f.run('B', 36000, t => -30 - t * (kind === 'slow-drift' ? 0.00015 : 1 / 3000))
+        f.run('B', 36000, t => -20 - t * (kind === 'slow-drift' ? 0.00015 : 1 / 3000))
       } else {
-        f.run('B', 36000, kind === 'quiet-step' ? -42 : -18)
+        f.run('B', 36000, kind === 'quiet-step' ? -32 : -8)
       }
       const first = f.writes.slice(initialWrites)[0]
       dynamics.push({ cadence, kind, ...f.result(), newWrites: f.writes.length - initialWrites,
@@ -74,7 +75,7 @@ export function runCorpus({ createParticipantLevelMeter, createAutoBalance }, ca
     for (let i = 0; i < 5; i++) {
       for (const key of kind === 'one-voice' ? ['A'] : ['A', 'B']) {
         const value = kind === 'unknown-meter' ? 'unknown' : kind === 'silence' ? -Infinity : kind === 'noise' ? -65
-          : kind === 'unstable-noise' ? t => -35 + 14 * Math.sin(t * .017) + 7 * Math.sin(t * .073) : -30
+          : kind === 'unstable-noise' ? t => -25 + 14 * Math.sin(t * .017) + 7 * Math.sin(t * .073) : -20
         f.run(key, kind === 'too-short-turns' ? 400 : 12000, value)
         f.run(null, 600, -70)
       }

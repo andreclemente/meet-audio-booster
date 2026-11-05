@@ -29,7 +29,8 @@ function root(id) {
 function scenario(change, { initialSingle = false, gaps = false, manual = false, durationMs = 120000, observe = null } = {}) {
   const keys = ['document', 'addEventListener', 'GainNode', 'AudioWorkletNode', 'BaseAudioContext', 'AudioContext', 'OfflineAudioContext', 'AudioParam']
   const saved = new Map(keys.map(k => [k, Object.getOwnPropertyDescriptor(globalThis, k)])), oldNow = Date.now
-  let now = 0, sourcePower = 10 ** (-30 / 10), meter, controller, native, slot, panel
+  // Voices start exactly at the fixed -20 dB Auto target (inside the deadband).
+  let state = null, now = 0, sourcePower = 10 ** (-20 / 10), meter, controller, native, slot, panel
   const a = root('source-a'), b = root('source-b'), roots = initialSingle ? [a.root] : [a.root, b.root], writes = [], resets = []
   let external = [], qualifiedFrames = 0, confidenceLosses = 0, missingPower = 0
   const document = { activeElement: null, createElement: tag => new Element(tag, document) }
@@ -44,7 +45,8 @@ function scenario(change, { initialSingle = false, gaps = false, manual = false,
       constructor() { this.currentTime = 0; this.destination = { channelCount: 2, channelCountMode: 'explicit', channelInterpretation: 'speakers' } }
       createGain() { return new globalThis.GainNode(this) }
       createChannelSplitter() { return {} }
-      createAnalyser() { return { getFloatTimeDomainData(buf) { buf.fill(Math.sqrt(sourcePower / 2) * native.gain.value * slot.actualValue) } } }
+      // The analyser follows the slot currently in use, as real post-gain audio does.
+      createAnalyser() { return { getFloatTimeDomainData(buf) { buf.fill(Math.sqrt(sourcePower / 2) * native.gain.value * (state?.google.slots[0] ?? slot).actualValue) } } }
     }
     Object.assign(globalThis, { document, addEventListener() {}, GainNode, AudioWorkletNode, BaseAudioContext, AudioContext: undefined, OfflineAudioContext: undefined, AudioParam })
     Date.now = () => now
@@ -56,7 +58,7 @@ function scenario(change, { initialSingle = false, gaps = false, manual = false,
     meter.connected(source, [native]); meter.connected(native, [context.destination])
     slot = { gain: {}, tap: null, audibleMeter: meter, actualValue: 1, targetValue: 1, appliedMultiplier: 1, set(v) { this.actualValue = this.targetValue = this.appliedMultiplier = v }, release() { this.set(1) } }
     const people = new Map(roots.map((r, i) => { const key = i ? 'B' : 'A'; return [key, { key, participantId: i ? 'source-b' : 'source-a', element: r, name: key, platform: 'google-meet', present: true, value: 1, muted: false }] }))
-    const state = { participants: people, settings: {}, closed: false, google: { slots: [slot], mediaPipelines: [], mode: 'worklet', activeParticipantKey: null, appliedParticipantKey: null, routingState: 'idle', transitionGuard: {}, routing: {}, rosterSignature: '', localPresentationActive: false } }
+    state = { participants: people, settings: {}, closed: false, google: { slots: [slot], mediaPipelines: [], mode: 'worklet', activeParticipantKey: null, appliedParticipantKey: null, routingState: 'idle', transitionGuard: {}, routing: {}, rosterSignature: '', localPresentationActive: false } }
     const readMeter = meter.read
     meter.read = slots => { const power = readMeter(slots); if (!Number.isFinite(power)) missingPower++; return power }
     panel = createPanelController(state, { participants: () => [...people.values()], levels: k => controller.levelFor(k), onGain(p, v) {
@@ -76,7 +78,8 @@ function scenario(change, { initialSingle = false, gaps = false, manual = false,
     balance.onclick()
     function tick(key) { a.level.value = key === 'A' ? .6 : 0; b.level.value = key === 'B' ? .6 : 0; context.currentTime = now / 1000; controller.route(); now += 30 }
     for (let i = 0; i < 4000; i++) tick(initialSingle ? 'A' : Math.floor(i / 400) % 2 ? 'B' : 'A')
-    assert.equal(state.autoBalanceReady, !initialSingle, 'initial comparative target policy')
+    assert.equal(state.autoBalanceReady, true, 'fixed target is known once a voice is confidently measured')
+    assert.equal(writes.length, 0, 'voices already at the fixed level are never adjusted')
     const start = now
     missingPower = 0; confidenceLosses = 0
     const api = { meter, context, source, native, mappings, slot, state, read: () => meter.read(state.google.slots), external: value => { external = value } }
@@ -87,11 +90,11 @@ function scenario(change, { initialSingle = false, gaps = false, manual = false,
     }
     for (let i = 0; i * 30 < durationMs; i++) {
       tick(gaps && i % 100 >= 67 ? null : 'A')
-      if (observe) observe({ elapsedMs: now - start, value: people.get('A').value, actualValue: slot.actualValue, slider: Number(state.panel.querySelector('[data-role="slider"]').value), level: controller.levelFor('A'), writes: writes.filter(w => w.now >= start).length, missingPower, confidenceLosses })
+      if (observe) observe({ ready: state.autoBalanceReady, elapsedMs: now - start, value: people.get('A').value, actualValue: slot.actualValue, slider: Number(state.panel.querySelector('[data-role="slider"]').value), level: controller.levelFor('A'), writes: writes.filter(w => w.now >= start).length, missingPower, confidenceLosses })
     }
     const dropWrites = writes.filter(w => w.now >= start)
     const slider = state.panel.querySelector('[data-role="slider"]')
-    return { start, writes: dropWrites, firstMs: dropWrites[0]?.now - start, value: people.get('A').value, slider: Number(slider.value), ready: state.autoBalanceReady, enabled: state.autoBalanceEnabled, level: controller.levelFor('A'), resets: resets.filter(r => r.now >= start) }
+    return { allWrites: writes, start, writes: dropWrites, firstMs: dropWrites[0]?.now - start, value: people.get('A').value, slider: Number(slider.value), ready: state.autoBalanceReady, enabled: state.autoBalanceEnabled, level: controller.levelFor('A'), resets: resets.filter(r => r.now >= start) }
   } finally {
     meter?.dispose(); Date.now = oldNow
     for (const [k, d] of saved) { if (d) Object.defineProperty(globalThis, k, d); else delete globalThis[k] }
@@ -107,7 +110,7 @@ for (const gaps of [false, true]) test(`compatible static native attenuation rec
     if (s.elapsedMs % 30000 === 0) trace.push(s)
   } })
   const gainDb = value => 20 * Math.log10(value)
-  // The injected source is exactly -42 dB after native attenuation. Progress
+  // The injected source is exactly -32 dB after native attenuation. Progress
   // remains measurable even at a checkpoint where Auto correctly abstains.
   const errorDb = s => 12 - gainDb(s.value)
   const at120 = trace.find(s => s.elapsedMs === 120000)
@@ -137,10 +140,10 @@ for (const gaps of [false, true]) test(`compatible static native attenuation rec
     assert.ok(w.level.autoInlierFrames >= 24)
     assert.ok(w.level.autoInlierPortions >= 3)
     assert.ok(w.qualifiedFrames >= 30, 'fresh confidence loss must rearm sustained qualification')
-    assert.ok(-30 - (w.level.autoDb + gainDb(w.from)) > 3 - 1e-6, 'no writes inside the deadband')
+    assert.ok(-20 - (w.level.autoDb + gainDb(w.from)) > 3 - 1e-6, 'no writes inside the deadband')
   }
   assert.ok(lastWriteMs <= 180000, 'deadband convergence has an explicit 180 s budget')
-  assert.ok(Math.abs(-30 - (r.level.autoDb + gainDb(r.value))) <= 3, 'same established 3 dB deadband')
+  assert.ok(Math.abs(-20 - (r.level.autoDb + gainDb(r.value))) <= 3, 'same established 3 dB deadband')
   if (gaps) {
     assert.ok(trace.some(s => s.confidenceLosses > 0), 'exercise confidence loss and rearming')
     assert.ok(trace.some(s => s.missingPower > 0), 'exercise native-meter settling abstentions')
@@ -158,7 +161,7 @@ const unsafe = {
   'arbitrary generation': a => { a.meter.changed(); attenuate(a); a.read() },
   'disconnect/reconnect before gain change': a => { a.meter.disconnected(a.native, [a.context.destination]); a.meter.connected(a.native, [a.context.destination]); attenuate(a) },
   'slot replacement': a => { a.state.google.slots = [{ ...a.slot }]; attenuate(a) },
-  'meter replacement': a => { a.slot.audibleMeter = { generation: 0, read: () => 10 ** (-42 / 10) }; attenuate(a) },
+  'meter replacement': a => { a.slot.audibleMeter = { generation: 0, read: () => 10 ** (-32 / 10) }; attenuate(a) },
   'tap replacement': a => { a.slot.tap = {}; attenuate(a) },
   'context replacement': a => { a.mappings[0].booster = { context: { ...a.context } }; attenuate(a) },
   'source ownership replacement': a => { a.mappings[0].source = {}; attenuate(a) },
@@ -218,15 +221,43 @@ unsafe['native stereo max/2 to explicit/1 before static gain'] = a => {
   assert.notEqual(a.meter.continuity.token, epoch)
   a.native.gain.value = .25; a.read()
 }
-for (const [name, change] of Object.entries(unsafe)) test(`unsafe ${name} never reuses the established target`, () => {
-  const r = scenario(change)
-  assert.equal(r.writes.length, 0)
-  assert.equal(r.ready, false)
+// The target is fixed, so nothing about it can be reused; the real invariant is
+// that an unsafe change discards meter evidence and sustained-error
+// qualification. Nothing is written until fresh, fully supported evidence from
+// after the change qualifies again, and it then converges to the same deadband.
+function assertFreshRequalification(r, { reasons }) {
+  const gainDb = value => 20 * Math.log10(value)
+  assert.ok(r.resets.some(x => reasons.includes(x.metadata?.reason)), JSON.stringify(r.resets))
+  for (const w of r.writes) {
+    const reset = Math.max(...r.resets.filter(x => x.now <= w.now).map(x => x.now))
+    assert.equal(w.key, 'A')
+    assert.ok(w.level.autoSince >= reset, 'no evidence from before the change')
+    assert.ok(w.now - reset >= 6000, 'fresh supported speech must be re-earned after the change')
+    assert.ok(w.level.autoSupportMs >= 6000)
+    assert.ok(w.level.autoInlierFrames >= 24)
+    assert.ok(w.level.autoInlierPortions >= 3)
+    assert.ok(w.qualifiedFrames >= 30, 'sustained-error qualification restarts after the change')
+    assert.equal(w.level.sampledAt, w.now, 'no writes on stale evidence')
+    assert.ok(Math.abs(gainDb(w.to / w.from) - 0.05) < 1e-10, 'only 0.05 dB boosts toward the fixed level')
+    assert.ok(-20 - (w.level.autoDb + gainDb(w.from)) > 3 - 1e-6, 'no writes inside the deadband')
+  }
+  if (r.writes.length) assert.ok(Math.abs(-20 - (r.level.autoDb + gainDb(r.value))) <= 3, 'converges to the same deadband')
+  else assert.equal(r.ready, false, 'without fresh evidence the UI keeps learning')
+}
+for (const [name, change] of Object.entries(unsafe)) test(`unsafe ${name} discards evidence; nothing is written before fresh qualification`, () => {
+  let learning = false, learnedBeforeWrite = true
+  const r = scenario(change, { observe(s) { if (!s.ready) learning = true; if (s.writes && !learning) learnedBeforeWrite = false } })
+  assert.ok(learning && learnedBeforeWrite, 'an unsafe change shows learning before any write')
+  assertFreshRequalification(r, { reasons: ['measurement-graph'] })
   assert.equal(r.enabled, true)
 })
-test('compatible change never creates an initial single-speaker target', () => {
-  const r = scenario(attenuate, { initialSingle: true })
-  assert.equal(r.writes.length, 0); assert.equal(r.ready, false)
+test('compatible change with a single speaker keeps the fixed target and recovers from fresh evidence', () => {
+  let alwaysReady = true
+  const r = scenario(attenuate, { initialSingle: true, observe(s) { if (!s.ready) alwaysReady = false } })
+  assert.ok(alwaysReady, 'compatible native gain keeps the fixed target')
+  assert.ok(r.writes.length > 0, 'a single quiet speaker is boosted')
+  assertFreshRequalification(r, { reasons: ['compatible-native-gain'] })
+  assert.equal(r.ready, true); assert.equal(r.enabled, true)
 })
 test('manual slider still cancels Auto across compatible invalidation', () => {
   const r = scenario(attenuate, { manual: true })

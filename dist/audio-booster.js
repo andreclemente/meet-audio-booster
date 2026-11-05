@@ -592,7 +592,6 @@
   var AUTO_MAX_FRAMES = 120;
   var AUTO_MAX_STANDARD_ERROR_DB = 1.5;
   var AUTO_MAX_SPREAD_DB = 2 * 1.96 * AUTO_MAX_STANDARD_ERROR_DB;
-  var AUTO_LOCK_SPREAD_DB = 2 * 1.96 * 1;
   function median(values) {
     if (!values.length) return NaN;
     const sorted = [...values].sort((a, b) => a - b), middle = sorted.length >> 1;
@@ -3011,25 +3010,20 @@
   }
 
   // src/ui/auto-balance.js
+  var AUTO_TARGET_DB = -20;
   function createAutoBalance({ participants, levels, onGain }) {
-    let enabled = false, startedAt = 0, targetDb = null, anchored = false;
-    const heard = /* @__PURE__ */ new Map(), consumed = /* @__PURE__ */ new Map(), qualification = /* @__PURE__ */ new Map();
-    const baselines = /* @__PURE__ */ new WeakMap(), automaticValues = /* @__PURE__ */ new WeakMap(), firstSeen = /* @__PURE__ */ new WeakMap();
+    let enabled = false, startedAt = 0, targetDb = null;
+    const consumed = /* @__PURE__ */ new Map(), qualification = /* @__PURE__ */ new Map();
+    const firstSeen = /* @__PURE__ */ new WeakMap();
     function stop() {
       enabled = false;
       targetDb = null;
-      anchored = false;
-      heard.clear();
       consumed.clear();
       qualification.clear();
     }
     function invalidate(now, { reason } = {}) {
       startedAt = now;
-      if (reason !== "compatible-native-gain") {
-        targetDb = null;
-        anchored = false;
-      } else if (targetDb !== null) anchored = true;
-      heard.clear();
+      if (reason !== "compatible-native-gain") targetDb = null;
       consumed.clear();
       qualification.clear();
     }
@@ -3037,17 +3031,11 @@
       stop();
       enabled = true;
       invalidate(now);
-      for (const person of participants()) {
-        firstSeen.set(person, now);
-        if (!baselines.has(person) || person.value !== automaticValues.get(person)) baselines.set(person, person.value);
-      }
+      for (const person of participants()) firstSeen.set(person, now);
     }
     function tick(now, sampledKey) {
       if (!enabled) return;
       const present = new Map(participants().map((person2) => [person2.key, person2]));
-      for (const [key, record] of heard) {
-        if (present.get(key) !== record.person || now - record.at > AUTO_HORIZON_MS || record.person.value <= 0) heard.delete(key);
-      }
       for (const key of consumed.keys()) if (!present.has(key)) {
         consumed.delete(key);
         qualification.delete(key);
@@ -3060,18 +3048,8 @@
         return;
       }
       if (level.autoLatestAgrees !== true) return;
-      if (!baselines.has(person)) baselines.set(person, person.value);
       consumed.set(person.key, now);
-      heard.set(person.key, { person, at: now, db: level.autoDb, spread: level.autoSpread });
-      if (targetDb === null || !anchored) {
-        const references = heard.size < 2 ? [] : [...heard.values()].filter((r) => Math.abs(baselines.get(r.person) - 1) < 1e-3).sort((a, b) => a.db - b.db);
-        if (references.length) {
-          const middle = references.length >> 1;
-          targetDb = references.length % 2 ? references[middle].db : (references[middle - 1].db + references[middle].db) / 2;
-          if (references.length >= 2 && references.every((r) => r.spread <= AUTO_LOCK_SPREAD_DB)) anchored = true;
-        }
-        if (targetDb === null) return;
-      }
+      if (targetDb === null) targetDb = AUTO_TARGET_DB;
       const error = targetDb - (level.autoDb + 20 * Math.log10(person.value));
       const direction = Math.sign(error);
       if (Math.abs(error) <= 3) {
@@ -3084,17 +3062,9 @@
       if (count < 30) return;
       const step = direction * 0.05;
       const value = Math.max(0.05, Math.min(6, person.value * 10 ** (step / 20)));
-      if (value !== person.value) {
-        anchored = true;
-        automaticValues.set(person, value);
-        onGain(person, value, { automatic: true });
-      }
+      if (value !== person.value) onGain(person, value, { automatic: true });
     }
-    function noteManual(person, value) {
-      baselines.set(person, value);
-      automaticValues.delete(person);
-    }
-    return { start, stop, tick, invalidate, noteManual, get enabled() {
+    return { start, stop, tick, invalidate, get enabled() {
       return enabled;
     }, get targetDb() {
       return targetDb;
@@ -3306,7 +3276,7 @@
     function toggle() {
       state.closed ? show() : hide();
     }
-    return { render, show, hide, toggle, updateLiveUi, autoTick, stopAuto, noteManual: (person, value) => auto.noteManual(person, value), invalidateAuto: (now, metadata) => auto.invalidate(now, metadata) };
+    return { render, show, hide, toggle, updateLiveUi, autoTick, stopAuto, invalidateAuto: (now, metadata) => auto.invalidate(now, metadata) };
   }
   function recoverPosition(panel) {
     const rect = panel.getBoundingClientRect();
@@ -3435,7 +3405,6 @@
       participant.value = Number.isFinite(value) ? Math.min(6, Math.max(0, value)) : 1;
       participant.adjusted = true;
       if (!automatic) {
-        panel.noteManual(participant, participant.value);
         setParticipantGain(state.settings, participant, participant.value);
         saveSettings(globalThis.localStorage, state.settings);
       }

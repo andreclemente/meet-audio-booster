@@ -355,12 +355,14 @@ test('actual hook slots with no source taps can drive controller/auto using a de
           setNow(t)
           f.a.level.value = t < 12000 ? 0.6 : 0
           f.b.level.value = t < 12000 ? 0 : 0.6
-          f.power.value = dbToPower(t < 12000 ? -40 : -20)
+          // A sits at the fixed -20 dB target; B is 10 dB too loud.
+          f.power.value = dbToPower(t < 12000 ? -20 : -10)
           f.controller.route()
         }
         assert.ok(reads > 60)
         assert.ok(Number.isFinite(f.controller.levelFor('B').autoDb))
         assert.ok(automaticWrites.some(([key]) => key === 'B'))
+        assert.ok(automaticWrites.every(([key, value]) => key === 'B' && value < 1), 'only the loud voice is reduced')
         // Generation belongs to the independent meter even when every tap is null.
         numericMeter.generation++
         setNow(24000); f.controller.route()
@@ -485,9 +487,11 @@ test('actual routing samples drive auto; overlap, unknown, graph mutation and te
   withClock(f.doc,setNow=>{
     auto.start(0)
     const run=(from,to)=>{for(let t=from;t<to;t+=30){setNow(t);f.controller.route()}}
-    f.a.level.value=0.6;f.power.value=dbToPower(-40);run(0,12000)
-    f.a.level.value=0;f.b.level.value=0.6;f.power.value=dbToPower(-20);run(12000,24000)
+    // A at the fixed -20 dB target is untouched; B 10 dB louder is reduced.
+    f.a.level.value=0.6;f.power.value=dbToPower(-20);run(0,12000)
+    f.a.level.value=0;f.b.level.value=0.6;f.power.value=dbToPower(-10);run(12000,24000)
     assert.ok(automaticWrites.some(([k])=>k==='B'))
+    assert.ok(automaticWrites.every(([k,v])=>k==='B'&&v<1))
     const before=automaticWrites.length
     f.a.level.value=0.6;run(24000,26000)
     assert.equal(automaticWrites.length,before,'overlap')
@@ -507,7 +511,7 @@ test('actual routing samples drive auto; overlap, unknown, graph mutation and te
 })
 
 
-test('actual controller acquires two conversational voices despite minority quiet expression', () => {
+test('actual controller acquires two conversational voices at the fixed level despite minority quiet expression', () => {
   let auto
   const writes = []
   const f = controllerFixture({ onLevelSample: (now, key) => auto.tick(now, key), onLevelReset: now => auto.invalidate(now) })
@@ -522,10 +526,10 @@ test('actual controller acquires two conversational voices despite minority quie
       f.a.level.value = now < 14000 ? 0.6 : 0
       f.b.level.value = now < 14000 ? 0 : 0.6
       // A declared settled numeric meter, NOT a native waveform or live call.
-      f.power.value = dbToPower(phase >= 4500 && phase < 6000 ? -42 : -30)
+      f.power.value = dbToPower(phase >= 4500 && phase < 6000 ? -32 : -20)
       f.controller.route()
     }
-    assert.equal(auto.targetDb, -30)
+    assert.equal(auto.targetDb, -20)
     assert.deepEqual(writes, [])
     assert.equal(f.state.google.routingState, 'confirmed-speaker')
     f.controller.stop()

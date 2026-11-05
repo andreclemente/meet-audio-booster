@@ -36,10 +36,11 @@ test('policy consumes explicit support, never legacy frame count or missing meta
     const people = ['A','B'].map(key=>({key,value:1}));let now=1000
     const auto=createAutoBalance({participants:()=>people,levels:()=>({autoDb:-30,autoFrames:120,
       autoSupportMs:6000,autoInlierFrames:24,autoInlierPortions:3,autoLatestAgrees:true,autoSpread:0,autoSince:0,sampledAt:now,...bad}),onGain:()=>assert.fail('unexpected write')})
-    auto.start(0);auto.tick(now,'A');now+=100;auto.tick(now,'B');assert.equal(auto.targetDb,null)
+    // -30 dB is 10 dB from the fixed target: sustained valid evidence would write.
+    auto.start(0);for(let i=0;i<40;i++){auto.tick(now,'A');now+=100;auto.tick(now,'B');now+=100};assert.equal(auto.targetDb,null)
   }
   const people=['A','B'].map(key=>({key,value:1}));let now=1000
   const auto=createAutoBalance({participants:()=>people,levels:()=>({autoDb:-30,autoFrames:24,
     autoSupportMs:6000,autoInlierFrames:24,autoInlierPortions:3,autoLatestAgrees:true,autoSpread:0,autoSince:0,sampledAt:now}),onGain:()=>assert.fail('unexpected write')})
-  auto.start(0);auto.tick(now,'A');now+=100;auto.tick(now,'B');assert.equal(auto.targetDb,-30)
+  auto.start(0);auto.tick(now,'A');now+=100;auto.tick(now,'B');assert.equal(auto.targetDb,-20)
 })

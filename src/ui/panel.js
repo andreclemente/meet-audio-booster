@@ -185,7 +185,7 @@ export function createPanelController(state, { participants, levels = () => null
   function show() { state.closed = false; render(); if (state.panel) state.panel.style.display = 'block' }
   function hide() { state.closed = true; if (state.panel) state.panel.style.display = 'none' }
   function toggle() { state.closed ? show() : hide() }
-  return { render, show, hide, toggle, updateLiveUi, autoTick, stopAuto, noteManual: (person, value) => auto.noteManual(person, value), invalidateAuto: (now, metadata) => auto.invalidate(now, metadata) }
+  return { render, show, hide, toggle, updateLiveUi, autoTick, stopAuto, invalidateAuto: (now, metadata) => auto.invalidate(now, metadata) }
 }
 
 function recoverPosition(panel) {
