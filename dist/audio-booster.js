@@ -914,10 +914,15 @@
         clearProbe();
         return unavailable();
       }
+      const channelContract = [];
+      for (const node of /* @__PURE__ */ new Set([context.destination, ...active.map((m) => m.source), ...gains])) {
+        const { channelCount, channelCountMode, channelInterpretation } = node;
+        if (!Number.isInteger(channelCount) || channelCount < 1 || channelCount > 32 || !["max", "clamped-max", "explicit"].includes(channelCountMode) || !["speakers", "discrete"].includes(channelInterpretation)) return unavailable();
+        channelContract.push(node, channelCount, channelCountMode, channelInterpretation);
+      }
       const nextOwnership = [
         context,
-        context.destination,
-        context.destination.channelCount,
+        ...channelContract,
         ...slots,
         ...active.flatMap((m) => [m.source, m.destination, m.booster, m.output, m.input]),
         ...gains,
@@ -2082,6 +2087,8 @@
   var GETTER_RETRY_MS = 1e3;
   var GETTER_STALE_MS = 1e4;
   var MAX_DISCOVERY_MODELS = 64;
+  var MAX_DISCOVERY_ROOTS = 64;
+  var MAX_DISCOVERY_VALUES = 4096;
   function isObject(value) {
     return value !== null && typeof value === "object" && !Array.isArray(value) && !(typeof Node === "function" && value instanceof Node) && typeof value.nodeType !== "number";
   }
@@ -2107,10 +2114,10 @@
     const nested = [...root?.querySelectorAll?.(selector) || []];
     return [root, ...nested].slice(0, MAX_ELEMENTS_PER_ROOT);
   }
-  function holdersOf(element) {
+  function holdersOf(element, budget) {
     const holders = [];
     const models = element?.__jsmodel;
-    if (isObject(models)) for (const entry of Object.values(models)) holders.push(entry?.pending?.value);
+    if (isObject(models)) for (const entry of valuesOf(models, budget)) holders.push(entry?.pending?.value);
     holders.push(element?.__jscontroller?.pending?.value);
     return holders.filter(isObject);
   }
@@ -2158,14 +2165,25 @@
     }
     return false;
   }
-  function valuesOf(object) {
+  function valuesOf(object, budget) {
+    if (budget) return boundedValuesOf(object, budget);
     try {
       return Object.values(object);
     } catch {
       return [];
     }
   }
-  function discoverParticipantSourceModels(root, participantId, activityGetter, identityCache) {
+  function* boundedValuesOf(object, budget) {
+    try {
+      for (const key in object) {
+        if (budget.values <= 0) return;
+        budget.values--;
+        if (Object.hasOwn(object, key)) yield object[key];
+      }
+    } catch {
+    }
+  }
+  function discoverParticipantSourceModels(root, participantId, activityGetter, identityCache, budget) {
     const found = [];
     const seen = /* @__PURE__ */ new Set();
     const consider = (value) => {
@@ -2181,16 +2199,17 @@
       return true;
     };
     for (const element of elementsOf(root, "[jsmodel],[jscontroller]")) {
+      if (budget && budget.values <= 0) break;
       let holders = [];
       try {
-        holders = holdersOf(element);
+        holders = holdersOf(element, budget);
       } catch {
       }
       for (const holder of holders) {
-        for (const value of valuesOf(holder)) {
+        for (const value of valuesOf(holder, budget)) {
           if (found.length >= MAX_MODELS_PER_ROOT) return found;
           if (consider(value) || !seen.has(value)) continue;
-          for (const nested of valuesOf(value)) {
+          for (const nested of valuesOf(value, budget)) {
             if (found.length >= MAX_MODELS_PER_ROOT) return found;
             consider(nested);
           }
@@ -2230,13 +2249,14 @@
       if (participant.element && !roots.includes(participant.element)) roots.push(participant.element);
       return roots.filter((root) => root && root.isConnected !== false);
     }
-    function modelsFor(participant, roots, now) {
+    function modelsFor(participant, roots, now, budget) {
       const cached = entries.get(participant.key);
       const valid = cached?.models.filter((model) => isParticipantSourceModel(model, participant.participantId, getter, identityCache));
       if (cached && cached.participantId === participant.participantId && valid.length === cached.models.length && now - cached.discoveredAt < rediscoverMs) return valid;
       const models = [];
       for (const root of roots) {
-        for (const model of discoverParticipantSourceModels(root, participant.participantId, getter, identityCache)) {
+        if (budget && (budget.roots-- <= 0 || budget.values <= 0)) break;
+        for (const model of discoverParticipantSourceModels(root, participant.participantId, getter, identityCache, budget)) {
           if (!models.includes(model)) models.push(model);
         }
       }
@@ -2297,9 +2317,11 @@
       }
       const discoveryIds = /* @__PURE__ */ new Set();
       const discoveryModels = [];
+      const budget = { roots: MAX_DISCOVERY_ROOTS, values: MAX_DISCOVERY_VALUES };
+      let attemptedIds = 0;
       for (const [id, roots] of getter ? rootsByParticipantId : []) {
-        if (discoveryModels.length >= MAX_DISCOVERY_MODELS) break;
-        for (const model of modelsFor({ key: `discovery:${id}`, participantId: id }, roots, now)) {
+        if (attemptedIds++ >= MAX_DISCOVERY_MODELS || budget.roots <= 0 || budget.values <= 0 || discoveryModels.length >= MAX_DISCOVERY_MODELS) break;
+        for (const model of modelsFor({ key: `discovery:${id}`, participantId: id }, roots, now, budget)) {
           if (discoveryModels.length >= MAX_DISCOVERY_MODELS) break;
           discoveryIds.add(id);
           discoveryModels.push(model);

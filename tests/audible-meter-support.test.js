@@ -5,10 +5,10 @@ import { createAudibleMeter } from '../src/platforms/google-meet/audible-meter.j
 function fixture(run) {
   const keys = ['GainNode', 'AudioWorkletNode', 'BaseAudioContext', 'AudioContext', 'OfflineAudioContext', 'AudioParam', 'MediaStream', 'document']
   const saved = new Map(keys.map(key => [key, Object.getOwnPropertyDescriptor(globalThis, key)]))
-  class GainNode { constructor(context) { this.context = context; this.gain = { value: 1 } } }
-  class AudioWorkletNode { constructor(context) { this.context = context } }
+  class GainNode { constructor(context) { Object.assign(this, { context, gain: { value: 1 }, channelCount: 2, channelCountMode: 'max', channelInterpretation: 'speakers' }) } }
+  class AudioWorkletNode { constructor(context) { Object.assign(this, { context, channelCount: 2, channelCountMode: 'max', channelInterpretation: 'speakers' }) } }
   class BaseAudioContext {
-    constructor() { this.currentTime = 0; this.destination = { channelCount: 1 } }
+    constructor() { this.currentTime = 0; this.destination = { channelCount: 1, channelCountMode: 'explicit', channelInterpretation: 'speakers' } }
     createGain() { return new globalThis.GainNode(this) }
     createChannelSplitter() { return { context: this } }
     createAnalyser() { return { getFloatTimeDomainData(buffer) { buffer.fill(0.25) } } }

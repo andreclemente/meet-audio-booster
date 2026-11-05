@@ -314,6 +314,36 @@ test('identity cache is rebuilt when a stale getter is rediscovered', () => {
   }
 })
 
+for (const repeatedId of [false, true]) test(`zero-match discovery caps attempted roots, repeated id=${repeatedId}`, () => {
+  const anchor = nativeRoot('anchor'), source = createNativeActivitySource()
+  source.read([], documentWith(anchor.root), 0)
+  let scans = 0
+  const roots = Array.from({ length: 2000 }, (_, i) => ({
+    isConnected: true,
+    getAttribute: () => repeatedId ? 'invalid' : `invalid-${i}`,
+    querySelectorAll() { scans++; return [] }
+  }))
+  const r = source.read([], documentWith(...roots), 2000)
+  assert.equal(r.available, false)
+  assert.equal(source.membershipTrusted, false)
+  assert.ok(scans > 0 && scans <= 64, `attempted ${scans} roots`)
+})
+
+test('zero-match discovery bounds candidate identity work inside a single root', () => {
+  const anchor = nativeRoot('anchor'), source = createNativeActivitySource()
+  source.read([], documentWith(anchor.root), 0)
+  let reads = 0
+  const holder = {}
+  for (let i = 0; i < 20000; i++) Object.defineProperty(holder, `candidate${i}`, {
+    enumerable: true, get() { reads++; return new BuildOneModel('wrong-id', 'wrong-media', { value: 0 }) }
+  })
+  const root = { isConnected: true, getAttribute: () => 'invalid', querySelectorAll: () => [],
+    __jsmodel: { model: { pending: { value: holder } } } }
+  source.read([], documentWith(root), 2000)
+  assert.ok(reads > 0 && reads <= 4096, `read ${reads} candidate values`)
+  assert.equal(source.membershipTrusted, false)
+})
+
 test('a participant temporarily hidden by Meet keeps their measured level', () => {
   const a = nativeRoot('device-a', { level: { value: 0.6 } })
   const b = nativeRoot('device-b', { level: { value: 0 } })

@@ -125,7 +125,18 @@ export function createAudibleMeter({ mappings, connect, disconnect }) {
     if (!(multiplier > 0) || slots.some(s => Math.abs(s.actualValue - multiplier) > 0.00001 || Math.abs(s.targetValue - multiplier) > 0.00001)) valid = false
     for (const gain of gains) if (automated.has(gain.gain) || !Number.isFinite(gain.gain.value) || edges.some(e => e.destination === gain.gain)) valid = false
     if (!valid || !terminals.size) { stable = null; clearProbe(); return unavailable() }
-    const nextOwnership = [context, context.destination, context.destination.channelCount, ...slots,
+    // Channel mixing changes the measured power coordinate system independently
+    // of scalar gain. Observe it on every read, before a later native gain can
+    // overwrite the reason, and fail closed on missing/invalid/throwing reads.
+    const channelContract = []
+    for (const node of new Set([context.destination, ...active.map(m => m.source), ...gains])) {
+      const { channelCount, channelCountMode, channelInterpretation } = node
+      if (!Number.isInteger(channelCount) || channelCount < 1 || channelCount > 32 ||
+        !['max', 'clamped-max', 'explicit'].includes(channelCountMode) ||
+        !['speakers', 'discrete'].includes(channelInterpretation)) return unavailable()
+      channelContract.push(node, channelCount, channelCountMode, channelInterpretation)
+    }
+    const nextOwnership = [context, ...channelContract, ...slots,
       ...active.flatMap(m => [m.source, m.destination, m.booster, m.output, m.input]), ...gains, ...terminals]
     if (nextOwnership.length !== ownership.length || nextOwnership.some((v, i) => v !== ownership[i])) {
       ownership = nextOwnership; changed()

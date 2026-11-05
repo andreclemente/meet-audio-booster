@@ -25,6 +25,8 @@ const REDISCOVER_MS = 1000
 const GETTER_RETRY_MS = 1000
 const GETTER_STALE_MS = 10000
 const MAX_DISCOVERY_MODELS = 64
+const MAX_DISCOVERY_ROOTS = 64
+const MAX_DISCOVERY_VALUES = 4096
 
 function isObject(value) {
   return value !== null && typeof value === 'object' && !Array.isArray(value) &&
@@ -52,10 +54,10 @@ function elementsOf(root, selector) {
   return [root, ...nested].slice(0, MAX_ELEMENTS_PER_ROOT)
 }
 
-function holdersOf(element) {
+function holdersOf(element, budget) {
   const holders = []
   const models = element?.__jsmodel
-  if (isObject(models)) for (const entry of Object.values(models)) holders.push(entry?.pending?.value)
+  if (isObject(models)) for (const entry of valuesOf(models, budget)) holders.push(entry?.pending?.value)
   holders.push(element?.__jscontroller?.pending?.value)
   return holders.filter(isObject)
 }
@@ -108,11 +110,23 @@ export function isParticipantSourceModel(value, participantId, activityGetter, i
   return false
 }
 
-function valuesOf(object) {
+function valuesOf(object, budget) {
+  if (budget) return boundedValuesOf(object, budget)
   try { return Object.values(object) } catch { return [] }
 }
 
-export function discoverParticipantSourceModels(root, participantId, activityGetter, identityCache) {
+function* boundedValuesOf(object, budget) {
+  // Do not eagerly invoke every foreign getter before applying the work cap.
+  try {
+    for (const key in object) {
+      if (budget.values <= 0) return
+      budget.values--
+      if (Object.hasOwn(object, key)) yield object[key]
+    }
+  } catch {}
+}
+
+export function discoverParticipantSourceModels(root, participantId, activityGetter, identityCache, budget) {
   const found = []
   const seen = new Set()
   const consider = value => {
@@ -125,14 +139,15 @@ export function discoverParticipantSourceModels(root, participantId, activityGet
     return true
   }
   for (const element of elementsOf(root, '[jsmodel],[jscontroller]')) {
+    if (budget && budget.values <= 0) break
     let holders = []
-    try { holders = holdersOf(element) } catch {}
+    try { holders = holdersOf(element, budget) } catch {}
     for (const holder of holders) {
-      for (const value of valuesOf(holder)) {
+      for (const value of valuesOf(holder, budget)) {
         if (found.length >= MAX_MODELS_PER_ROOT) return found
         if (consider(value) || !seen.has(value)) continue
         // Controllers hold models one level deeper (e.g. a view-model holder).
-        for (const nested of valuesOf(value)) {
+        for (const nested of valuesOf(value, budget)) {
           if (found.length >= MAX_MODELS_PER_ROOT) return found
           consider(nested)
         }
@@ -182,7 +197,7 @@ export function createNativeActivitySource({ rediscoverMs = REDISCOVER_MS } = {}
     return roots.filter(root => root && root.isConnected !== false)
   }
 
-  function modelsFor(participant, roots, now) {
+  function modelsFor(participant, roots, now, budget) {
     const cached = entries.get(participant.key)
     const valid = cached?.models.filter(model => isParticipantSourceModel(model, participant.participantId, getter, identityCache))
     // Reuse the last discovery (including an empty one) for a short while, so a
@@ -191,7 +206,8 @@ export function createNativeActivitySource({ rediscoverMs = REDISCOVER_MS } = {}
       now - cached.discoveredAt < rediscoverMs) return valid
     const models = []
     for (const root of roots) {
-      for (const model of discoverParticipantSourceModels(root, participant.participantId, getter, identityCache)) {
+      if (budget && (budget.roots-- <= 0 || budget.values <= 0)) break
+      for (const model of discoverParticipantSourceModels(root, participant.participantId, getter, identityCache, budget)) {
         if (!models.includes(model)) models.push(model)
       }
     }
@@ -256,9 +272,13 @@ export function createNativeActivitySource({ rediscoverMs = REDISCOVER_MS } = {}
     // registry trust. A lobby root may have a model without being a member.
     const discoveryIds = new Set()
     const discoveryModels = []
+    // Count attempts, not only successful matches: malformed/unrelated roots
+    // must not make the membership-bootstrap search unbounded.
+    const budget = { roots: MAX_DISCOVERY_ROOTS, values: MAX_DISCOVERY_VALUES }
+    let attemptedIds = 0
     for (const [id, roots] of getter ? rootsByParticipantId : []) {
-      if (discoveryModels.length >= MAX_DISCOVERY_MODELS) break
-      for (const model of modelsFor({ key: `discovery:${id}`, participantId: id }, roots, now)) {
+      if (attemptedIds++ >= MAX_DISCOVERY_MODELS || budget.roots <= 0 || budget.values <= 0 || discoveryModels.length >= MAX_DISCOVERY_MODELS) break
+      for (const model of modelsFor({ key: `discovery:${id}`, participantId: id }, roots, now, budget)) {
         if (discoveryModels.length >= MAX_DISCOVERY_MODELS) break
         discoveryIds.add(id)
         discoveryModels.push(model)

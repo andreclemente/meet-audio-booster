@@ -38,13 +38,13 @@ function scenario(change, { initialSingle = false, gaps = false, manual = false 
   document.querySelectorAll = s => s === '[data-participant-id]' ? roots : s === 'audio,video' ? external : []
   try {
     class AudioParam { constructor() { this.value = 1 } setValueAtTime(v) { this.value = v } }
-    class GainNode { constructor(context) { this.context = context; this.gain = new AudioParam() } }
-    class AudioWorkletNode { constructor(context) { this.context = context } }
+    class GainNode { constructor(context) { Object.assign(this, { context, gain: new AudioParam(), channelCount: 2, channelCountMode: 'max', channelInterpretation: 'speakers' }) } }
+    class AudioWorkletNode { constructor(context) { Object.assign(this, { context, channelCount: 2, channelCountMode: 'max', channelInterpretation: 'speakers' }) } }
     class BaseAudioContext {
-      constructor() { this.currentTime = 0; this.destination = { channelCount: 1 } }
+      constructor() { this.currentTime = 0; this.destination = { channelCount: 2, channelCountMode: 'explicit', channelInterpretation: 'speakers' } }
       createGain() { return new globalThis.GainNode(this) }
       createChannelSplitter() { return {} }
-      createAnalyser() { return { getFloatTimeDomainData(buf) { buf.fill(Math.sqrt(sourcePower) * native.gain.value * slot.actualValue) } } }
+      createAnalyser() { return { getFloatTimeDomainData(buf) { buf.fill(Math.sqrt(sourcePower / 2) * native.gain.value * slot.actualValue) } } }
     }
     Object.assign(globalThis, { document, addEventListener() {}, GainNode, AudioWorkletNode, BaseAudioContext, AudioContext: undefined, OfflineAudioContext: undefined, AudioParam })
     Date.now = () => now
@@ -101,7 +101,7 @@ const unsafe = {
   'context replacement': a => { a.mappings[0].booster = { context: { ...a.context } }; attenuate(a) },
   'source ownership replacement': a => { a.mappings[0].source = {}; attenuate(a) },
   'supported booster ownership replacement then gain change': a => { a.mappings[0].booster = a.context.createGain(); attenuate(a); a.read() },
-  'supported channel layout replacement then gain change': a => { a.context.destination.channelCount = 2; attenuate(a); a.read() },
+  'supported channel layout replacement then gain change': a => { a.context.destination.channelCount = 1; attenuate(a); a.read() },
   'unsupported sink then gain change': a => { a.context.destination.channelCount = 9; a.read(); a.context.destination.channelCount = 1; attenuate(a); a.read() },
   'unsupported media then compatible gain': a => { a.external([{}]); a.read(); a.external([]); a.read(); attenuate(a); a.read() },
   'unreadable graph then compatible gain': a => {
@@ -112,6 +112,49 @@ const unsafe = {
   },
   'automation': a => { a.native.gain.setValueAtTime(10 ** (-12 / 20), 0) },
   'zero gain then compatible gain': a => { a.native.gain.value = 0; a.read(); attenuate(a); a.read() }
+}
+// Observe a channel change before a later scalar change: the last reason may
+// become compatible, but the original coordinate-system epoch must be gone.
+for (const node of ['native', 'source', 'sink']) {
+  for (const [field, value] of [['channelCount', 1], ['channelCountMode', 'clamped-max'], ['channelInterpretation', 'discrete']]) {
+    unsafe[`${node} ${field} observed before static gain`] = a => {
+      const target = node === 'sink' ? a.context.destination : a[node]
+      const epoch = a.meter.continuity.token
+      target[field] = value
+      a.read()
+      assert.notEqual(a.meter.continuity.token, epoch, 'first channel observation must revoke the epoch')
+      attenuate(a); a.read()
+      assert.notEqual(a.meter.continuity.token, epoch, 'later scalar gain cannot restore the epoch')
+    }
+  }
+  for (const [field, invalid] of [['channelCount', 0], ['channelCount', 1.5], ['channelCount', NaN], ['channelCountMode', 'unknown'], ['channelInterpretation', undefined]]) {
+    unsafe[`${node} invalid ${field}=${String(invalid)}`] = a => {
+      const target = node === 'sink' ? a.context.destination : a[node], prior = target[field]
+      const epoch = a.meter.continuity.token
+      target[field] = invalid
+      assert.ok(Number.isNaN(a.read()))
+      assert.notEqual(a.meter.continuity.token, epoch)
+      target[field] = prior; a.read(); attenuate(a); a.read()
+    }
+  }
+  for (const field of ['channelCount', 'channelCountMode', 'channelInterpretation']) {
+    unsafe[`${node} throwing ${field}`] = a => {
+      const target = node === 'sink' ? a.context.destination : a[node], prior = target[field]
+      const epoch = a.meter.continuity.token
+      Object.defineProperty(target, field, { configurable: true, get() { throw new Error('channel read') } })
+      assert.ok(Number.isNaN(a.read()))
+      assert.notEqual(a.meter.continuity.token, epoch)
+      Object.defineProperty(target, field, { configurable: true, writable: true, value: prior })
+      a.read(); attenuate(a); a.read()
+    }
+  }
+}
+unsafe['native stereo max/2 to explicit/1 before static gain'] = a => {
+  const epoch = a.meter.continuity.token
+  a.native.channelCountMode = 'explicit'; a.native.channelCount = 1
+  a.read()
+  assert.notEqual(a.meter.continuity.token, epoch)
+  a.native.gain.value = .25; a.read()
 }
 for (const [name, change] of Object.entries(unsafe)) test(`unsafe ${name} never reuses the established target`, () => {
   const r = scenario(change)
