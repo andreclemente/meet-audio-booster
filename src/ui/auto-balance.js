@@ -31,8 +31,10 @@ export function createAutoBalance({ participants, levels, onGain }) {
     }
     for (const key of consumed.keys()) if (!present.has(key)) { consumed.delete(key); qualification.delete(key) }
     const person = present.get(sampledKey)
-    const level = person && levels(person.key)
     if (person && !firstSeen.has(person)) firstSeen.set(person, now)
+    // Only evidence since Auto started (or the person appeared) counts; the
+    // meter filters it directly instead of waiting for old evidence to expire.
+    const level = person && levels(person.key, { since: Math.max(startedAt, firstSeen.get(person)) })
     if (!person || !(person.value > 0 && person.value <= 6) || !Number.isFinite(level?.autoDb)
       || !(Number.isFinite(level.autoSupportMs) && level.autoSupportMs >= 6000)
       || !(Number.isFinite(level.autoInlierFrames) && level.autoInlierFrames >= 24)
@@ -45,6 +47,10 @@ export function createAutoBalance({ participants, levels, onGain }) {
       if (person && level?.sampledAt === now && consumed.get(person.key) !== now) qualification.delete(person.key)
       return
     }
+    // A sustained change first appears as outlier portions while the old level
+    // still holds the majority. Pause (without resetting qualification) rather
+    // than act on that stale level. Missing metadata fails closed.
+    if (level.autoLatestAgrees !== true) return
     if (!baselines.has(person)) baselines.set(person, person.value)
     consumed.set(person.key, now)
     heard.set(person.key, { person, at: now, db: level.autoDb, spread: level.autoSpread })

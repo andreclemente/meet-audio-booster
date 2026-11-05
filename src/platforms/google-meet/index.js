@@ -389,7 +389,7 @@ export function createGoogleMeetController({ state, context, setStatus, renderSo
   }
   return {
     start, stop, route, applyParticipantGain, setOutputs,
-    levelFor: key => levelMeter.levelFor(key),
+    levelFor: (key, options) => levelMeter.levelFor(key, options),
     get pipelines() { return media.pipelines }
   }
 }

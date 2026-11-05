@@ -726,9 +726,9 @@
       recent.set(attributedKey, frames);
       return true;
     }
-    function levelFor(key) {
+    function levelFor(key, { since = -Infinity } = {}) {
       const estimator = estimators.get(key);
-      const frames = (recent.get(key) || []).filter((frame) => clock - frame.at <= AUTO_HORIZON_MS);
+      const frames = (recent.get(key) || []).filter((frame) => clock - frame.at <= AUTO_HORIZON_MS && frame.at >= since);
       const groups = /* @__PURE__ */ new Map();
       for (const frame of frames) {
         if (!groups.has(frame.portion)) groups.set(frame.portion, []);
@@ -766,6 +766,9 @@
         // Reported spread is the 95% interval width of the level estimate.
         autoDb,
         autoSpread: ready ? 2 * 1.96 * standardError : Infinity,
+        // False while the newest completed portion is excluded as an outlier:
+        // a sustained change starts as outliers, so the stale level must not act.
+        autoLatestAgrees: ready && agreeing2.includes(portions.at(-1)),
         autoSupportMs: support,
         autoInlierFrames: inlierFrames,
         autoInlierPortions: agreeing2.length,
@@ -2803,7 +2806,7 @@
       route,
       applyParticipantGain,
       setOutputs,
-      levelFor: (key) => levelMeter.levelFor(key),
+      levelFor: (key, options) => levelMeter.levelFor(key, options),
       get pipelines() {
         return media.pipelines;
       }
@@ -2997,12 +3000,13 @@
         qualification.delete(key);
       }
       const person = present.get(sampledKey);
-      const level = person && levels(person.key);
       if (person && !firstSeen.has(person)) firstSeen.set(person, now);
+      const level = person && levels(person.key, { since: Math.max(startedAt, firstSeen.get(person)) });
       if (!person || !(person.value > 0 && person.value <= 6) || !Number.isFinite(level?.autoDb) || !(Number.isFinite(level.autoSupportMs) && level.autoSupportMs >= 6e3) || !(Number.isFinite(level.autoInlierFrames) && level.autoInlierFrames >= 24) || !(Number.isFinite(level.autoInlierPortions) && level.autoInlierPortions >= 3) || !(level.autoSpread <= AUTO_MAX_SPREAD_DB) || !Number.isFinite(level.autoSince) || level.autoSince < Math.max(startedAt, firstSeen.get(person)) || level.sampledAt !== now || now - startedAt < 1e3 || consumed.get(person.key) === now) {
         if (person && level?.sampledAt === now && consumed.get(person.key) !== now) qualification.delete(person.key);
         return;
       }
+      if (level.autoLatestAgrees !== true) return;
       if (!baselines.has(person)) baselines.set(person, person.value);
       consumed.set(person.key, now);
       heard.set(person.key, { person, at: now, db: level.autoDb, spread: level.autoSpread });
@@ -3404,7 +3408,7 @@
     const panel = createPanelController(state, {
       participants: () => visibleParticipants(state),
       // In-memory pre-volume levels from the controller; never persisted.
-      levels: (key) => platformController?.levelFor?.(key) ?? null,
+      levels: (key, options) => platformController?.levelFor?.(key, options) ?? null,
       onGain: applyGain,
       onCollapse: (collapsed) => {
         state.settings.collapsed = collapsed;

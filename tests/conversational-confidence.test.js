@@ -8,7 +8,7 @@ function fixture(step = 100) {
   const meter = createParticipantLevelMeter({ settleMs: 0 })
   const writes = []
   let now = 0
-  const auto = createAutoBalance({ participants: () => people, levels: key => meter.levelFor(key),
+  const auto = createAutoBalance({ participants: () => people, levels: (key, options) => meter.levelFor(key, options),
     onGain(person, value) { writes.push({ at: now, key: person.key, value }); person.value = value } })
   auto.start(0)
   function run(key, duration, db) {
@@ -78,7 +78,7 @@ test('fresh confidence loss cancels accumulated policy qualification instead of 
   const writes = []
   const auto = createAutoBalance({ participants: () => people,
     levels: () => ({ autoDb: db, autoFrames: 80, autoSupportMs: 6000, autoInlierFrames: 24,
-      autoInlierPortions: 3, autoSpread: 0, autoSince: 0, sampledAt: now }),
+      autoInlierPortions: 3, autoLatestAgrees: true, autoSpread: 0, autoSince: 0, sampledAt: now }),
     onGain: (person, value) => { writes.push(value); person.value = value } })
   auto.start(0)
   now = 1000; auto.tick(now, 'A')
@@ -121,4 +121,37 @@ test('subsecond speaking turns retain independent speech support without bridgin
     assert.ok(level.autoSupportMs >= 4000)
   }
   assert.deepEqual(f.writes, [])
+})
+
+test('a sustained change never acts on the stale level while new portions are still outliers', () => {
+  const meter = createParticipantLevelMeter({ settleMs: 0 })
+  let now = 0
+  const add = (count, db) => { for (let i = 0; i < count; i++) { now += 100; meter.tick({ now, participantKeys: ['x'], attributedKey: 'x', readPower: () => 10 ** (db / 10) }) } }
+  add(100, -30)
+  assert.equal(meter.levelFor('x').autoDb, -30)
+  assert.equal(meter.levelFor('x').autoLatestAgrees, true)
+  let staleAndActionable = 0
+  for (let i = 0; i < 120; i++) {
+    add(1, -20)
+    const level = meter.levelFor('x')
+    if (level.autoDb !== null && Math.abs(level.autoDb + 30) < 1 && level.autoLatestAgrees) staleAndActionable++
+  }
+  // Only the frames before the first complete -20 dB portion may still look
+  // like a valid -30 dB level.
+  assert.ok(staleAndActionable <= 20, String(staleAndActionable))
+  assert.ok(Math.abs(meter.levelFor('x').autoDb + 20) < 0.5, 'the new level takes over')
+})
+
+test('enabling Auto mid-call uses only fresh evidence but does not wait for old evidence to expire', () => {
+  const f = fixture()
+  f.auto.stop()
+  f.run('A', 30000, -30); f.run('B', 30000, -30)
+  f.auto.start(f.now)
+  f.run('A', 8000, -30); f.run('B', 8000, -30)
+  assert.equal(f.auto.targetDb, -30, 'eight seconds of fresh speech each is enough')
+  const g = fixture(); g.auto.stop()
+  g.run('A', 30000, -30); g.run('B', 30000, -30)
+  g.auto.start(g.now)
+  g.run('A', 8000, -30)
+  assert.equal(g.auto.targetDb, null, 'pre-enable evidence for B is not used')
 })

@@ -46,7 +46,7 @@ if (detectPlatform() === 'google-meet' && !globalThis.__meetingAudioBoosterInsta
   const panel = createPanelController(state, {
     participants: () => visibleParticipants(state),
     // In-memory pre-volume levels from the controller; never persisted.
-    levels: key => platformController?.levelFor?.(key) ?? null,
+    levels: (key, options) => platformController?.levelFor?.(key, options) ?? null,
     onGain: applyGain,
     onCollapse: collapsed => { state.settings.collapsed = collapsed; saveSettings(globalThis.localStorage, state.settings) },
     onSave: position => { state.settings.position = position; saveSettings(globalThis.localStorage, state.settings) }

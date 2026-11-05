@@ -187,9 +187,11 @@ export function createParticipantLevelMeter({
     return true
   }
 
-  function levelFor(key) {
+  // options.since: ignore evidence before this time (e.g. before Auto was
+  // enabled). A portion straddling it is a truncated edge and is excluded.
+  function levelFor(key, { since = -Infinity } = {}) {
     const estimator = estimators.get(key)
-    const frames = (recent.get(key) || []).filter(frame => clock - frame.at <= AUTO_HORIZON_MS)
+    const frames = (recent.get(key) || []).filter(frame => clock - frame.at <= AUTO_HORIZON_MS && frame.at >= since)
     const groups = new Map()
     for (const frame of frames) {
       if (!groups.has(frame.portion)) groups.set(frame.portion, [])
@@ -239,6 +241,9 @@ export function createParticipantLevelMeter({
       frames: estimator ? estimator.frames : 0,
       // Reported spread is the 95% interval width of the level estimate.
       autoDb, autoSpread: ready ? 2 * 1.96 * standardError : Infinity,
+      // False while the newest completed portion is excluded as an outlier:
+      // a sustained change starts as outliers, so the stale level must not act.
+      autoLatestAgrees: ready && agreeing.includes(portions.at(-1)),
       autoSupportMs: support, autoInlierFrames: inlierFrames, autoInlierPortions: agreeing.length,
       autoPortions: portions.length, autoFrames: frames.length, autoSince: frames[0]?.at ?? null, sampledAt: frames.at(-1)?.at ?? null
     }

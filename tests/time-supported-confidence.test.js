@@ -35,11 +35,11 @@ test('policy consumes explicit support, never legacy frame count or missing meta
     {autoInlierFrames:undefined},{autoInlierFrames:23},{autoInlierPortions:undefined},{autoInlierPortions:2}]) {
     const people = ['A','B'].map(key=>({key,value:1}));let now=1000
     const auto=createAutoBalance({participants:()=>people,levels:()=>({autoDb:-30,autoFrames:120,
-      autoSupportMs:6000,autoInlierFrames:24,autoInlierPortions:3,autoSpread:0,autoSince:0,sampledAt:now,...bad}),onGain:()=>assert.fail('unexpected write')})
+      autoSupportMs:6000,autoInlierFrames:24,autoInlierPortions:3,autoLatestAgrees:true,autoSpread:0,autoSince:0,sampledAt:now,...bad}),onGain:()=>assert.fail('unexpected write')})
     auto.start(0);auto.tick(now,'A');now+=100;auto.tick(now,'B');assert.equal(auto.targetDb,null)
   }
   const people=['A','B'].map(key=>({key,value:1}));let now=1000
   const auto=createAutoBalance({participants:()=>people,levels:()=>({autoDb:-30,autoFrames:24,
-    autoSupportMs:6000,autoInlierFrames:24,autoInlierPortions:3,autoSpread:0,autoSince:0,sampledAt:now}),onGain:()=>assert.fail('unexpected write')})
+    autoSupportMs:6000,autoInlierFrames:24,autoInlierPortions:3,autoLatestAgrees:true,autoSpread:0,autoSince:0,sampledAt:now}),onGain:()=>assert.fail('unexpected write')})
   auto.start(0);auto.tick(now,'A');now+=100;auto.tick(now,'B');assert.equal(auto.targetDb,-30)
 })
