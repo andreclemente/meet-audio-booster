@@ -171,7 +171,7 @@
     if (existing) {
       if (data.name && data.name !== existing.name) {
         existing.name = data.name;
-        if (existing.value === existing.restoredValue) existing.value = existing.restoredValue = getParticipantGain(state.settings, existing);
+        if (!existing.adjusted) existing.value = getParticipantGain(state.settings, existing);
       }
       existing.present = data.present ?? existing.present;
       existing.speaking = data.speaking ?? existing.speaking;
@@ -190,7 +190,7 @@
       lastSpeakingAt: data.speaking ? Date.now() : 0,
       ...data.extra
     };
-    participant.value = participant.restoredValue = getParticipantGain(state.settings, participant);
+    participant.value = getParticipantGain(state.settings, participant);
     state.participants.set(participant.key, participant);
     return participant;
   }
@@ -3433,6 +3433,7 @@
     }, applyGain = function(participant, value, { automatic = false } = {}) {
       if (!automatic) panel.stopAuto();
       participant.value = Number.isFinite(value) ? Math.min(6, Math.max(0, value)) : 1;
+      participant.adjusted = true;
       if (!automatic) {
         panel.noteManual(participant, participant.value);
         setParticipantGain(state.settings, participant, participant.value);

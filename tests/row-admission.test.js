@@ -43,7 +43,10 @@ test('a rename restores the saved volume for the corrected name until anything c
   assert.equal(p.value, 1)
   upsertParticipant(state, { key: 'id:new', platform: 'google-meet', name: 'Bea' })
   assert.equal(p.value, 2, 'value follows the corrected name')
-  p.value = 0.5
+  // Any manual or automatic change marks it adjusted, even one that lands
+  // back on the restored value.
+  p.value = 2; p.adjusted = true
+  state.settings.gains['google-meet:name:bea b'] = 3
   upsertParticipant(state, { key: 'id:new', platform: 'google-meet', name: 'Bea B' })
-  assert.equal(p.value, 0.5, 'a changed volume is never overwritten by a rename')
+  assert.equal(p.value, 2, 'an adjusted volume is never overwritten by a rename')
 })

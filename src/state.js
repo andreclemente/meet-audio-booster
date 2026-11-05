@@ -30,7 +30,7 @@ export function upsertParticipant(state, data) {
       existing.name = data.name
       // The saved volume is looked up by name for a new id (rejoin). If the
       // first read name was wrong, follow the rename until anything changes it.
-      if (existing.value === existing.restoredValue) existing.value = existing.restoredValue = getParticipantGain(state.settings, existing)
+      if (!existing.adjusted) existing.value = getParticipantGain(state.settings, existing)
     }
     existing.present = data.present ?? existing.present
     existing.speaking = data.speaking ?? existing.speaking
@@ -45,7 +45,7 @@ export function upsertParticipant(state, data) {
     lastSeenAt: data.lastSeenAt ?? Date.now(), lastSpeakingAt: data.speaking ? Date.now() : 0,
     ...data.extra
   }
-  participant.value = participant.restoredValue = getParticipantGain(state.settings, participant)
+  participant.value = getParticipantGain(state.settings, participant)
   state.participants.set(participant.key, participant)
   return participant
 }

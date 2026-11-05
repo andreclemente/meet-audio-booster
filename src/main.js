@@ -35,6 +35,7 @@ if (detectPlatform() === 'google-meet' && !globalThis.__meetingAudioBoosterInsta
   function applyGain(participant, value, { automatic = false } = {}) {
     if (!automatic) panel.stopAuto()
     participant.value = Number.isFinite(value) ? Math.min(6, Math.max(0, value)) : 1
+    participant.adjusted = true // manual or automatic: a later rename never replaces it
     if (!automatic) {
       panel.noteManual(participant, participant.value)
       setParticipantGain(state.settings, participant, participant.value)
