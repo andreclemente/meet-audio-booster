@@ -2,6 +2,15 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { readFile } from 'node:fs/promises'
 
+// Lowest major version referenced for an action; fails when the action is absent.
+function actionMajor (text, action) {
+  const escaped = action.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&')
+  const majors = [...text.matchAll(new RegExp(`uses: ${escaped}@v(\\d+)(?:\\.\\d+)*\\s*$`, 'gm'))]
+    .map(match => Number(match[1]))
+  assert.ok(majors.length > 0, `Missing ${action}`)
+  return Math.min(...majors)
+}
+
 test('store upload is stable-release-only with main ancestry and immutable checkouts', async () => {
   const text = await readFile('.github/workflows/webstore-draft.yml', 'utf8')
   for (const value of ['types: [published]', "github.event_name == 'release'",
@@ -23,8 +32,9 @@ test('maintenance verify runs every Python test in a dedicated unconditional ste
   const text = await readFile('.github/workflows/maintenance.yml', 'utf8')
   const verify = text.split('\n  verify:\n')[1].split('\n  report:\n')[0]
   const steps = verify.split(/^      - /m).slice(1)
-  const setup = steps.find(step => step.startsWith('uses: actions/setup-python@v5\n'))
+  const setup = steps.find(step => /^uses: actions\/setup-python@v\d+\n/.test(step))
   assert.ok(setup, 'Python setup must be an actual verify step')
+  assert.ok(actionMajor(setup, 'actions/setup-python') >= 7)
   assert.match(setup, /python-version: '3\.12'/)
   assert.doesNotMatch(setup, /^\s*if:/m)
   const tests = steps.find(step => step.startsWith('name: Run all offline Python tests\n'))
@@ -46,7 +56,10 @@ test('credentials only reach trusted uploader, with exact artifact and offline c
   const uploadStep = upload.split('      - name: Upload draft only and read store status back')[1]
   assert.ok(uploadStep.includes('CWS_SERVICE_ACCOUNT_JSON: ${{ secrets.CWS_SERVICE_ACCOUNT_JSON }}'))
   assert.doesNotMatch(upload, /run:.*(?:npm |node )|release_sha/)
-  for (const value of ['environment: chrome-web-store', 'actions/download-artifact@v4',
+  // artifact-ids needs v4.3.0+; v8+ also errors on artifact digest mismatch by default.
+  assert.ok(actionMajor(upload, 'actions/download-artifact') >= 8)
+  assert.doesNotMatch(upload, /digest-mismatch:|skip-decompress:/)
+  for (const value of ['environment: chrome-web-store',
     'artifact-ids: ${{ needs.package.outputs.artifact_id }}', 'merge-multiple: true',
     'CWS_CLIENT_ID: ${{ secrets.CWS_CLIENT_ID }}', 'CWS_CLIENT_SECRET: ${{ secrets.CWS_CLIENT_SECRET }}',
     'CWS_REFRESH_TOKEN: ${{ secrets.CWS_REFRESH_TOKEN }}',
@@ -54,7 +67,8 @@ test('credentials only reach trusted uploader, with exact artifact and offline c
     'webstore_draft.py check', 'webstore_draft.py upload', 'needs.package.outputs.sha256']) {
     assert.ok(upload.includes(value), `Missing privileged isolation: ${value}`)
   }
-  assert.match(build, /actions\/upload-artifact@v4/)
+  assert.ok(actionMajor(build, 'actions/upload-artifact') >= 7)
+  assert.doesNotMatch(build, /^\s*archive:\s*['"]?false/m)
   assert.match(build, /if-no-files-found: error/)
   assert.match(build, /sha256sum release-artifact\/extension.zip/)
 })
