@@ -2462,7 +2462,7 @@
       const unchanged = g.mode === previousMode && units.length === previousUnits.length && kept.length === units.length && keptUnchanged && units.every((u, i) => u.key === previousUnits[i].key);
       if (unchanged) return null;
       const meter = g.mode === "worklet" && g.slots[0]?.audibleMeter;
-      const membershipOnly = g.mode === previousMode && previousUnits.length > 0 && units.length > 0 && keptUnchanged && kept.length > 0 && (g.mode !== "worklet" || g.slots[0] === previousUnits[0].key && g.slots.every((s) => s.audibleMeter === meter) && (!previous || previous.meter === meter));
+      const membershipOnly = g.mode === "media" && previousMode === "media" && units.length > 0 && kept.length > 0 && keptUnchanged;
       const next = meter?.continuity;
       const sameOwners = g.mode === previousMode && units.length === previousUnits.length && units.every((u, i) => u.key === previousUnits[i].key && same(u.parts, previousUnits[i].parts));
       const compatible = sameOwners && previous?.meter === meter && g.slots.every((s) => s.audibleMeter === meter) && next?.token && next.token === previous.token && next.reason === "static-native-gain" && next.generation === meter.generation && next.generation > previous.generation;

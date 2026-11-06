@@ -17,14 +17,14 @@ export function createMeasurementContinuity() {
       && units.every((u, i) => u.key === previousUnits[i].key)
     if (unchanged) return null
     const meter = g.mode === 'worklet' && g.slots[0]?.audibleMeter
-    // Someone joining or leaving only adds or removes other people's streams.
-    // Levels are summed over all streams, so a silent added stream does not
-    // change the measured speaker; keep evidence. Any replaced or re-wired
-    // stream, the worklet scaling slot (slots[0]) or meter changing, or a
-    // first/last stream is still a new measurement graph.
-    const membershipOnly = g.mode === previousMode && previousUnits.length > 0 && units.length > 0 && keptUnchanged
-      && kept.length > 0 && (g.mode !== 'worklet' || (g.slots[0] === previousUnits[0].key
-        && g.slots.every(s => s.audibleMeter === meter) && (!previous || previous.meter === meter)))
+    // Media mode: someone joining or leaving only adds or removes other
+    // people's streams. Pre-gain power is summed over all streams and the
+    // level meter keeps no per-stream state, so a silent added stream does not
+    // change the measured speaker; keep evidence. A re-wired kept stream, or a
+    // first/last stream, is still a new measurement graph. Worklet mode is
+    // unchanged: its audible meter re-verifies the native graph (new
+    // generation) on every connection change, so evidence is discarded there.
+    const membershipOnly = g.mode === 'media' && previousMode === 'media' && units.length > 0 && kept.length > 0 && keptUnchanged
     const next = meter?.continuity
     const sameOwners = g.mode === previousMode && units.length === previousUnits.length && units.every((u, i) => u.key === previousUnits[i].key && same(u.parts, previousUnits[i].parts))
     const compatible = sameOwners && previous?.meter === meter

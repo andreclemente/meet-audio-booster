@@ -19,18 +19,25 @@ test('media: someone joining or leaving keeps evidence; a replaced stream still 
   assert.equal(observe(g, []).reason, 'measurement-graph', 'all streams gone: resets')
 })
 
-test('worklet: an added or removed slot keeps evidence only while the scaling slot and meter are unchanged', () => {
+test('media: a replaced pipeline object with others kept is treated like leave plus join (pre-gain power is unchanged)', () => {
   const observe = createMeasurementContinuity()
-  const meter = { generation: 1, continuity: null }
+  const a = pipeline(), b = pipeline(), g = { mode: 'media' }
+  observe(g, [a, b])
+  assert.equal(observe(g, [a, pipeline()]), null)
+})
+
+test('worklet: a slot joining or leaving with the real audible meter still discards evidence (meter re-verifies the graph)', () => {
+  const observe = createMeasurementContinuity()
+  let generation = 1
+  const meter = { get generation() { return generation }, continuity: null }
   const s0 = slot(meter), s1 = slot(meter), g = { mode: 'worklet', slots: [s0] }
   assert.equal(observe(g, []).reason, 'measurement-graph')
-  g.slots = [s0, s1]; assert.equal(observe(g, []), null, 'added slot: no reset')
-  g.slots = [s0]; assert.equal(observe(g, []), null, 'removed slot: no reset')
-  g.slots = [s1, s0]; assert.equal(observe(g, []).reason, 'measurement-graph', 'scaling slot changed: resets')
-  g.slots = [s1, slot({ generation: 1 })]; assert.equal(observe(g, []).reason, 'measurement-graph', 'different meter: resets')
-  const m2 = { generation: 1, continuity: null }, t0 = slot(m2)
-  g.slots = [t0]; observe(g, [])
-  m2.generation = 2; g.slots = [t0, slot(m2)]
-  assert.equal(observe(g, []).reason, 'measurement-graph', 'meter generation change during a join still resets')
+  assert.equal(observe(g, []), null, 'steady graph: nothing to invalidate')
+  generation++; g.slots = [s0, s1]
+  assert.equal(observe(g, []).reason, 'measurement-graph', 'connect bumps the meter generation: resets')
+  generation++; g.slots = [s0]
+  assert.equal(observe(g, []).reason, 'measurement-graph', 'disconnect bumps the meter generation: resets')
+  g.slots = [s0, s1]
+  assert.equal(observe(g, []).reason, 'measurement-graph', 'even without a generation bump, worklet slot changes reset')
   g.mode = 'media'; assert.equal(observe(g, [pipeline()]).reason, 'measurement-graph', 'mode change resets')
 })
