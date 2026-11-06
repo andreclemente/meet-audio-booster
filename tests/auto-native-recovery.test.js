@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import { createAudibleMeter } from '../src/platforms/google-meet/audible-meter.js'
 import { createGoogleMeetController } from '../src/platforms/google-meet/index.js'
 import { createPanelController } from '../src/ui/panel.js'
+import { AUTO_DEADBAND_DB, AUTO_STEP_DB } from '../src/ui/auto-balance.js'
 
 // Synthetic DOM/activity, PCM, AudioNodes and immediately settled slots. Actual
 // meter -> controller estimator -> panel Auto -> gain callback -> UI are exercised.
@@ -132,7 +133,7 @@ for (const gaps of [false, true]) test(`compatible static native attenuation rec
   }
   for (const w of r.writes) {
     assert.equal(w.key, 'A')
-    assert.ok(Math.abs(gainDb(w.to / w.from) - 0.05) < 1e-10, 'only monotonic 0.05 dB earned steps')
+    assert.ok(Math.abs(gainDb(w.to / w.from) - AUTO_STEP_DB) < 1e-10, 'only monotonic fixed-size earned steps')
     assert.equal(w.actualValue, w.to, 'gain callback must reach the real slot')
     assert.equal(w.level.sampledAt, w.now, 'no writes on stale evidence')
     assert.ok(w.level.autoSince >= r.start, 'no pre-reset evidence')
@@ -140,10 +141,10 @@ for (const gaps of [false, true]) test(`compatible static native attenuation rec
     assert.ok(w.level.autoInlierFrames >= 24)
     assert.ok(w.level.autoInlierPortions >= 3)
     assert.ok(w.qualifiedFrames >= 30, 'fresh confidence loss must rearm sustained qualification')
-    assert.ok(-20 - (w.level.autoDb + gainDb(w.from)) > 3 - 1e-6, 'no writes inside the deadband')
+    assert.ok(-20 - (w.level.autoDb + gainDb(w.from)) > Math.max(AUTO_DEADBAND_DB, w.level.autoSpread / 2) - 1e-6, 'no writes inside the tolerance or the 95% interval')
   }
   assert.ok(lastWriteMs <= 180000, 'deadband convergence has an explicit 180 s budget')
-  assert.ok(Math.abs(-20 - (r.level.autoDb + gainDb(r.value))) <= 3, 'same established 3 dB deadband')
+  assert.ok(Math.abs(-20 - (r.level.autoDb + gainDb(r.value))) <= 3, 'converged within the largest possible tolerance (95% half-interval <= 2.94 dB)')
   if (gaps) {
     assert.ok(trace.some(s => s.confidenceLosses > 0), 'exercise confidence loss and rearming')
     assert.ok(trace.some(s => s.missingPower > 0), 'exercise native-meter settling abstentions')
@@ -238,8 +239,8 @@ function assertFreshRequalification(r, { reasons }) {
     assert.ok(w.level.autoInlierPortions >= 3)
     assert.ok(w.qualifiedFrames >= 30, 'sustained-error qualification restarts after the change')
     assert.equal(w.level.sampledAt, w.now, 'no writes on stale evidence')
-    assert.ok(Math.abs(gainDb(w.to / w.from) - 0.05) < 1e-10, 'only 0.05 dB boosts toward the fixed level')
-    assert.ok(-20 - (w.level.autoDb + gainDb(w.from)) > 3 - 1e-6, 'no writes inside the deadband')
+    assert.ok(Math.abs(gainDb(w.to / w.from) - AUTO_STEP_DB) < 1e-10, 'only fixed-size boosts toward the fixed level')
+    assert.ok(-20 - (w.level.autoDb + gainDb(w.from)) > Math.max(AUTO_DEADBAND_DB, w.level.autoSpread / 2) - 1e-6, 'no writes inside the tolerance or the 95% interval')
   }
   if (r.writes.length) assert.ok(Math.abs(-20 - (r.level.autoDb + gainDb(r.value))) <= 3, 'converges to the same deadband')
   else assert.equal(r.ready, false, 'without fresh evidence the UI keeps learning')

@@ -1,15 +1,15 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { createParticipantLevelMeter } from '../src/platforms/google-meet/levels.js'
-import { createAutoBalance } from '../src/ui/auto-balance.js'
+import { createAutoBalance, AUTO_STEP_DB } from '../src/ui/auto-balance.js'
 import { runCorpus } from './fixtures/conversational-corpus.js'
 
 const corpus = runCorpus({ createParticipantLevelMeter, createAutoBalance })
-// Every write is a 0.05 dB step; total movement equal to the step count means
+// Every write is one fixed-size step; total movement equal to the step count means
 // no person's gain ever reversed direction.
 function assertMonotonic(r, maxDb) {
   const moved = r.finalGainDb.reduce((sum, db) => sum + Math.abs(db), 0)
-  assert.ok(Math.abs(moved - 0.05 * r.writes) < 1e-9, JSON.stringify(r))
+  assert.ok(Math.abs(moved - AUTO_STEP_DB * r.writes) < 1e-9, JSON.stringify(r))
   for (const db of r.finalGainDb) assert.ok(Math.abs(db) <= maxDb, JSON.stringify(r))
 }
 
@@ -23,8 +23,10 @@ test('known-envelope corpus: adequately sampled long turns acquire without gain 
   // Short/slowly sampled fragments may legitimately lack independent support or
   // sample only one phonetic phase. Do not force confidence by rephasing them.
   // Against a fixed target such a phase-biased estimate can earn a small
-  // correction, but it must be monotonic (never chasing) and stay small.
-  for (const r of corpus.acquisition) assertMonotonic(r, 1)
+  // correction, but it must be monotonic (never chasing) and stay small. With
+  // the 1 dB tolerance the one 300 ms/3 s phase-biased case moves 2.1 dB
+  // (was 0.55 dB at 3 dB); the bound keeps any regression beyond that visible.
+  for (const r of corpus.acquisition) assertMonotonic(r, 2.5)
 })
 
 test('known-envelope corpus: short fluctuations and balanced periodic passages never write', () => {
@@ -39,7 +41,7 @@ test('known-envelope corpus: persistent steps respond slowly, with unchanged dea
   for (const r of steps) {
     // Bounded by memory turnover: 120 accepted samples at the read cadence.
     assert.ok(r.firstWriteDelayMs >= 3000 && r.firstWriteDelayMs <= Math.max(30000, 120 * r.cadence), JSON.stringify(r))
-    assert.ok(r.maxStepDb <= 0.0500001, JSON.stringify(r))
+    assert.ok(r.maxStepDb <= AUTO_STEP_DB + 1e-7, JSON.stringify(r))
     assert.ok(r.kind === 'quiet-step' ? r.finalGainDb[1] > 0 : r.finalGainDb[1] < 0, JSON.stringify(r))
   }
   for (const r of corpus.dynamics.filter(r => r.kind === 'slow-drift' && r.cadence <= 120)) {
@@ -63,7 +65,8 @@ test('known-envelope corpus: one voice at the fixed level is kept; floor noise, 
   // sole speech is indistinguishable here from speech of that scalar envelope.
   // Keep this adverse challenge visible rather than asserting impossible VAD.
   // Its median sits 5 dB under the fixed target, so it is treated like a quiet
-  // voice: a monotonic boost that stops at the deadband edge, never chasing.
+  // voice: a monotonic boost that stops at the 1 dB tolerance edge (measured
+  // 4.0 dB), never chasing.
   const ambiguous = corpus.negatives.find(r => r.kind === 'unstable-noise')
-  assertMonotonic(ambiguous, 2.5)
+  assertMonotonic(ambiguous, 4.5)
 })

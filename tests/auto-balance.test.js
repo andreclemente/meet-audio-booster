@@ -1,7 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { createParticipantLevelMeter, attributeLevelSample, AUTO_HORIZON_MS } from '../src/platforms/google-meet/levels.js'
-import { createAutoBalance, AUTO_TARGET_DB } from '../src/ui/auto-balance.js'
+import { createAutoBalance, AUTO_TARGET_DB, AUTO_DEADBAND_DB, AUTO_STEP_DB } from '../src/ui/auto-balance.js'
 
 function fixture(values=[1,1]) {
   const people=values.map((value,i)=>({key:String(i),value})), writes=[]
@@ -13,28 +13,28 @@ function fixture(values=[1,1]) {
   return {people,writes,meter,auto,run,get now(){return now}}
 }
 const gainDb=v=>20*Math.log10(v)
-test('fixed comfortable target is -20 dB',()=>assert.equal(AUTO_TARGET_DB,-20))
+test('fixed comfortable target is -20 dB with an owner-approved 1 dB tolerance and 0.1 dB steps',()=>{assert.equal(AUTO_TARGET_DB,-20);assert.equal(AUTO_DEADBAND_DB,1);assert.equal(AUTO_STEP_DB,0.1)})
 test('voices far from the fixed level adjust in correct directions with positive readiness',()=>{
  const f=fixture();f.run(0,-30);f.run(1,-10);f.run(0,-30)
  assert.equal(f.auto.targetDb,-20);assert.ok(f.people[0].value>1);assert.ok(f.people[1].value<1)
- for(const w of f.writes){assert.ok(Math.abs(gainDb(w.to/w.from))<=.0500001);assert.deepEqual(w.o,{automatic:true})}
+ for(const w of f.writes){assert.ok(Math.abs(gainDb(w.to/w.from))<=AUTO_STEP_DB+1e-7);assert.deepEqual(w.o,{automatic:true})}
 })
 for(const [db,dir] of [[-30,1],[-10,-1]]) test(`a single speaker at ${db} dB is corrected slowly toward the fixed level`,()=>{
  const f=fixture([1]);assert.equal(f.auto.targetDb,null,'learning until a voice is confidently measured')
  f.run(0,db,59);assert.equal(f.writes.length,0,'no write before supported qualification')
  f.run(0,db,200)
  assert.equal(f.auto.targetDb,-20);assert.ok(f.writes.length>0)
- for(const w of f.writes)assert.ok(Math.abs(gainDb(w.to/w.from)-dir*.05)<1e-10,'only 0.05 dB steps in the right direction')
+ for(const w of f.writes)assert.ok(Math.abs(gainDb(w.to/w.from)-dir*AUTO_STEP_DB)<1e-10,'only fixed-size steps in the right direction')
 })
-for(const db of [-22.9,-20,-17.1]) test(`a voice within 3 dB of the fixed level (${db} dB) is untouched`,()=>{
+for(const db of [-20.9,-20,-19.1]) test(`a voice within 1 dB of the fixed level (${db} dB) is untouched`,()=>{
  const f=fixture([1,1]);f.run(0,db,400);f.run(1,db,400)
  assert.equal(f.auto.targetDb,-20);assert.equal(f.writes.length,0);assert.deepEqual(f.people.map(p=>p.value),[1,1])
 })
 test('each person independently converges toward -20 dB then stops at the deadband edge',()=>{
  const f=fixture([1,1]);f.run(0,-26,400);f.run(1,-14,400)
  const at0=f.writes.filter(w=>w.key==='0').length,at1=f.writes.filter(w=>w.key==='1').length
- assert.ok(gainDb(f.people[0].value)>=3-1e-9&&gainDb(f.people[0].value)<=3.05+1e-9,String(gainDb(f.people[0].value)))
- assert.ok(gainDb(f.people[1].value)<=-3+1e-9&&gainDb(f.people[1].value)>=-3.05-1e-9,String(gainDb(f.people[1].value)))
+ assert.ok(gainDb(f.people[0].value)>=6-AUTO_DEADBAND_DB-1e-9&&gainDb(f.people[0].value)<=6-AUTO_DEADBAND_DB+AUTO_STEP_DB+1e-9,String(gainDb(f.people[0].value)))
+ assert.ok(gainDb(f.people[1].value)<=-(6-AUTO_DEADBAND_DB)+1e-9&&gainDb(f.people[1].value)>=-(6-AUTO_DEADBAND_DB)-AUTO_STEP_DB-1e-9,String(gainDb(f.people[1].value)))
  f.run(0,-26,300);f.run(1,-14,300)
  assert.equal(f.writes.filter(w=>w.key==='0').length,at0,'no chasing inside the deadband')
  assert.equal(f.writes.filter(w=>w.key==='1').length,at1)

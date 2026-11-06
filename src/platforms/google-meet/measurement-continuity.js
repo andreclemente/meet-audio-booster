@@ -1,23 +1,39 @@
 // Controller-side classification; the meter alone verifies the native graph.
 // This never licenses reuse of samples or qualification, only a session target.
 export function createMeasurementContinuity() {
-  let previousGraph = [], previousGenerations = [], previous = null
+  let previousMode = null, previousUnits = [], previous = null
   const same = (a, b) => a.length === b.length && a.every((value, i) => value === b[i])
+  // One unit per remote stream (media) or audio slot (worklet), with the
+  // meter generation it was observed at.
+  const unitsOf = (g, pipelines) => g.mode === 'media'
+    ? pipelines.map(p => ({ key: p, parts: [p, p.stream, ...(p.tracks || [])], generation: undefined }))
+    : g.slots.map(s => ({ key: s, parts: [s, s.tap, s.audibleMeter], generation: s.audibleMeter?.generation }))
   return function observe(g, pipelines) {
-    const graph = [g.mode, ...(g.mode === 'media'
-      ? pipelines.flatMap(p => [p, p.stream, ...(p.tracks || [])])
-      : g.slots.flatMap(s => [s, s.tap, s.audibleMeter]))]
-    const generations = g.mode === 'media' ? [] : g.slots.map(s => s.audibleMeter?.generation)
-    const sameOwners = same(graph, previousGraph)
-    if (sameOwners && same(generations, previousGenerations)) return null
+    const units = unitsOf(g, pipelines)
+    const before = new Map(previousUnits.map(u => [u.key, u]))
+    const kept = units.filter(u => before.has(u.key))
+    const keptUnchanged = kept.every(u => { const o = before.get(u.key); return same(u.parts, o.parts) && u.generation === o.generation })
+    const unchanged = g.mode === previousMode && units.length === previousUnits.length && kept.length === units.length && keptUnchanged
+      && units.every((u, i) => u.key === previousUnits[i].key)
+    if (unchanged) return null
     const meter = g.mode === 'worklet' && g.slots[0]?.audibleMeter
+    // Media mode: someone joining or leaving only adds or removes other
+    // people's streams. Pre-gain power is summed over all streams and the
+    // level meter keeps no per-stream state, so a silent added stream does not
+    // change the measured speaker; keep evidence. A re-wired kept stream, or a
+    // first/last stream, is still a new measurement graph. Worklet mode is
+    // unchanged: its audible meter re-verifies the native graph (new
+    // generation) on every connection change, so evidence is discarded there.
+    const membershipOnly = g.mode === 'media' && previousMode === 'media' && units.length > 0 && kept.length > 0 && keptUnchanged
     const next = meter?.continuity
+    const sameOwners = g.mode === previousMode && units.length === previousUnits.length && units.every((u, i) => u.key === previousUnits[i].key && same(u.parts, previousUnits[i].parts))
     const compatible = sameOwners && previous?.meter === meter
       && g.slots.every(s => s.audibleMeter === meter)
       && next?.token && next.token === previous.token
       && next.reason === 'static-native-gain' && next.generation === meter.generation
       && next.generation > previous.generation
-    previousGraph = graph; previousGenerations = generations
+    previousMode = g.mode; previousUnits = units
+    if (membershipOnly) return null
     previous = next ? { meter, ...next } : null
     return { reason: compatible ? 'compatible-native-gain' : 'measurement-graph' }
   }
