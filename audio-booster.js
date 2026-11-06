@@ -2448,18 +2448,27 @@
 
   // src/platforms/google-meet/measurement-continuity.js
   function createMeasurementContinuity() {
-    let previousGraph = [], previousGenerations = [], previous = null;
+    let previousMode = null, previousUnits = [], previous = null;
     const same = (a, b) => a.length === b.length && a.every((value, i) => value === b[i]);
+    const unitsOf = (g, pipelines) => g.mode === "media" ? pipelines.map((p) => ({ key: p, parts: [p, p.stream, ...p.tracks || []], generation: void 0 })) : g.slots.map((s) => ({ key: s, parts: [s, s.tap, s.audibleMeter], generation: s.audibleMeter?.generation }));
     return function observe(g, pipelines) {
-      const graph = [g.mode, ...g.mode === "media" ? pipelines.flatMap((p) => [p, p.stream, ...p.tracks || []]) : g.slots.flatMap((s) => [s, s.tap, s.audibleMeter])];
-      const generations = g.mode === "media" ? [] : g.slots.map((s) => s.audibleMeter?.generation);
-      const sameOwners = same(graph, previousGraph);
-      if (sameOwners && same(generations, previousGenerations)) return null;
+      const units = unitsOf(g, pipelines);
+      const before = new Map(previousUnits.map((u) => [u.key, u]));
+      const kept = units.filter((u) => before.has(u.key));
+      const keptUnchanged = kept.every((u) => {
+        const o = before.get(u.key);
+        return same(u.parts, o.parts) && u.generation === o.generation;
+      });
+      const unchanged = g.mode === previousMode && units.length === previousUnits.length && kept.length === units.length && keptUnchanged && units.every((u, i) => u.key === previousUnits[i].key);
+      if (unchanged) return null;
       const meter = g.mode === "worklet" && g.slots[0]?.audibleMeter;
+      const membershipOnly = g.mode === previousMode && previousUnits.length > 0 && units.length > 0 && keptUnchanged && kept.length > 0 && (g.mode !== "worklet" || g.slots[0] === previousUnits[0].key && g.slots.every((s) => s.audibleMeter === meter) && (!previous || previous.meter === meter));
       const next = meter?.continuity;
+      const sameOwners = g.mode === previousMode && units.length === previousUnits.length && units.every((u, i) => u.key === previousUnits[i].key && same(u.parts, previousUnits[i].parts));
       const compatible = sameOwners && previous?.meter === meter && g.slots.every((s) => s.audibleMeter === meter) && next?.token && next.token === previous.token && next.reason === "static-native-gain" && next.generation === meter.generation && next.generation > previous.generation;
-      previousGraph = graph;
-      previousGenerations = generations;
+      previousMode = g.mode;
+      previousUnits = units;
+      if (membershipOnly) return null;
       previous = next ? { meter, ...next } : null;
       return { reason: compatible ? "compatible-native-gain" : "measurement-graph" };
     };
@@ -3011,6 +3020,8 @@
 
   // src/ui/auto-balance.js
   var AUTO_TARGET_DB = -20;
+  var AUTO_DEADBAND_DB = 1;
+  var AUTO_STEP_DB = 0.1;
   function createAutoBalance({ participants, levels, onGain }) {
     let enabled = false, startedAt = 0, targetDb = null;
     const consumed = /* @__PURE__ */ new Map(), qualification = /* @__PURE__ */ new Map();
@@ -3052,7 +3063,7 @@
       if (targetDb === null) targetDb = AUTO_TARGET_DB;
       const error = targetDb - (level.autoDb + 20 * Math.log10(person.value));
       const direction = Math.sign(error);
-      if (Math.abs(error) <= 3) {
+      if (Math.abs(error) <= Math.max(AUTO_DEADBAND_DB, level.autoSpread / 2)) {
         qualification.delete(person.key);
         return;
       }
@@ -3060,7 +3071,7 @@
       const count = old?.person === person && old.direction === direction && now - old.at <= AUTO_HORIZON_MS ? old.count + 1 : 1;
       qualification.set(person.key, { person, direction, count, at: now });
       if (count < 30) return;
-      const step = direction * 0.05;
+      const step = direction * AUTO_STEP_DB;
       const value = Math.max(0.05, Math.min(6, person.value * 10 ** (step / 20)));
       if (value !== person.value) onGain(person, value, { automatic: true });
     }
