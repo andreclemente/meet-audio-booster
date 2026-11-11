@@ -48,6 +48,7 @@ if (detectPlatform() === 'google-meet' && !globalThis.__meetingAudioBoosterInsta
     // In-memory pre-volume levels from the controller; never persisted.
     levels: (key, options) => platformController?.levelFor?.(key, options) ?? null,
     onGain: applyGain,
+    onAutoSettings: autoBalance => { state.settings.autoBalance = autoBalance; saveSettings(globalThis.localStorage, state.settings) },
     onCollapse: collapsed => { state.settings.collapsed = collapsed; saveSettings(globalThis.localStorage, state.settings) },
     onSave: position => { state.settings.position = position; saveSettings(globalThis.localStorage, state.settings) }
   })
@@ -70,11 +71,12 @@ if (detectPlatform() === 'google-meet' && !globalThis.__meetingAudioBoosterInsta
     state.platform = detectPlatform()
     const context = getContext()
     state.audioUnavailable = !context
-    const common = { state, context, setStatus, renderSoon, updateLiveUi: panel.updateLiveUi, onLevelSample: panel.autoTick, onLevelReset: panel.invalidateAuto, onStop: panel.stopAuto, mediaOwnership }
+    const common = { state, context, setStatus, renderSoon, updateLiveUi: panel.updateLiveUi, onLevelSample: panel.autoTick, onLevelReset: panel.invalidateAuto, onStop: () => panel.stopAuto({ persist: false }), mediaOwnership }
     platformController = createGoogleMeetController(common)
     platformController.start()
     if (!context) setStatus('Audio unavailable · controls are inactive')
     panel.render()
+    if (context) panel.restoreAuto()
   }
   boot()
 }

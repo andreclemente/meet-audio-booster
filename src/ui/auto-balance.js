@@ -15,7 +15,7 @@ export const AUTO_STEP_DB = 0.1
 // people's turns within the evidence horizon.
 export function createAutoBalance({ participants, levels, onGain }) {
   // targetDb stays null ("learning") until a first voice is confidently measured.
-  let enabled = false, startedAt = 0, targetDb = null
+  let enabled = false, startedAt = 0, targetDb = null, offsetDb = 0
   const consumed = new Map(), qualification = new Map()
   const firstSeen = new WeakMap()
   function stop() { enabled = false; targetDb = null; consumed.clear(); qualification.clear() }
@@ -54,7 +54,7 @@ export function createAutoBalance({ participants, levels, onGain }) {
     // than act on that stale level. Missing metadata fails closed.
     if (level.autoLatestAgrees !== true) return
     consumed.set(person.key, now)
-    if (targetDb === null) targetDb = AUTO_TARGET_DB
+    if (targetDb === null) targetDb = AUTO_TARGET_DB + offsetDb
     const error = targetDb - (level.autoDb + 20 * Math.log10(person.value))
     const direction = Math.sign(error)
     if (Math.abs(error) <= Math.max(AUTO_DEADBAND_DB, level.autoSpread / 2)) { qualification.delete(person.key); return }
@@ -67,5 +67,13 @@ export function createAutoBalance({ participants, levels, onGain }) {
     const value = Math.max(0.05, Math.min(6, person.value * 10 ** (step / 20)))
     if (value !== person.value) onGain(person, value, { automatic: true })
   }
-  return { start, stop, tick, invalidate, get enabled() { return enabled }, get targetDb() { return targetDb } }
+  // The user's target level, as dB relative to the comfortable default.
+  // Measurements are kept; corrections toward the new level must qualify again.
+  function setTargetOffset(db) {
+    if (!Number.isFinite(db) || db === offsetDb) return
+    offsetDb = db
+    if (targetDb !== null) targetDb = AUTO_TARGET_DB + offsetDb
+    qualification.clear()
+  }
+  return { start, stop, tick, invalidate, setTargetOffset, get enabled() { return enabled }, get targetDb() { return targetDb } }
 }

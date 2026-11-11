@@ -34,7 +34,7 @@ function scenario(change, { initialSingle = false, gaps = false, manual = false,
   let state = null, now = 0, sourcePower = 10 ** (-20 / 10), meter, controller, native, slot, panel
   const a = root('source-a'), b = root('source-b'), roots = initialSingle ? [a.root] : [a.root, b.root], writes = [], resets = []
   let external = [], qualifiedFrames = 0, confidenceLosses = 0, missingPower = 0
-  const document = { activeElement: null, createElement: tag => new Element(tag, document) }
+  const document = { activeElement: null, createElement: tag => new Element(tag, document), createElementNS: (ns, tag) => new Element(tag, document) }
   document.documentElement = new Element('html', document)
   document.getElementById = id => [document.documentElement, ...document.documentElement.querySelectorAll('div')].find(e => e.id === id)
   document.querySelectorAll = s => s === '[data-participant-id]' ? roots : s === 'audio,video' ? external : []
@@ -75,7 +75,7 @@ function scenario(change, { initialSingle = false, gaps = false, manual = false,
       panel.autoTick(t, key)
     }, onLevelReset(t, metadata) { qualifiedFrames = 0; resets.push({ now: t, metadata }); panel.invalidateAuto(t, metadata) } })
     panel.render()
-    const balance = state.panel.querySelectorAll('button').find(e => e.textContent === 'Auto Balance')
+    const balance = state.panel.querySelectorAll('button').find(e => e.getAttribute('aria-label') === 'Auto Balance')
     balance.onclick()
     function tick(key) { a.level.value = key === 'A' ? .6 : 0; b.level.value = key === 'B' ? .6 : 0; context.currentTime = now / 1000; controller.route(); now += 30 }
     for (let i = 0; i < 4000; i++) tick(initialSingle ? 'A' : Math.floor(i / 400) % 2 ? 'B' : 'A')

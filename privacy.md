@@ -15,8 +15,9 @@ The following preferences are stored in browser `localStorage`:
 - Per-participant volume preferences
 - Floating panel position
 - Whether the panel is collapsed or expanded
+- Whether Auto Balance is on, and its target level
 
-Speaking-level estimates and Auto Balance state are kept only in session memory, not saved in `localStorage` or transmitted. Automatic volume adjustments are not persisted; manual volume preferences retain the local storage behavior described above. They are collected only when a single speaker can be confidently associated with the audio; no audio recordings are stored by this feature.
+Speaking-level estimates and Auto Balance measurements are kept only in session memory, not saved in `localStorage` or transmitted. Automatic volume adjustments are not persisted; manual volume preferences retain the local storage behavior described above. They are collected only when a single speaker can be confidently associated with the audio; no audio recordings are stored by this feature.
 
 Participant names or platform IDs may form local preference keys. This information remains in your browser's site storage. Clear site data for the supported meeting sites to remove it; uninstalling the extension does not necessarily clear site storage.
 

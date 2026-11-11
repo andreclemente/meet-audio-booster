@@ -10,13 +10,23 @@
   var ASSOCIATION_CONFIRMATIONS = 3;
 
   // src/storage.js
-  var defaults = () => ({ gains: {}, position: null, collapsed: false });
+  var AUTO_TARGET_PERCENTS = [70, 80, 90, 100, 110, 120, 130, 140];
+  var defaultAutoBalance = () => ({ enabled: false, target: 100 });
+  var defaults = () => ({ gains: {}, position: null, collapsed: false, autoBalance: defaultAutoBalance() });
+  function sanitizeAutoBalance(value) {
+    if (!value || typeof value !== "object") return defaultAutoBalance();
+    return {
+      enabled: value.enabled === true,
+      target: AUTO_TARGET_PERCENTS.includes(value.target) ? value.target : 100
+    };
+  }
   function sanitize(value) {
     if (!value || typeof value !== "object") return defaults();
     return {
       gains: value.gains && typeof value.gains === "object" ? value.gains : {},
       position: value.position && Number.isFinite(value.position.left) && Number.isFinite(value.position.top) ? { left: value.position.left, top: value.position.top } : null,
-      collapsed: value.collapsed === true
+      collapsed: value.collapsed === true,
+      autoBalance: sanitizeAutoBalance(value.autoBalance)
     };
   }
   function loadSettings(storage = globalThis.localStorage) {
@@ -296,9 +306,9 @@
   var MICROPHONE_ICONS = /* @__PURE__ */ new Set(["mic", "mic_none", "mic_off"]);
   function ownIcons(root) {
     const icons = /* @__PURE__ */ new Set();
-    for (const icon of root?.querySelectorAll?.(MATERIAL_ICON_SELECTOR) || []) {
-      if (icon.closest && icon.closest("[data-participant-id]") !== root) continue;
-      icons.add((icon.textContent || "").trim());
+    for (const icon2 of root?.querySelectorAll?.(MATERIAL_ICON_SELECTOR) || []) {
+      if (icon2.closest && icon2.closest("[data-participant-id]") !== root) continue;
+      icons.add((icon2.textContent || "").trim());
     }
     return icons;
   }
@@ -313,13 +323,13 @@
   }
   function hasMicrophoneIndicator(root) {
     const icons = ownIcons(root);
-    return [...MICROPHONE_ICONS].some((icon) => icons.has(icon)) || hasOwnMicrophonePath(root);
+    return [...MICROPHONE_ICONS].some((icon2) => icons.has(icon2)) || hasOwnMicrophonePath(root);
   }
   function isPresentationRoot(root) {
     if (!root?.getAttribute?.("data-participant-id")) return false;
     if (hasMicrophoneIndicator(root)) return false;
     const icons = ownIcons(root);
-    return [...PRESENTATION_ICONS].some((icon) => icons.has(icon));
+    return [...PRESENTATION_ICONS].some((icon2) => icons.has(icon2));
   }
   function isLocalPresentationRoot(root) {
     return isPresentationRoot(root) && ownIcons(root).has("stylus_laser_pointer");
@@ -345,9 +355,9 @@
     const icons = /* @__PURE__ */ new Set();
     for (const button of root?.querySelectorAll?.(BUTTON_SELECTOR) || []) {
       if (button.closest?.("[data-participant-id]") !== root) continue;
-      for (const icon of button.querySelectorAll?.(MATERIAL_ICON_SELECTOR) || []) {
-        if (icon.closest?.("[data-participant-id]") !== root || icon.closest?.(BUTTON_SELECTOR) !== button) continue;
-        icons.add((icon.textContent || "").trim());
+      for (const icon2 of button.querySelectorAll?.(MATERIAL_ICON_SELECTOR) || []) {
+        if (icon2.closest?.("[data-participant-id]") !== root || icon2.closest?.(BUTTON_SELECTOR) !== button) continue;
+        icons.add((icon2.textContent || "").trim());
       }
     }
     return icons.has("visual_effects");
@@ -3023,7 +3033,7 @@
   var AUTO_DEADBAND_DB = 1;
   var AUTO_STEP_DB = 0.1;
   function createAutoBalance({ participants, levels, onGain }) {
-    let enabled = false, startedAt = 0, targetDb = null;
+    let enabled = false, startedAt = 0, targetDb = null, offsetDb = 0;
     const consumed = /* @__PURE__ */ new Map(), qualification = /* @__PURE__ */ new Map();
     const firstSeen = /* @__PURE__ */ new WeakMap();
     function stop() {
@@ -3060,7 +3070,7 @@
       }
       if (level.autoLatestAgrees !== true) return;
       consumed.set(person.key, now);
-      if (targetDb === null) targetDb = AUTO_TARGET_DB;
+      if (targetDb === null) targetDb = AUTO_TARGET_DB + offsetDb;
       const error = targetDb - (level.autoDb + 20 * Math.log10(person.value));
       const direction = Math.sign(error);
       if (Math.abs(error) <= Math.max(AUTO_DEADBAND_DB, level.autoSpread / 2)) {
@@ -3075,7 +3085,13 @@
       const value = Math.max(0.05, Math.min(6, person.value * 10 ** (step / 20)));
       if (value !== person.value) onGain(person, value, { automatic: true });
     }
-    return { start, stop, tick, invalidate, get enabled() {
+    function setTargetOffset(db) {
+      if (!Number.isFinite(db) || db === offsetDb) return;
+      offsetDb = db;
+      if (targetDb !== null) targetDb = AUTO_TARGET_DB + offsetDb;
+      qualification.clear();
+    }
+    return { start, stop, tick, invalidate, setTargetOffset, get enabled() {
       return enabled;
     }, get targetDb() {
       return targetDb;
@@ -3083,6 +3099,36 @@
   }
 
   // src/ui/panel.js
+  var ICONS = {
+    balance: "M440-120v-240h80v80h320v80H520v80h-80Zm-320-80v-80h240v80H120Zm160-160v-80H120v-80h160v-80h80v240h-80Zm160-80v-80h400v80H440Zm160-160v-240h80v80h160v80H680v80h-80Zm-480-80v-80h400v80H120Z",
+    reset: "M280-200v-80h284q63 0 109.5-40T720-420q0-60-46.5-100T564-560H312l104 104-56 56-200-200 200-200 56 56-104 104h252q97 0 166.5 63T800-420q0 94-69.5 157T564-200H280Z",
+    minus: "M200-440v-80h560v80H200Z",
+    plus: "M440-440H200v-80h240v-240h80v240h240v80H520v240h-80v-240Z"
+  };
+  function icon(name) {
+    const ns = "http://www.w3.org/2000/svg";
+    const svg = document.createElementNS(ns, "svg");
+    svg.setAttribute("viewBox", "0 -960 960 960");
+    svg.setAttribute("width", "16");
+    svg.setAttribute("height", "16");
+    svg.setAttribute("fill", "currentColor");
+    svg.setAttribute("aria-hidden", "true");
+    svg.setAttribute("focusable", "false");
+    const path = document.createElementNS(ns, "path");
+    path.setAttribute("d", ICONS[name]);
+    svg.append(path);
+    return svg;
+  }
+  function iconButton(name, label, action) {
+    const button = makeButton("", action);
+    button.type = "button";
+    button.append(icon(name));
+    button.setAttribute("aria-label", label);
+    button.title = label;
+    Object.assign(button.style, { width: "28px", height: "26px", padding: "0", display: "inline-flex", alignItems: "center", justifyContent: "center", flex: "0 0 auto" });
+    return button;
+  }
+  var targetDbOf = (percent) => 20 * Math.log10(percent / 100);
   function statusText(state, now = Date.now()) {
     if (state.autoBalanceEnabled) return state.autoBalanceReady ? "Auto Balance on" : "Learning levels…";
     const notice = state.statusNotice;
@@ -3104,28 +3150,53 @@
     const title = Number.isFinite(level?.typicalDb) ? "Typical speaking level after your volume" : "Not heard yet";
     if (track.title !== title) track.title = title;
   }
-  function createPanelController(state, { participants, levels = () => null, onGain, onSave, onCollapse }) {
+  function createPanelController(state, { participants, levels = () => null, onGain, onSave, onCollapse, onAutoSettings = () => {
+  } }) {
     const auto = createAutoBalance({ participants, levels, onGain });
     state.autoBalanceEnabled = false;
-    let balanceButton = null;
+    state.settings.autoBalance ??= { enabled: false, target: 100 };
+    auto.setTargetOffset(targetDbOf(state.settings.autoBalance.target));
+    let balanceButton = null, targetParts = null;
+    function saveAuto(changes) {
+      state.settings.autoBalance = { ...state.settings.autoBalance, ...changes };
+      onAutoSettings(state.settings.autoBalance);
+    }
     function updateBalanceButton() {
       const button = balanceButton;
-      if (!button) return;
-      button.textContent = "Auto Balance";
-      button.setAttribute("aria-label", "Auto Balance");
-      button.setAttribute("aria-pressed", String(auto.enabled));
-      setStyle(button, "color", auto.enabled ? "#202124" : "#8ab4f8");
-      setStyle(button, "background", auto.enabled ? "#8ab4f8" : "#303134");
-      setStyle(button, "borderColor", "#8ab4f8");
-      button.disabled = false;
+      if (button) {
+        const label = auto.enabled ? "Auto Balance: on" : "Auto Balance: off";
+        button.setAttribute("aria-label", "Auto Balance");
+        button.setAttribute("aria-pressed", String(auto.enabled));
+        if (button.title !== label) button.title = label;
+        setStyle(button, "color", auto.enabled ? "#202124" : "#8ab4f8");
+        setStyle(button, "background", auto.enabled ? "#8ab4f8" : "#303134");
+        setStyle(button, "borderColor", "#8ab4f8");
+        button.disabled = false;
+      }
+      if (targetParts) {
+        const target = state.settings.autoBalance.target;
+        const text = `${target}%`;
+        if (targetParts.value.textContent !== text) targetParts.value.textContent = text;
+        targetParts.lower.disabled = target <= AUTO_TARGET_PERCENTS[0];
+        targetParts.raise.disabled = target >= AUTO_TARGET_PERCENTS.at(-1);
+        setStyle(targetParts.lower, "opacity", targetParts.lower.disabled ? "0.4" : "1");
+        setStyle(targetParts.raise, "opacity", targetParts.raise.disabled ? "0.4" : "1");
+        setStyle(targetParts.group, "opacity", auto.enabled ? "1" : "0.55");
+      }
     }
-    function stopAuto() {
+    function stopAuto({ persist = true } = {}) {
       auto.stop();
       state.autoBalanceEnabled = false;
       state.autoBalanceReady = false;
+      if (persist && state.settings.autoBalance.enabled) saveAuto({ enabled: false });
       updateBalanceButton();
       const status = document.getElementById(`${PANEL_ID}_status`);
       if (status) status.textContent = statusText(state);
+    }
+    function startAuto() {
+      auto.start(Date.now());
+      state.autoBalanceEnabled = true;
+      state.autoBalanceReady = false;
     }
     function manualGain(participant, value) {
       stopAuto();
@@ -3134,10 +3205,23 @@
     function toggleAuto() {
       if (auto.enabled) stopAuto();
       else {
-        auto.start(Date.now());
-        state.autoBalanceEnabled = true;
-        state.autoBalanceReady = false;
+        startAuto();
+        saveAuto({ enabled: true });
       }
+      updateLiveUi();
+    }
+    function restoreAuto() {
+      if (state.settings.autoBalance.enabled && !auto.enabled) {
+        startAuto();
+        updateLiveUi();
+      }
+    }
+    function stepTarget(direction) {
+      const list = AUTO_TARGET_PERCENTS, index = list.indexOf(state.settings.autoBalance.target);
+      const next = list[Math.max(0, Math.min(list.length - 1, (index < 0 ? list.indexOf(100) : index) + direction))];
+      if (next === state.settings.autoBalance.target) return;
+      saveAuto({ target: next });
+      auto.setTargetOffset(targetDbOf(next));
       updateLiveUi();
     }
     function autoTick(now, sampledKey) {
@@ -3245,17 +3329,27 @@
       status.id = `${PANEL_ID}_status`;
       status.textContent = statusText(state);
       Object.assign(status.style, { minHeight: "14px", marginTop: "0", color: "#bdc1c6", fontSize: "11px", lineHeight: "14px", flex: "1 1 auto", minWidth: "0", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" });
-      const reset = makeButton("Reset", () => {
+      const reset = iconButton("reset", "Reset all participant volumes to 100%", () => {
         stopAuto();
         for (const participant of participants()) onGain(participant, 1);
         render();
       });
-      reset.setAttribute("aria-label", "Reset all participant volumes to 100%");
-      reset.style.flex = "0 0 auto";
-      balanceButton = makeButton("Auto Balance", toggleAuto);
+      reset.title = "Reset all to 100%";
+      const group = document.createElement("div");
+      group.dataset.role = "auto-target";
+      Object.assign(group.style, { display: "inline-flex", alignItems: "center", border: "1px solid #5f6368", borderRadius: "7px", overflow: "hidden", flex: "0 0 auto" });
+      const lower = iconButton("minus", "Lower Auto Balance target", () => stepTarget(-1));
+      const raise = iconButton("plus", "Raise Auto Balance target", () => stepTarget(1));
+      for (const button of [lower, raise]) Object.assign(button.style, { width: "22px", height: "24px", border: "0", borderRadius: "0" });
+      const value = document.createElement("div");
+      value.dataset.role = "auto-target-value";
+      value.title = "Auto Balance target level";
+      Object.assign(value.style, { minWidth: "34px", textAlign: "center", fontSize: "11px", lineHeight: "24px", color: "#e8eaed", borderLeft: "1px solid #5f6368", borderRight: "1px solid #5f6368", fontVariantNumeric: "tabular-nums" });
+      group.append(lower, value, raise);
+      targetParts = { group, lower, value, raise };
+      balanceButton = iconButton("balance", "Auto Balance", toggleAuto);
       balanceButton.onmouseenter = balanceButton.onmouseleave = updateBalanceButton;
-      balanceButton.style.flex = "0 0 auto";
-      footer.append(status, balanceButton, reset);
+      footer.append(status, group, balanceButton, reset);
       const support = document.createElement("a");
       support.textContent = "Support development";
       support.href = "https://buymeacoffee.com/andreclemente";
@@ -3287,7 +3381,7 @@
     function toggle() {
       state.closed ? show() : hide();
     }
-    return { render, show, hide, toggle, updateLiveUi, autoTick, stopAuto, invalidateAuto: (now, metadata) => auto.invalidate(now, metadata) };
+    return { render, show, hide, toggle, updateLiveUi, autoTick, stopAuto, restoreAuto, invalidateAuto: (now, metadata) => auto.invalidate(now, metadata) };
   }
   function recoverPosition(panel) {
     const rect = panel.getBoundingClientRect();
@@ -3429,11 +3523,12 @@
       state.platform = detectPlatform();
       const context = getContext();
       state.audioUnavailable = !context;
-      const common = { state, context, setStatus, renderSoon, updateLiveUi: panel.updateLiveUi, onLevelSample: panel.autoTick, onLevelReset: panel.invalidateAuto, onStop: panel.stopAuto, mediaOwnership };
+      const common = { state, context, setStatus, renderSoon, updateLiveUi: panel.updateLiveUi, onLevelSample: panel.autoTick, onLevelReset: panel.invalidateAuto, onStop: () => panel.stopAuto({ persist: false }), mediaOwnership };
       platformController = createGoogleMeetController(common);
       platformController.start();
       if (!context) setStatus("Audio unavailable · controls are inactive");
       panel.render();
+      if (context) panel.restoreAuto();
     };
     globalThis.__meetingAudioBoosterInstalled = true;
     const mediaOwnership = installRemoteMediaOwnership();
@@ -3444,6 +3539,10 @@
       // In-memory pre-volume levels from the controller; never persisted.
       levels: (key, options) => platformController?.levelFor?.(key, options) ?? null,
       onGain: applyGain,
+      onAutoSettings: (autoBalance) => {
+        state.settings.autoBalance = autoBalance;
+        saveSettings(globalThis.localStorage, state.settings);
+      },
       onCollapse: (collapsed) => {
         state.settings.collapsed = collapsed;
         saveSettings(globalThis.localStorage, state.settings);
