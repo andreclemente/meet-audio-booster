@@ -574,13 +574,42 @@ test('target buttons step 70%..140% in 10% steps, are remembered, and never stop
   f.parts().balance.click()
   for (let i = 0; i < 6; i++) f.parts().raise.click()
   assert.equal(f.parts().target.textContent, '140%')
-  assert.equal(f.parts().raise.disabled, true)
+  assert.equal(f.parts().raise.getAttribute('aria-disabled'), 'true')
+  assert.ok(!f.parts().raise.disabled, 'stays focusable at the limit')
+  f.parts().raise.click(); assert.equal(f.parts().target.textContent, '140%', 'no step past the limit')
+  assert.equal(f.parts().target.getAttribute('aria-live'), 'polite')
   assert.deepEqual(saved.at(-1), { enabled: true, target: 140 })
   for (let i = 0; i < 10; i++) f.parts().lower.click()
   assert.equal(f.parts().target.textContent, '70%')
-  assert.equal(f.parts().lower.disabled, true)
-  assert.equal(f.parts().raise.disabled, false)
+  assert.equal(f.parts().lower.getAttribute('aria-disabled'), 'true')
+  assert.equal(f.parts().raise.getAttribute('aria-disabled'), 'false')
   assert.equal(f.state.autoBalanceEnabled, true, 'changing the target keeps Auto Balance on')
   assert.deepEqual(f.gains, [], 'changing the target never moves a slider by itself')
   assert.equal(f.state.settings.autoBalance.target, 70)
+})
+
+test('a target changed in another tab is followed here without toggling Auto or moving sliders', t => {
+  const f = fixture(t)
+  f.parts().balance.click()
+  f.state.settings.autoBalance = { enabled: false, target: 130 }
+  f.controller.syncAutoSettings()
+  assert.equal(f.parts().target.textContent, '130%')
+  assert.equal(f.state.autoBalanceEnabled, true, 'a running Auto here is not switched off by another tab')
+  assert.deepEqual(f.gains, [])
+})
+
+test('Reset stores Auto Balance off; a slider in a tab where Auto never ran (no audio) keeps the saved on', t => {
+  const f = fixture(t)
+  const saved = []
+  const controller = createPanelController(f.state, { participants: () => f.people, onGain: (p, v) => { p.value = v }, onSave() {}, onAutoSettings: s => saved.push({ ...s }) })
+  controller.render()
+  f.parts().balance.click()
+  f.parts().reset.click()
+  assert.deepEqual(saved.at(-1), { enabled: false, target: 100 }, 'Reset of a running Auto stores off')
+  // Saved on, but this tab never restored it (audio unavailable).
+  f.state.settings.autoBalance = { enabled: true, target: 100 }; saved.length = 0
+  const slider = f.state.panel.querySelector('[data-role="slider"]')
+  slider.value = '2'; slider.oninput()
+  assert.deepEqual(saved, [], 'a never-started Auto is not saved as off')
+  assert.equal(f.state.settings.autoBalance.enabled, true)
 })

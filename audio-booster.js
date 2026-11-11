@@ -51,6 +51,14 @@
       return false;
     }
   }
+  function watchSettings(settings, { storage = globalThis.localStorage, listen = (name, handler) => globalThis.addEventListener?.(name, handler), onChange = () => {
+  } } = {}) {
+    listen("storage", (event) => {
+      if (event?.key !== STORAGE_KEY || event.storageArea && event.storageArea !== storage) return;
+      Object.assign(settings, loadSettings(storage));
+      onChange(settings);
+    });
+  }
   function normalizeName(value) {
     return String(value || "").replace(/\s+/g, " ").trim().toLocaleLowerCase();
   }
@@ -3177,18 +3185,20 @@
         const target = state.settings.autoBalance.target;
         const text = `${target}%`;
         if (targetParts.value.textContent !== text) targetParts.value.textContent = text;
-        targetParts.lower.disabled = target <= AUTO_TARGET_PERCENTS[0];
-        targetParts.raise.disabled = target >= AUTO_TARGET_PERCENTS.at(-1);
-        setStyle(targetParts.lower, "opacity", targetParts.lower.disabled ? "0.4" : "1");
-        setStyle(targetParts.raise, "opacity", targetParts.raise.disabled ? "0.4" : "1");
+        for (const [button2, atLimit] of [[targetParts.lower, target <= AUTO_TARGET_PERCENTS[0]], [targetParts.raise, target >= AUTO_TARGET_PERCENTS.at(-1)]]) {
+          button2.setAttribute("aria-disabled", String(atLimit));
+          setStyle(button2, "opacity", atLimit ? "0.4" : "1");
+          setStyle(button2, "cursor", atLimit ? "default" : "pointer");
+        }
         setStyle(targetParts.group, "opacity", auto.enabled ? "1" : "0.55");
       }
     }
     function stopAuto({ persist = true } = {}) {
+      const wasRunning = auto.enabled;
       auto.stop();
       state.autoBalanceEnabled = false;
       state.autoBalanceReady = false;
-      if (persist && state.settings.autoBalance.enabled) saveAuto({ enabled: false });
+      if (persist && wasRunning && state.settings.autoBalance.enabled) saveAuto({ enabled: false });
       updateBalanceButton();
       const status = document.getElementById(`${PANEL_ID}_status`);
       if (status) status.textContent = statusText(state);
@@ -3215,6 +3225,10 @@
         startAuto();
         updateLiveUi();
       }
+    }
+    function syncAutoSettings() {
+      auto.setTargetOffset(targetDbOf(state.settings.autoBalance.target));
+      updateLiveUi();
     }
     function stepTarget(direction) {
       const list = AUTO_TARGET_PERCENTS, index = list.indexOf(state.settings.autoBalance.target);
@@ -3344,6 +3358,7 @@
       const value = document.createElement("div");
       value.dataset.role = "auto-target-value";
       value.title = "Auto Balance target level";
+      value.setAttribute("aria-live", "polite");
       Object.assign(value.style, { minWidth: "34px", textAlign: "center", fontSize: "11px", lineHeight: "24px", color: "#e8eaed", borderLeft: "1px solid #5f6368", borderRight: "1px solid #5f6368", fontVariantNumeric: "tabular-nums" });
       group.append(lower, value, raise);
       targetParts = { group, lower, value, raise };
@@ -3381,7 +3396,7 @@
     function toggle() {
       state.closed ? show() : hide();
     }
-    return { render, show, hide, toggle, updateLiveUi, autoTick, stopAuto, restoreAuto, invalidateAuto: (now, metadata) => auto.invalidate(now, metadata) };
+    return { render, show, hide, toggle, updateLiveUi, autoTick, stopAuto, restoreAuto, syncAutoSettings, invalidateAuto: (now, metadata) => auto.invalidate(now, metadata) };
   }
   function recoverPosition(panel) {
     const rect = panel.getBoundingClientRect();
@@ -3552,6 +3567,7 @@
         saveSettings(globalThis.localStorage, state.settings);
       }
     });
+    watchSettings(state.settings, { onChange: () => panel.syncAutoSettings() });
     globalThis.__meetingAudioBooster = state;
     globalThis.__meetingAudioBoosterShow = panel.show;
     globalThis.__meetingAudioBoosterHide = panel.hide;

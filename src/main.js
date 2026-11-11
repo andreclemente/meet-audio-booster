@@ -1,5 +1,5 @@
 import { createState, visibleParticipants } from './state.js'
-import { saveSettings, setParticipantGain } from './storage.js'
+import { saveSettings, setParticipantGain, watchSettings } from './storage.js'
 import { detectPlatform } from './platforms/google-meet/platform.js'
 import { createGoogleMeetController } from './platforms/google-meet/index.js'
 import { installRemoteMediaOwnership } from './platforms/google-meet/media-ownership.js'
@@ -53,6 +53,7 @@ if (detectPlatform() === 'google-meet' && !globalThis.__meetingAudioBoosterInsta
     onSave: position => { state.settings.position = position; saveSettings(globalThis.localStorage, state.settings) }
   })
 
+  watchSettings(state.settings, { onChange: () => panel.syncAutoSettings() })
   globalThis.__meetingAudioBooster = state
   globalThis.__meetingAudioBoosterShow = panel.show
   globalThis.__meetingAudioBoosterHide = panel.hide

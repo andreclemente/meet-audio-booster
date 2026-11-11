@@ -10,7 +10,7 @@ Per-participant playback volume controls for Google Meet. Preferences stay in br
 2. Join a Google Meet call and use each participant's slider or preset to adjust what **you** hear. Start at 100% and raise volume gradually.
 3. Use the toolbar button to reopen a hidden panel; use the Reset button (↶) to return the listed participants to 100%.
 
-![Meet Audio Booster participant volume controls, level estimates and Balance](docs/assets/production-panel.png)
+![Meet Audio Booster participant volume controls, level estimates, Auto Balance and its target level](docs/assets/production-panel.png)
 
 ## Troubleshooting and support
 

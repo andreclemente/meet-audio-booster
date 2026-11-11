@@ -85,19 +85,24 @@ export function createPanelController(state, { participants, levels = () => null
       const target = state.settings.autoBalance.target
       const text = `${target}%`
       if (targetParts.value.textContent !== text) targetParts.value.textContent = text
-      targetParts.lower.disabled = target <= AUTO_TARGET_PERCENTS[0]
-      targetParts.raise.disabled = target >= AUTO_TARGET_PERCENTS.at(-1)
-      setStyle(targetParts.lower, 'opacity', targetParts.lower.disabled ? '0.4' : '1')
-      setStyle(targetParts.raise, 'opacity', targetParts.raise.disabled ? '0.4' : '1')
+      // aria-disabled (not disabled) keeps keyboard focus on the button at a limit.
+      for (const [button, atLimit] of [[targetParts.lower, target <= AUTO_TARGET_PERCENTS[0]], [targetParts.raise, target >= AUTO_TARGET_PERCENTS.at(-1)]]) {
+        button.setAttribute('aria-disabled', String(atLimit))
+        setStyle(button, 'opacity', atLimit ? '0.4' : '1')
+        setStyle(button, 'cursor', atLimit ? 'default' : 'pointer')
+      }
       setStyle(targetParts.group, 'opacity', auto.enabled ? '1' : '0.55')
     }
   }
   // persist=false when the page/controller shuts down: the user's choice stays.
   function stopAuto({ persist = true } = {}) {
+    // Only a user stopping an Auto Balance that was actually running stores
+    // off (e.g. not when audio was unavailable and it was never restored).
+    const wasRunning = auto.enabled
     auto.stop()
     state.autoBalanceEnabled = false
     state.autoBalanceReady = false
-    if (persist && state.settings.autoBalance.enabled) saveAuto({ enabled: false })
+    if (persist && wasRunning && state.settings.autoBalance.enabled) saveAuto({ enabled: false })
     updateBalanceButton()
     const status = document.getElementById(`${PANEL_ID}_status`)
     if (status) status.textContent = statusText(state)
@@ -117,6 +122,12 @@ export function createPanelController(state, { participants, levels = () => null
   // Restore the remembered on/off state when a meeting page starts.
   function restoreAuto() {
     if (state.settings.autoBalance.enabled && !auto.enabled) { startAuto(); updateLiveUi() }
+  }
+  // Settings changed in another tab: follow its target level. Its on/off
+  // choice applies to the next meeting; a running Auto here is not toggled.
+  function syncAutoSettings() {
+    auto.setTargetOffset(targetDbOf(state.settings.autoBalance.target))
+    updateLiveUi()
   }
   function stepTarget(direction) {
     const list = AUTO_TARGET_PERCENTS, index = list.indexOf(state.settings.autoBalance.target)
@@ -232,6 +243,7 @@ export function createPanelController(state, { participants, levels = () => null
     const value = document.createElement('div')
     value.dataset.role = 'auto-target-value'
     value.title = 'Auto Balance target level'
+    value.setAttribute('aria-live', 'polite')
     Object.assign(value.style, { minWidth: '34px', textAlign: 'center', fontSize: '11px', lineHeight: '24px', color: '#e8eaed', borderLeft: '1px solid #5f6368', borderRight: '1px solid #5f6368', fontVariantNumeric: 'tabular-nums' })
     group.append(lower, value, raise)
     targetParts = { group, lower, value, raise }
@@ -260,7 +272,7 @@ export function createPanelController(state, { participants, levels = () => null
   function show() { state.closed = false; render(); if (state.panel) state.panel.style.display = 'block' }
   function hide() { state.closed = true; if (state.panel) state.panel.style.display = 'none' }
   function toggle() { state.closed ? show() : hide() }
-  return { render, show, hide, toggle, updateLiveUi, autoTick, stopAuto, restoreAuto, invalidateAuto: (now, metadata) => auto.invalidate(now, metadata) }
+  return { render, show, hide, toggle, updateLiveUi, autoTick, stopAuto, restoreAuto, syncAutoSettings, invalidateAuto: (now, metadata) => auto.invalidate(now, metadata) }
 }
 
 function recoverPosition(panel) {
