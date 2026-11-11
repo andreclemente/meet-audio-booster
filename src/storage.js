@@ -48,6 +48,16 @@ export function saveSettings(storage = globalThis.localStorage, settings) {
   }
 }
 
+// Another Meet tab saved settings: adopt them, so this tab's next save does
+// not write back its older copy (whole-object saves). Same object identity.
+export function watchSettings(settings, { storage = globalThis.localStorage, listen = (name, handler) => globalThis.addEventListener?.(name, handler), onChange = () => {} } = {}) {
+  listen('storage', event => {
+    if (event?.key !== STORAGE_KEY || event.storageArea && event.storageArea !== storage) return
+    Object.assign(settings, loadSettings(storage))
+    onChange(settings)
+  })
+}
+
 export function normalizeName(value) {
   return String(value || '').replace(/\s+/g, ' ').trim().toLocaleLowerCase()
 }

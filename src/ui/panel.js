@@ -118,6 +118,12 @@ export function createPanelController(state, { participants, levels = () => null
   function restoreAuto() {
     if (state.settings.autoBalance.enabled && !auto.enabled) { startAuto(); updateLiveUi() }
   }
+  // Settings changed in another tab: follow its target level. Its on/off
+  // choice applies to the next meeting; a running Auto here is not toggled.
+  function syncAutoSettings() {
+    auto.setTargetOffset(targetDbOf(state.settings.autoBalance.target))
+    updateLiveUi()
+  }
   function stepTarget(direction) {
     const list = AUTO_TARGET_PERCENTS, index = list.indexOf(state.settings.autoBalance.target)
     const next = list[Math.max(0, Math.min(list.length - 1, (index < 0 ? list.indexOf(100) : index) + direction))]
@@ -260,7 +266,7 @@ export function createPanelController(state, { participants, levels = () => null
   function show() { state.closed = false; render(); if (state.panel) state.panel.style.display = 'block' }
   function hide() { state.closed = true; if (state.panel) state.panel.style.display = 'none' }
   function toggle() { state.closed ? show() : hide() }
-  return { render, show, hide, toggle, updateLiveUi, autoTick, stopAuto, restoreAuto, invalidateAuto: (now, metadata) => auto.invalidate(now, metadata) }
+  return { render, show, hide, toggle, updateLiveUi, autoTick, stopAuto, restoreAuto, syncAutoSettings, invalidateAuto: (now, metadata) => auto.invalidate(now, metadata) }
 }
 
 function recoverPosition(panel) {

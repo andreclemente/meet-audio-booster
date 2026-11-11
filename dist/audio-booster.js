@@ -51,6 +51,14 @@
       return false;
     }
   }
+  function watchSettings(settings, { storage = globalThis.localStorage, listen = (name, handler) => globalThis.addEventListener?.(name, handler), onChange = () => {
+  } } = {}) {
+    listen("storage", (event) => {
+      if (event?.key !== STORAGE_KEY || event.storageArea && event.storageArea !== storage) return;
+      Object.assign(settings, loadSettings(storage));
+      onChange(settings);
+    });
+  }
   function normalizeName(value) {
     return String(value || "").replace(/\s+/g, " ").trim().toLocaleLowerCase();
   }
@@ -3216,6 +3224,10 @@
         updateLiveUi();
       }
     }
+    function syncAutoSettings() {
+      auto.setTargetOffset(targetDbOf(state.settings.autoBalance.target));
+      updateLiveUi();
+    }
     function stepTarget(direction) {
       const list = AUTO_TARGET_PERCENTS, index = list.indexOf(state.settings.autoBalance.target);
       const next = list[Math.max(0, Math.min(list.length - 1, (index < 0 ? list.indexOf(100) : index) + direction))];
@@ -3381,7 +3393,7 @@
     function toggle() {
       state.closed ? show() : hide();
     }
-    return { render, show, hide, toggle, updateLiveUi, autoTick, stopAuto, restoreAuto, invalidateAuto: (now, metadata) => auto.invalidate(now, metadata) };
+    return { render, show, hide, toggle, updateLiveUi, autoTick, stopAuto, restoreAuto, syncAutoSettings, invalidateAuto: (now, metadata) => auto.invalidate(now, metadata) };
   }
   function recoverPosition(panel) {
     const rect = panel.getBoundingClientRect();
@@ -3552,6 +3564,7 @@
         saveSettings(globalThis.localStorage, state.settings);
       }
     });
+    watchSettings(state.settings, { onChange: () => panel.syncAutoSettings() });
     globalThis.__meetingAudioBooster = state;
     globalThis.__meetingAudioBoosterShow = panel.show;
     globalThis.__meetingAudioBoosterHide = panel.hide;

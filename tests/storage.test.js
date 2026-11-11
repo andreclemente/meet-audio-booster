@@ -1,7 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { STORAGE_KEY, LEGACY_STORAGE_KEYS } from '../src/shared/constants.js'
-import { loadSettings, saveSettings, participantStorageKeys, setParticipantGain, getParticipantGain } from '../src/storage.js'
+import { loadSettings, saveSettings, participantStorageKeys, setParticipantGain, getParticipantGain, watchSettings } from '../src/storage.js'
 import { createState } from '../src/state.js'
 
 const AUTO_OFF = { enabled: false, target: 100 }
@@ -103,4 +103,24 @@ test('Auto Balance on/off and target level are remembered; bad values fall back 
     const s = memoryStorage({ [STORAGE_KEY]: JSON.stringify({ gains: {}, autoBalance }) })
     assert.deepEqual(loadSettings(s).autoBalance, expected, JSON.stringify(autoBalance))
   }
+})
+
+test('a save from another tab is adopted, so this tab never writes back its older copy', () => {
+  const storage = memoryStorage()
+  const settings = loadSettings(storage)
+  let handler = null, changes = 0
+  watchSettings(settings, { storage, listen: (name, h) => { assert.equal(name, 'storage'); handler = h }, onChange: s => { assert.equal(s, settings); changes++ } })
+  // Tab B turns Auto on at 120% and sets a volume.
+  const other = loadSettings(storage)
+  other.autoBalance = { enabled: true, target: 120 }; setParticipantGain(other, { platform: 'google-meet', name: 'Bob' }, 2)
+  saveSettings(storage, other)
+  handler({ key: 'unrelated' }); assert.equal(changes, 0)
+  handler({ key: STORAGE_KEY, storageArea: storage })
+  assert.equal(changes, 1)
+  // This tab now saves its own change (panel position) without undoing tab B.
+  settings.position = { left: 5, top: 6 }; saveSettings(storage, settings)
+  const stored = loadSettings(storage)
+  assert.deepEqual(stored.autoBalance, { enabled: true, target: 120 })
+  assert.equal(getParticipantGain(stored, { platform: 'google-meet', name: 'Bob' }), 2)
+  assert.deepEqual(stored.position, { left: 5, top: 6 })
 })

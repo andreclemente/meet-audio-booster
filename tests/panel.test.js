@@ -584,3 +584,13 @@ test('target buttons step 70%..140% in 10% steps, are remembered, and never stop
   assert.deepEqual(f.gains, [], 'changing the target never moves a slider by itself')
   assert.equal(f.state.settings.autoBalance.target, 70)
 })
+
+test('a target changed in another tab is followed here without toggling Auto or moving sliders', t => {
+  const f = fixture(t)
+  f.parts().balance.click()
+  f.state.settings.autoBalance = { enabled: false, target: 130 }
+  f.controller.syncAutoSettings()
+  assert.equal(f.parts().target.textContent, '130%')
+  assert.equal(f.state.autoBalanceEnabled, true, 'a running Auto here is not switched off by another tab')
+  assert.deepEqual(f.gains, [])
+})
