@@ -3,6 +3,36 @@ import { panelStyles, headerStyles } from './styles.js'
 import { makeButton, renderParticipantRow } from './participant-row.js'
 import { postVolumeDb, dbToScale } from './balance.js'
 import { createAutoBalance } from './auto-balance.js'
+import { AUTO_TARGET_PERCENTS } from '../storage.js'
+
+// Inline SVG icons (no icon font, no remote assets); labels come from
+// aria-label/title, never from translated page text.
+const ICONS = {
+  balance: 'M440-120v-240h80v80h320v80H520v80h-80Zm-320-80v-80h240v80H120Zm160-160v-80H120v-80h160v-80h80v240h-80Zm160-80v-80h400v80H440Zm160-160v-240h80v80h160v80H680v80h-80Zm-480-80v-80h400v80H120Z',
+  reset: 'M280-200v-80h284q63 0 109.5-40T720-420q0-60-46.5-100T564-560H312l104 104-56 56-200-200 200-200 56 56-104 104h252q97 0 166.5 63T800-420q0 94-69.5 157T564-200H280Z',
+  minus: 'M200-440v-80h560v80H200Z',
+  plus: 'M440-440H200v-80h240v-240h80v240h240v80H520v240h-80v-240Z'
+}
+function icon(name) {
+  const ns = 'http://www.w3.org/2000/svg'
+  const svg = document.createElementNS(ns, 'svg')
+  svg.setAttribute('viewBox', '0 -960 960 960'); svg.setAttribute('width', '16'); svg.setAttribute('height', '16')
+  svg.setAttribute('fill', 'currentColor'); svg.setAttribute('aria-hidden', 'true'); svg.setAttribute('focusable', 'false')
+  const path = document.createElementNS(ns, 'path')
+  path.setAttribute('d', ICONS[name])
+  svg.append(path)
+  return svg
+}
+function iconButton(name, label, action) {
+  const button = makeButton('', action)
+  button.type = 'button'
+  button.append(icon(name))
+  button.setAttribute('aria-label', label)
+  button.title = label
+  Object.assign(button.style, { width: '28px', height: '26px', padding: '0', display: 'inline-flex', alignItems: 'center', justifyContent: 'center', flex: '0 0 auto' })
+  return button
+}
+const targetDbOf = percent => 20 * Math.log10(percent / 100)
 
 // Reuse the existing footer: automatic learning/state, otherwise routing status.
 export function statusText(state, now = Date.now()) {
@@ -29,28 +59,51 @@ function updateLevelMeter(row, participant, levels) {
   if (track.title !== title) track.title = title
 }
 
-export function createPanelController(state, { participants, levels = () => null, onGain, onSave, onCollapse }) {
+export function createPanelController(state, { participants, levels = () => null, onGain, onSave, onCollapse, onAutoSettings = () => {} }) {
   const auto = createAutoBalance({ participants, levels, onGain })
   state.autoBalanceEnabled = false
-  let balanceButton = null
+  state.settings.autoBalance ??= { enabled: false, target: 100 }
+  auto.setTargetOffset(targetDbOf(state.settings.autoBalance.target))
+  let balanceButton = null, targetParts = null
+  function saveAuto(changes) {
+    state.settings.autoBalance = { ...state.settings.autoBalance, ...changes }
+    onAutoSettings(state.settings.autoBalance)
+  }
   function updateBalanceButton() {
     const button = balanceButton
-    if (!button) return
-    button.textContent = 'Auto Balance'
-    button.setAttribute('aria-label', 'Auto Balance')
-    button.setAttribute('aria-pressed', String(auto.enabled))
-    setStyle(button, 'color', auto.enabled ? '#202124' : '#8ab4f8')
-    setStyle(button, 'background', auto.enabled ? '#8ab4f8' : '#303134')
-    setStyle(button, 'borderColor', '#8ab4f8')
-    button.disabled = false
+    if (button) {
+      const label = auto.enabled ? 'Auto Balance: on' : 'Auto Balance: off'
+      button.setAttribute('aria-label', 'Auto Balance')
+      button.setAttribute('aria-pressed', String(auto.enabled))
+      if (button.title !== label) button.title = label
+      setStyle(button, 'color', auto.enabled ? '#202124' : '#8ab4f8')
+      setStyle(button, 'background', auto.enabled ? '#8ab4f8' : '#303134')
+      setStyle(button, 'borderColor', '#8ab4f8')
+      button.disabled = false
+    }
+    if (targetParts) {
+      const target = state.settings.autoBalance.target
+      const text = `${target}%`
+      if (targetParts.value.textContent !== text) targetParts.value.textContent = text
+      targetParts.lower.disabled = target <= AUTO_TARGET_PERCENTS[0]
+      targetParts.raise.disabled = target >= AUTO_TARGET_PERCENTS.at(-1)
+      setStyle(targetParts.lower, 'opacity', targetParts.lower.disabled ? '0.4' : '1')
+      setStyle(targetParts.raise, 'opacity', targetParts.raise.disabled ? '0.4' : '1')
+      setStyle(targetParts.group, 'opacity', auto.enabled ? '1' : '0.55')
+    }
   }
-  function stopAuto() {
+  // persist=false when the page/controller shuts down: the user's choice stays.
+  function stopAuto({ persist = true } = {}) {
     auto.stop()
     state.autoBalanceEnabled = false
     state.autoBalanceReady = false
+    if (persist && state.settings.autoBalance.enabled) saveAuto({ enabled: false })
     updateBalanceButton()
     const status = document.getElementById(`${PANEL_ID}_status`)
     if (status) status.textContent = statusText(state)
+  }
+  function startAuto() {
+    auto.start(Date.now()); state.autoBalanceEnabled = true; state.autoBalanceReady = false
   }
   function manualGain(participant, value) {
     stopAuto()
@@ -58,7 +111,19 @@ export function createPanelController(state, { participants, levels = () => null
   }
   function toggleAuto() {
     if (auto.enabled) stopAuto()
-    else { auto.start(Date.now()); state.autoBalanceEnabled = true; state.autoBalanceReady = false }
+    else { startAuto(); saveAuto({ enabled: true }) }
+    updateLiveUi()
+  }
+  // Restore the remembered on/off state when a meeting page starts.
+  function restoreAuto() {
+    if (state.settings.autoBalance.enabled && !auto.enabled) { startAuto(); updateLiveUi() }
+  }
+  function stepTarget(direction) {
+    const list = AUTO_TARGET_PERCENTS, index = list.indexOf(state.settings.autoBalance.target)
+    const next = list[Math.max(0, Math.min(list.length - 1, (index < 0 ? list.indexOf(100) : index) + direction))]
+    if (next === state.settings.autoBalance.target) return
+    saveAuto({ target: next })
+    auto.setTargetOffset(targetDbOf(next))
     updateLiveUi()
   }
   function autoTick(now, sampledKey) {
@@ -156,13 +221,23 @@ export function createPanelController(state, { participants, levels = () => null
     const status = document.createElement('div')
     status.id = `${PANEL_ID}_status`; status.textContent = statusText(state)
     Object.assign(status.style, { minHeight: '14px', marginTop: '0', color: '#bdc1c6', fontSize: '11px', lineHeight: '14px', flex: '1 1 auto', minWidth: '0', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' })
-    const reset = makeButton('Reset', () => { stopAuto(); for (const participant of participants()) onGain(participant, 1); render() })
-    reset.setAttribute('aria-label', 'Reset all participant volumes to 100%')
-    reset.style.flex = '0 0 auto'
-    balanceButton = makeButton('Auto Balance', toggleAuto)
+    const reset = iconButton('reset', 'Reset all participant volumes to 100%', () => { stopAuto(); for (const participant of participants()) onGain(participant, 1); render() })
+    reset.title = 'Reset all to 100%'
+    const group = document.createElement('div')
+    group.dataset.role = 'auto-target'
+    Object.assign(group.style, { display: 'inline-flex', alignItems: 'center', border: '1px solid #5f6368', borderRadius: '7px', overflow: 'hidden', flex: '0 0 auto' })
+    const lower = iconButton('minus', 'Lower Auto Balance target', () => stepTarget(-1))
+    const raise = iconButton('plus', 'Raise Auto Balance target', () => stepTarget(1))
+    for (const button of [lower, raise]) Object.assign(button.style, { width: '22px', height: '24px', border: '0', borderRadius: '0' })
+    const value = document.createElement('div')
+    value.dataset.role = 'auto-target-value'
+    value.title = 'Auto Balance target level'
+    Object.assign(value.style, { minWidth: '34px', textAlign: 'center', fontSize: '11px', lineHeight: '24px', color: '#e8eaed', borderLeft: '1px solid #5f6368', borderRight: '1px solid #5f6368', fontVariantNumeric: 'tabular-nums' })
+    group.append(lower, value, raise)
+    targetParts = { group, lower, value, raise }
+    balanceButton = iconButton('balance', 'Auto Balance', toggleAuto)
     balanceButton.onmouseenter = balanceButton.onmouseleave = updateBalanceButton
-    balanceButton.style.flex = '0 0 auto'
-    footer.append(status, balanceButton, reset)
+    footer.append(status, group, balanceButton, reset)
     const support = document.createElement('a')
     support.textContent = 'Support development'
     support.href = 'https://buymeacoffee.com/andreclemente'
@@ -185,7 +260,7 @@ export function createPanelController(state, { participants, levels = () => null
   function show() { state.closed = false; render(); if (state.panel) state.panel.style.display = 'block' }
   function hide() { state.closed = true; if (state.panel) state.panel.style.display = 'none' }
   function toggle() { state.closed ? show() : hide() }
-  return { render, show, hide, toggle, updateLiveUi, autoTick, stopAuto, invalidateAuto: (now, metadata) => auto.invalidate(now, metadata) }
+  return { render, show, hide, toggle, updateLiveUi, autoTick, stopAuto, restoreAuto, invalidateAuto: (now, metadata) => auto.invalidate(now, metadata) }
 }
 
 function recoverPosition(panel) {

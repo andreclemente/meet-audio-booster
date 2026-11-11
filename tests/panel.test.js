@@ -38,6 +38,7 @@ function fixture(t) {
   const document = { activeElement: null }
   document.documentElement = new Element('html', document)
   document.createElement = tag => new Element(tag, document)
+  document.createElementNS = (ns, tag) => Object.assign(new Element(tag, document), { namespaceURI: ns })
   document.getElementById = id => [document.documentElement, ...document.documentElement.querySelectorAll('div')].find(element => element.id === id) ?? null
   globalThis.document = document
   globalThis.addEventListener = (name, handler) => { events[name] = handler }
@@ -54,7 +55,9 @@ function fixture(t) {
     const [header, body] = state.panel.children
     const buttons = header.querySelectorAll('button')
     const footerButtons = body.children[1].querySelectorAll('button')
-    return { header, body, collapse: buttons[0], close: buttons[1], balance: footerButtons[0], reset: footerButtons[1] }
+    const by = label => footerButtons.find(b => b.getAttribute('aria-label') === label)
+    return { header, body, collapse: buttons[0], close: buttons[1], balance: by('Auto Balance'), reset: by('Reset all participant volumes to 100%'),
+      lower: by('Lower Auto Balance target'), raise: by('Raise Auto Balance target'), target: body.children[1].querySelector('[data-role="auto-target-value"]') }
   }
   return { state, controller, parts, document, events, gains, saves, collapses, people, alice, levelData }
 }
@@ -134,7 +137,7 @@ test('panel starts expanded with collapse immediately left of close and one comp
   assert.match(header.children[0].children[1].textContent, /1 participant/)
   assert.equal(body.children.length, 3)
   assert.equal(body.children[0].querySelectorAll('[data-participant-key]').length, 1)
-  assert.equal(parts().reset.textContent, 'Reset')
+  assert.equal(parts().reset.title, 'Reset all to 100%')
   assert.equal(body.children[1].children[0].textContent, state.status)
   assert.equal(body.children[2].textContent, 'Support development')
   assertExpanded(parts(), true)
@@ -227,10 +230,17 @@ test('approved support layout keeps exact dynamic status left of Reset all and s
   const [list, footer, support] = parts().body.children
   const status = document.getElementById(`${PANEL_ID}_status`)
   assert.equal(list.querySelectorAll('[data-participant-key]').length, 1)
-  const [balance, reset] = footer.querySelectorAll('button')
-  assert.deepEqual(footer.children, [status, balance, reset])
-  assert.equal(balance.textContent, 'Auto Balance')
-  assert.equal(reset.textContent, 'Reset')
+  const { balance, reset, lower, raise, target } = parts()
+  const group = footer.children[1]
+  assert.deepEqual(footer.children, [status, group, balance, reset])
+  assert.deepEqual(group.children, [lower, target, raise])
+  assert.equal(target.textContent, '100%')
+  for (const button of [lower, raise, balance, reset]) {
+    assert.equal(button.textContent, '', 'icon-only button')
+    assert.equal(button.children[0].tagName, 'svg')
+    assert.equal(button.children[0].getAttribute('aria-hidden'), 'true')
+    assert.ok(button.title && button.getAttribute('aria-label'))
+  }
   assert.equal(footer.style.justifyContent, 'space-between')
   assert.equal(status.textContent, state.status)
   assert.equal(status.style.marginTop, '0')
@@ -476,7 +486,8 @@ test('Auto Balance defaults off and is available before voices are heard', t => 
   const f = fixture(t)
   const { balance, reset } = f.parts()
   assert.equal(balance.parentElement, reset.parentElement)
-  assert.equal(balance.textContent, 'Auto Balance')
+  assert.equal(balance.getAttribute('aria-label'), 'Auto Balance')
+  assert.equal(balance.title, 'Auto Balance: off')
   assert.equal(balance.getAttribute('aria-pressed'), 'false')
   assert.equal(balance.style.color, '#8ab4f8')
   assert.equal(balance.style.background, '#303134')
@@ -530,4 +541,46 @@ test('status notice briefly overrides routing status, then routing status return
   assert.equal(statusText(state, 999), 'Balanced 2 voices')
   assert.equal(statusText(state, 1000), 'Alice · automatic routing')
   assert.equal(statusText({ status: 'Ready' }, 0), 'Ready')
+})
+
+test('Auto Balance on/off is remembered, restored on a new page, and a manual change remembers off', t => {
+  const f = fixture(t)
+  const saved = []
+  // Recreate with the persistence callback, as production wires it.
+  const controller = createPanelController(f.state, { participants: () => f.people, onGain: (p, v) => { f.gains.push([p.key, v]); p.value = v }, onSave() {}, onAutoSettings: s => saved.push({ ...s }) })
+  controller.render()
+  f.parts().balance.click()
+  assert.deepEqual(saved.at(-1), { enabled: true, target: 100 })
+  // A new meeting page restores it.
+  const next = createPanelController(f.state, { participants: () => f.people, onGain() {}, onSave() {}, onAutoSettings() {} })
+  assert.equal(f.state.autoBalanceEnabled, false)
+  next.restoreAuto()
+  assert.equal(f.state.autoBalanceEnabled, true)
+  // Teardown keeps the remembered choice; a user action stores off.
+  controller.stopAuto({ persist: false })
+  assert.deepEqual(saved.at(-1), { enabled: true, target: 100 })
+  controller.render(); controller.restoreAuto()
+  const slider = f.state.panel.querySelector('[data-role="slider"]')
+  slider.value = '2'; slider.oninput()
+  assert.equal(f.state.autoBalanceEnabled, false)
+  assert.deepEqual(saved.at(-1), { enabled: false, target: 100 })
+})
+
+test('target buttons step 70%..140% in 10% steps, are remembered, and never stop Auto Balance or move sliders', t => {
+  const f = fixture(t)
+  const saved = []
+  const controller = createPanelController(f.state, { participants: () => f.people, onGain: (p, v) => { f.gains.push([p.key, v]); p.value = v }, onSave() {}, onAutoSettings: s => saved.push({ ...s }) })
+  controller.render()
+  f.parts().balance.click()
+  for (let i = 0; i < 6; i++) f.parts().raise.click()
+  assert.equal(f.parts().target.textContent, '140%')
+  assert.equal(f.parts().raise.disabled, true)
+  assert.deepEqual(saved.at(-1), { enabled: true, target: 140 })
+  for (let i = 0; i < 10; i++) f.parts().lower.click()
+  assert.equal(f.parts().target.textContent, '70%')
+  assert.equal(f.parts().lower.disabled, true)
+  assert.equal(f.parts().raise.disabled, false)
+  assert.equal(f.state.autoBalanceEnabled, true, 'changing the target keeps Auto Balance on')
+  assert.deepEqual(f.gains, [], 'changing the target never moves a slider by itself')
+  assert.equal(f.state.settings.autoBalance.target, 70)
 })

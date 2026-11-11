@@ -1,6 +1,18 @@
 import { LEGACY_STORAGE_KEYS, STORAGE_KEY } from './shared/constants.js'
 
-const defaults = () => ({ gains: {}, position: null, collapsed: false })
+export const AUTO_TARGET_PERCENTS = [70, 80, 90, 100, 110, 120, 130, 140]
+const defaultAutoBalance = () => ({ enabled: false, target: 100 })
+const defaults = () => ({ gains: {}, position: null, collapsed: false, autoBalance: defaultAutoBalance() })
+
+// Auto Balance on/off and its target level are user preferences, remembered
+// across meetings. Unknown or out-of-range values fall back to the defaults.
+function sanitizeAutoBalance(value) {
+  if (!value || typeof value !== 'object') return defaultAutoBalance()
+  return {
+    enabled: value.enabled === true,
+    target: AUTO_TARGET_PERCENTS.includes(value.target) ? value.target : 100
+  }
+}
 
 function sanitize(value) {
   if (!value || typeof value !== 'object') return defaults()
@@ -8,7 +20,8 @@ function sanitize(value) {
     gains: value.gains && typeof value.gains === 'object' ? value.gains : {},
     position: value.position && Number.isFinite(value.position.left) && Number.isFinite(value.position.top)
       ? { left: value.position.left, top: value.position.top } : null,
-    collapsed: value.collapsed === true
+    collapsed: value.collapsed === true,
+    autoBalance: sanitizeAutoBalance(value.autoBalance)
   }
 }
 

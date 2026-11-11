@@ -167,3 +167,19 @@ test('persistent quiet/loud directions reverse and relearn after graph invalidat
  assert.equal(f.auto.targetDb,-20)
  assert.ok(f.people[0].value>restart[0]&&f.people[1].value<restart[1])
 })
+
+test('a raised or lowered target moves voices toward the new level without discarding measurements',()=>{
+ const f=fixture([1]);f.run(0,-20,200)
+ assert.equal(f.auto.targetDb,-20);assert.equal(f.writes.length,0)
+ f.auto.setTargetOffset(20*Math.log10(1.4))
+ assert.ok(Math.abs(f.auto.targetDb-(-20+20*Math.log10(1.4)))<1e-9,'target follows the user level immediately')
+ f.run(0,-20,400)
+ assert.ok(f.writes.length>0&&f.writes.every(w=>w.to>w.from),'boosts toward the higher target')
+ const n=f.writes.length;f.auto.setTargetOffset(0);f.run(0,-20,400)
+ assert.ok(f.writes.slice(n).every(w=>w.to<w.from),'then reduces after lowering it back')
+})
+test('target offset applies once Auto has measured a first voice, also after an invalidation',()=>{
+ const f=fixture([1]);f.auto.setTargetOffset(-3);assert.equal(f.auto.targetDb,null)
+ f.run(0,-20,200);assert.equal(f.auto.targetDb,-23)
+ f.auto.invalidate(f.now);assert.equal(f.auto.targetDb,null)
+})
