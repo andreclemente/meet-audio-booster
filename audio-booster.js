@@ -3185,18 +3185,20 @@
         const target = state.settings.autoBalance.target;
         const text = `${target}%`;
         if (targetParts.value.textContent !== text) targetParts.value.textContent = text;
-        targetParts.lower.disabled = target <= AUTO_TARGET_PERCENTS[0];
-        targetParts.raise.disabled = target >= AUTO_TARGET_PERCENTS.at(-1);
-        setStyle(targetParts.lower, "opacity", targetParts.lower.disabled ? "0.4" : "1");
-        setStyle(targetParts.raise, "opacity", targetParts.raise.disabled ? "0.4" : "1");
+        for (const [button2, atLimit] of [[targetParts.lower, target <= AUTO_TARGET_PERCENTS[0]], [targetParts.raise, target >= AUTO_TARGET_PERCENTS.at(-1)]]) {
+          button2.setAttribute("aria-disabled", String(atLimit));
+          setStyle(button2, "opacity", atLimit ? "0.4" : "1");
+          setStyle(button2, "cursor", atLimit ? "default" : "pointer");
+        }
         setStyle(targetParts.group, "opacity", auto.enabled ? "1" : "0.55");
       }
     }
     function stopAuto({ persist = true } = {}) {
+      const wasRunning = auto.enabled;
       auto.stop();
       state.autoBalanceEnabled = false;
       state.autoBalanceReady = false;
-      if (persist && state.settings.autoBalance.enabled) saveAuto({ enabled: false });
+      if (persist && wasRunning && state.settings.autoBalance.enabled) saveAuto({ enabled: false });
       updateBalanceButton();
       const status = document.getElementById(`${PANEL_ID}_status`);
       if (status) status.textContent = statusText(state);
@@ -3356,6 +3358,7 @@
       const value = document.createElement("div");
       value.dataset.role = "auto-target-value";
       value.title = "Auto Balance target level";
+      value.setAttribute("aria-live", "polite");
       Object.assign(value.style, { minWidth: "34px", textAlign: "center", fontSize: "11px", lineHeight: "24px", color: "#e8eaed", borderLeft: "1px solid #5f6368", borderRight: "1px solid #5f6368", fontVariantNumeric: "tabular-nums" });
       group.append(lower, value, raise);
       targetParts = { group, lower, value, raise };
