@@ -1,6 +1,6 @@
 import { PANEL_ID } from '../shared/constants.js'
 import { panelStyles, headerStyles } from './styles.js'
-import { makeButton, renderParticipantRow } from './participant-row.js'
+import { makeButton, renderParticipantRow, updateMuteButton } from './participant-row.js'
 import { postVolumeDb, dbToScale } from './balance.js'
 import { createAutoBalance } from './auto-balance.js'
 import { AUTO_TARGET_PERCENTS } from '../storage.js'
@@ -38,7 +38,9 @@ const targetDbOf = percent => 20 * Math.log10(percent / 100)
 export function statusText(state, now = Date.now()) {
   if (state.autoBalanceEnabled) return state.autoBalanceReady ? 'Auto Balance on' : 'Learning levels…'
   const notice = state.statusNotice
-  return notice && now < notice.until ? notice.message : state.status
+  if (notice && now < notice.until) return notice.message
+  // Routing details are not shown; only a problem that leaves controls inactive.
+  return state.audioUnavailable ? state.status : ''
 }
 
 function setStyle(element, name, value) {
@@ -59,7 +61,7 @@ function updateLevelMeter(row, participant, levels) {
   if (track.title !== title) track.title = title
 }
 
-export function createPanelController(state, { participants, levels = () => null, onGain, onSave, onCollapse, onAutoSettings = () => {} }) {
+export function createPanelController(state, { participants, levels = () => null, onGain, onSave, onCollapse, onAutoSettings = () => {}, unmuteValue = () => 1, onSettle = () => {} }) {
   const auto = createAutoBalance({ participants, levels, onGain })
   state.autoBalanceEnabled = false
   state.settings.autoBalance ??= { enabled: false, target: 100 }
@@ -110,9 +112,9 @@ export function createPanelController(state, { participants, levels = () => null
   function startAuto() {
     auto.start(Date.now()); state.autoBalanceEnabled = true; state.autoBalanceReady = false
   }
-  function manualGain(participant, value) {
+  function manualGain(participant, value, options) {
     stopAuto()
-    onGain(participant, value)
+    onGain(participant, value, options)
   }
   function toggleAuto() {
     if (auto.enabled) stopAuto()
@@ -156,6 +158,7 @@ export function createPanelController(state, { participants, levels = () => null
       if (value) value.textContent = `${Math.round(participant.value * 100)}%`
       const slider = row.querySelector('[data-role="slider"]')
       if (slider && document.activeElement !== slider) slider.value = String(participant.value)
+      updateMuteButton(row, participant)
       updateLevelMeter(row, participant, levels)
     }
   }
@@ -182,11 +185,7 @@ export function createPanelController(state, { participants, levels = () => null
     const title = document.createElement('div')
     title.textContent = 'Google Meet Audio Booster'
     Object.assign(title.style, { fontWeight: '700', fontSize: '13px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' })
-    const subtitle = document.createElement('div')
-    const outputCount = state.google.mode === 'media' ? state.google.mediaPipelines.length : state.google.slots.length
-    subtitle.textContent = `${listItems.length} participant${listItems.length === 1 ? '' : 's'} · ${outputCount} ${state.google.mode === 'media' ? 'media stream' : 'audio slot'}${outputCount === 1 ? '' : 's'}`
-    Object.assign(subtitle.style, { opacity: '0.68', fontSize: '11px', marginTop: '2px' })
-    titleWrap.append(title, subtitle)
+    titleWrap.append(title)
     const body = document.createElement('div')
     body.id = `${PANEL_ID}_body`
     function toggleCollapsed() {
@@ -225,7 +224,7 @@ export function createPanelController(state, { participants, levels = () => null
       const empty = document.createElement('div'); empty.textContent = 'Waiting for remote participants…'
       Object.assign(empty.style, { opacity: '0.75', padding: '8px 0' }); list.append(empty)
     }
-    for (const participant of listItems) list.append(renderParticipantRow(participant, manualGain))
+    for (const participant of listItems) list.append(renderParticipantRow(participant, manualGain, { unmuteValue, onSettle }))
     body.append(list)
     const footer = document.createElement('div')
     Object.assign(footer.style, { display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '6px', marginTop: '9px', paddingTop: '8px', borderTop: '1px solid #3c4043' })

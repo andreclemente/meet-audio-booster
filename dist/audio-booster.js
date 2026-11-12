@@ -12,7 +12,7 @@
   // src/storage.js
   var AUTO_TARGET_PERCENTS = [70, 80, 90, 100, 110, 120, 130, 140];
   var defaultAutoBalance = () => ({ enabled: false, target: 100 });
-  var defaults = () => ({ gains: {}, position: null, collapsed: false, autoBalance: defaultAutoBalance() });
+  var defaults = () => ({ gains: {}, unmute: {}, position: null, collapsed: false, autoBalance: defaultAutoBalance() });
   function sanitizeAutoBalance(value) {
     if (!value || typeof value !== "object") return defaultAutoBalance();
     return {
@@ -20,10 +20,17 @@
       target: AUTO_TARGET_PERCENTS.includes(value.target) ? value.target : 100
     };
   }
+  function sanitizeUnmute(value) {
+    const unmute = {};
+    if (!value || typeof value !== "object" || Array.isArray(value)) return unmute;
+    for (const [key, gain] of Object.entries(value)) if (typeof gain === "number" && gain > 0 && gain <= 6) unmute[key] = gain;
+    return unmute;
+  }
   function sanitize(value) {
     if (!value || typeof value !== "object") return defaults();
     return {
       gains: value.gains && typeof value.gains === "object" ? value.gains : {},
+      unmute: sanitizeUnmute(value.unmute),
       position: value.position && Number.isFinite(value.position.left) && Number.isFinite(value.position.top) ? { left: value.position.left, top: value.position.top } : null,
       collapsed: value.collapsed === true,
       autoBalance: sanitizeAutoBalance(value.autoBalance)
@@ -75,6 +82,24 @@
       if (typeof value === "number" && Number.isFinite(value)) return value;
     }
     return 1;
+  }
+  function getParticipantUnmute(settings, participant) {
+    for (const key of participantStorageKeys(participant)) {
+      const value = settings?.unmute?.[key];
+      if (typeof value === "number" && value > 0 && value <= 6) return value;
+    }
+    return 1;
+  }
+  function rememberAudible(participant, next, { dragging = false } = {}) {
+    if (!(participant.unmuteValue > 0) && participant.value > 0) participant.unmuteValue = participant.value;
+    if (next > 0 && !dragging) participant.unmuteValue = next;
+    return participant.unmuteValue;
+  }
+  function setParticipantUnmute(settings, participant, value) {
+    if (!(typeof value === "number" && value > 0 && value <= 6)) return settings;
+    settings.unmute ||= {};
+    for (const key of participantStorageKeys(participant)) settings.unmute[key] = value;
+    return settings;
   }
   function setParticipantGain(settings, participant, value) {
     settings.gains ||= {};
@@ -2959,15 +2984,34 @@
     element.textContent = text;
     Object.assign(element.style, buttonStyles);
     element.addEventListener("mouseenter", () => {
-      element.style.background = "#3c4043";
+      if (element.dataset.muted !== "true") element.style.background = "#3c4043";
     });
     element.addEventListener("mouseleave", () => {
-      element.style.background = "#303134";
+      if (element.dataset.muted !== "true") element.style.background = "#303134";
     });
     element.onclick = action;
     return element;
   }
-  function renderParticipantRow(participant, onGain) {
+  var SPEAKER = "M560-131v-82q90-26 145-100t55-168q0-94-55-168T560-749v-82q124 28 202 125.5T840-481q0 127-78 224.5T560-131ZM120-360v-240h160l200-200v640L280-360H120Zm440 40v-322q47 22 73.5 66t26.5 96q0 51-26.5 94.5T560-320Z";
+  var MUTED = "M792-56 671-177q-25 16-53 27.5T560-131v-82q14-5 27.5-10t25.5-12L480-368v208L280-360H120v-240h128L56-792l56-56 736 736-56 56Zm-8-232-58-58q17-31 25.5-65t8.5-70q0-94-55-168T560-749v-82q124 28 202 125.5T840-481q0 53-14.5 102T784-288ZM650-422l-90-90v-130q47 22 73.5 66t26.5 96q0 15-2.5 29.5T650-422ZM480-592 376-696l104-104v208Z";
+  var SETTLE_MS = 700;
+  function updateMuteButton(row, participant) {
+    const button = row.querySelector('[data-role="mute"]');
+    if (!button) return;
+    const muted = !(participant.value > 0);
+    if (button.dataset.muted === String(muted) && button.getAttribute("aria-label") === `${muted ? "Unmute" : "Mute"} ${participant.name}`) return;
+    button.dataset.muted = String(muted);
+    const label = `${muted ? "Unmute" : "Mute"} ${participant.name}`;
+    button.setAttribute("aria-label", label);
+    button.setAttribute("aria-pressed", String(muted));
+    button.title = muted ? "Unmute" : "Mute";
+    button.querySelector("path")?.setAttribute("d", muted ? MUTED : SPEAKER);
+    Object.assign(button.style, { color: muted ? "#f28b82" : "#e8eaed", borderColor: muted ? "#f28b82" : "#5f6368", background: muted ? "#3c2a2a" : "#303134" });
+    const slider = row.querySelector('[data-role="slider"]');
+    if (slider) slider.style.opacity = muted ? "0.45" : "1";
+  }
+  function renderParticipantRow(participant, onGain, { unmuteValue = () => 1, onSettle = () => {
+  } } = {}) {
     const row = document.createElement("div");
     row.dataset.participantKey = participant.key;
     Object.assign(row.style, { padding: "9px 0", borderTop: "1px solid #3c4043" });
@@ -2988,25 +3032,56 @@
     Object.assign(slider, { type: "range", min: "0", max: "6", step: "0.05", value: String(participant.value) });
     slider.dataset.role = "slider";
     slider.setAttribute("aria-label", `Volume for ${participant.name}`);
-    Object.assign(slider.style, { width: "100%", margin: "0" });
-    slider.oninput = () => {
-      const next = Number(slider.value);
-      onGain(participant, next);
+    Object.assign(slider.style, { width: "100%", margin: "0", display: "block" });
+    const set = (next, options) => {
+      onGain(participant, next, options);
+      slider.value = String(next);
       value.textContent = `${Math.round(next * 100)}%`;
+      updateMuteButton(row, participant);
     };
-    const presets = document.createElement("div");
+    let pending = null;
+    const cancel = () => {
+      if (pending) {
+        clearTimeout(pending.timer);
+        pending = null;
+      }
+    };
+    const flush = () => {
+      if (!pending) return;
+      const { value: value2 } = pending;
+      cancel();
+      if (participant.value === value2) onSettle(participant, value2);
+    };
+    slider.oninput = () => {
+      cancel();
+      set(Number(slider.value), { dragging: true });
+    };
+    slider.onchange = () => {
+      cancel();
+      const value2 = Number(slider.value);
+      if (value2 > 0) pending = { value: value2, timer: setTimeout(flush, SETTLE_MS) };
+    };
+    const mute = makeButton("", () => {
+      flush();
+      set(participant.value > 0 ? 0 : unmuteValue(participant));
+    });
+    mute.type = "button";
+    mute.dataset.role = "mute";
+    const ns = "http://www.w3.org/2000/svg";
+    const svg = document.createElementNS(ns, "svg");
+    for (const [k, v] of [["viewBox", "0 -960 960 960"], ["width", "18"], ["height", "18"], ["fill", "currentColor"], ["aria-hidden", "true"], ["focusable", "false"]]) svg.setAttribute(k, v);
+    svg.append(document.createElementNS(ns, "path"));
+    mute.append(svg);
+    Object.assign(mute.style, { width: "28px", height: "26px", padding: "0", display: "inline-flex", alignItems: "center", justifyContent: "center" });
     const meter = renderLevelMeter();
-    Object.assign(presets.style, { display: "flex", gap: "5px", marginTop: "7px", flexWrap: "wrap" });
-    for (const [text, gain] of [["Mute", 0], ["50%", 0.5], ["100%", 1], ["250%", 2.5]]) {
-      const button = makeButton(text, () => {
-        slider.value = String(gain);
-        onGain(participant, gain);
-        value.textContent = `${Math.round(gain * 100)}%`;
-      });
-      button.setAttribute("aria-label", `${text} for ${participant.name}`);
-      presets.append(button);
-    }
-    row.append(top, slider, meter, presets);
+    const controls = document.createElement("div");
+    Object.assign(controls.style, { minWidth: "0" });
+    controls.append(slider, meter);
+    const line = document.createElement("div");
+    Object.assign(line.style, { display: "grid", gridTemplateColumns: "28px 1fr", alignItems: "center", gap: "6px" });
+    line.append(mute, controls);
+    row.append(top, line);
+    updateMuteButton(row, participant);
     return row;
   }
   function renderLevelMeter() {
@@ -3140,7 +3215,8 @@
   function statusText(state, now = Date.now()) {
     if (state.autoBalanceEnabled) return state.autoBalanceReady ? "Auto Balance on" : "Learning levels…";
     const notice = state.statusNotice;
-    return notice && now < notice.until ? notice.message : state.status;
+    if (notice && now < notice.until) return notice.message;
+    return state.audioUnavailable ? state.status : "";
   }
   function setStyle(element, name, value) {
     if (element && element.style[name] !== value) element.style[name] = value;
@@ -3159,6 +3235,7 @@
     if (track.title !== title) track.title = title;
   }
   function createPanelController(state, { participants, levels = () => null, onGain, onSave, onCollapse, onAutoSettings = () => {
+  }, unmuteValue = () => 1, onSettle = () => {
   } }) {
     const auto = createAutoBalance({ participants, levels, onGain });
     state.autoBalanceEnabled = false;
@@ -3208,9 +3285,9 @@
       state.autoBalanceEnabled = true;
       state.autoBalanceReady = false;
     }
-    function manualGain(participant, value) {
+    function manualGain(participant, value, options) {
       stopAuto();
-      onGain(participant, value);
+      onGain(participant, value, options);
     }
     function toggleAuto() {
       if (auto.enabled) stopAuto();
@@ -3260,6 +3337,7 @@
         if (value) value.textContent = `${Math.round(participant.value * 100)}%`;
         const slider = row.querySelector('[data-role="slider"]');
         if (slider && document.activeElement !== slider) slider.value = String(participant.value);
+        updateMuteButton(row, participant);
         updateLevelMeter(row, participant, levels);
       }
     }
@@ -3290,11 +3368,7 @@
       const title = document.createElement("div");
       title.textContent = "Google Meet Audio Booster";
       Object.assign(title.style, { fontWeight: "700", fontSize: "13px", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" });
-      const subtitle = document.createElement("div");
-      const outputCount = state.google.mode === "media" ? state.google.mediaPipelines.length : state.google.slots.length;
-      subtitle.textContent = `${listItems.length} participant${listItems.length === 1 ? "" : "s"} · ${outputCount} ${state.google.mode === "media" ? "media stream" : "audio slot"}${outputCount === 1 ? "" : "s"}`;
-      Object.assign(subtitle.style, { opacity: "0.68", fontSize: "11px", marginTop: "2px" });
-      titleWrap.append(title, subtitle);
+      titleWrap.append(title);
       const body = document.createElement("div");
       body.id = `${PANEL_ID}_body`;
       function toggleCollapsed() {
@@ -3335,7 +3409,7 @@
         Object.assign(empty.style, { opacity: "0.75", padding: "8px 0" });
         list.append(empty);
       }
-      for (const participant of listItems) list.append(renderParticipantRow(participant, manualGain));
+      for (const participant of listItems) list.append(renderParticipantRow(participant, manualGain, { unmuteValue, onSettle }));
       body.append(list);
       const footer = document.createElement("div");
       Object.assign(footer.style, { display: "flex", justifyContent: "space-between", alignItems: "center", gap: "6px", marginTop: "9px", paddingTop: "8px", borderTop: "1px solid #3c4043" });
@@ -3520,12 +3594,15 @@
       if (state.closed) return;
       clearTimeout(state.renderTimer);
       state.renderTimer = setTimeout(() => panel.render(), 120);
-    }, applyGain = function(participant, value, { automatic = false } = {}) {
+    }, applyGain = function(participant, value, { automatic = false, dragging = false } = {}) {
       if (!automatic) panel.stopAuto();
-      participant.value = Number.isFinite(value) ? Math.min(6, Math.max(0, value)) : 1;
+      const next = Number.isFinite(value) ? Math.min(6, Math.max(0, value)) : 1;
+      rememberAudible(participant, next, { dragging });
+      participant.value = next;
       participant.adjusted = true;
       if (!automatic) {
         setParticipantGain(state.settings, participant, participant.value);
+        if (participant.unmuteValue > 0) setParticipantUnmute(state.settings, participant, participant.unmuteValue);
         saveSettings(globalThis.localStorage, state.settings);
       }
       platformController?.applyParticipantGain(participant, participant.value);
@@ -3554,6 +3631,14 @@
       // In-memory pre-volume levels from the controller; never persisted.
       levels: (key, options) => platformController?.levelFor?.(key, options) ?? null,
       onGain: applyGain,
+      // A settled slider value becomes the unmute volume (gain already applied).
+      onSettle: (participant, value) => {
+        if (participant.value !== value) return;
+        rememberAudible(participant, value);
+        setParticipantUnmute(state.settings, participant, participant.unmuteValue);
+        saveSettings(globalThis.localStorage, state.settings);
+      },
+      unmuteValue: (participant) => participant.unmuteValue > 0 ? participant.unmuteValue : getParticipantUnmute(state.settings, participant),
       onAutoSettings: (autoBalance) => {
         state.settings.autoBalance = autoBalance;
         saveSettings(globalThis.localStorage, state.settings);
