@@ -23,8 +23,8 @@ function fixture(step = 100) {
   return { meter, auto, writes, people, run, get now() { return now } }
 }
 
-// Voices sit at the fixed -20 dB Auto target unless a test moves them away.
-test('minority quiet expression does not veto confident voices at the fixed level', () => {
+// Voices sit at the -20 dB default reference unless a test moves them away.
+test('minority quiet expression does not veto confident voices at the reference level', () => {
   const f = fixture()
   for (const key of ['A', 'B']) f.run(key, 12000, t => t >= 4000 && t < 6000 ? -32 : -20)
   assert.equal(f.auto.targetDb, -20)

@@ -36,11 +36,19 @@ test('policy consumes explicit support, never legacy frame count or missing meta
     const people = ['A','B'].map(key=>({key,value:1}));let now=1000
     const auto=createAutoBalance({participants:()=>people,levels:()=>({autoDb:-30,autoFrames:120,
       autoSupportMs:6000,autoInlierFrames:24,autoInlierPortions:3,autoLatestAgrees:true,autoSpread:0,autoSince:0,sampledAt:now,...bad}),onGain:()=>assert.fail('unexpected write')})
-    // -30 dB is 10 dB from the fixed target: sustained valid evidence would write.
+    // Two voices at -30 dB: the clamped -26 dB reference leaves both 4 dB
+    // (beyond the 1 dB deadband) too quiet, so valid evidence would write
+    // (positive control below).
     auto.start(0);for(let i=0;i<40;i++){auto.tick(now,'A');now+=100;auto.tick(now,'B');now+=100};assert.equal(auto.targetDb,null)
   }
   const people=['A','B'].map(key=>({key,value:1}));let now=1000
   const auto=createAutoBalance({participants:()=>people,levels:()=>({autoDb:-30,autoFrames:24,
     autoSupportMs:6000,autoInlierFrames:24,autoInlierPortions:3,autoLatestAgrees:true,autoSpread:0,autoSince:0,sampledAt:now}),onGain:()=>assert.fail('unexpected write')})
-  auto.start(0);auto.tick(now,'A');now+=100;auto.tick(now,'B');assert.equal(auto.targetDb,-20)
+  auto.start(0);auto.tick(now,'A');now+=100;auto.tick(now,'B');assert.equal(auto.targetDb,-26)
+  // Positive control: the same valid metadata, sustained, does write.
+  const valid=['A','B'].map(key=>({key,value:1}));let t=1000;const writes=[]
+  const control=createAutoBalance({participants:()=>valid,levels:()=>({autoDb:-30,autoFrames:24,
+    autoSupportMs:6000,autoInlierFrames:24,autoInlierPortions:3,autoLatestAgrees:true,autoSpread:0,autoSince:0,sampledAt:t}),onGain:(p,v)=>{writes.push(p.key);p.value=v}})
+  control.start(0);for(let i=0;i<40;i++){control.tick(t,'A');t+=100;control.tick(t,'B');t+=100}
+  assert.ok(writes.includes('A')&&writes.includes('B'),JSON.stringify(writes))
 })

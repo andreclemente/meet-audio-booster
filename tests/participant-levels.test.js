@@ -355,7 +355,8 @@ test('actual hook slots with no source taps can drive controller/auto using a de
           setNow(t)
           f.a.level.value = t < 12000 ? 0.6 : 0
           f.b.level.value = t < 12000 ? 0 : 0.6
-          // A sits at the fixed -20 dB target; B is 10 dB too loud.
+          // A sits at -20 dB; B is 10 dB louder, above the call reference
+          // (median of the two, -15 dB).
           f.power.value = dbToPower(t < 12000 ? -20 : -10)
           f.controller.route()
         }
@@ -487,7 +488,8 @@ test('actual routing samples drive auto; overlap, unknown, graph mutation and te
   withClock(f.doc,setNow=>{
     auto.start(0)
     const run=(from,to)=>{for(let t=from;t<to;t+=30){setNow(t);f.controller.route()}}
-    // A at the fixed -20 dB target is untouched; B 10 dB louder is reduced.
+    // A at -20 dB is untouched (a lone voice within 4 dB, then at the -15 dB
+    // call reference within the 95% interval); B 10 dB louder is reduced.
     f.a.level.value=0.6;f.power.value=dbToPower(-20);run(0,12000)
     f.a.level.value=0;f.b.level.value=0.6;f.power.value=dbToPower(-10);run(12000,24000)
     assert.ok(automaticWrites.some(([k])=>k==='B'))
@@ -511,7 +513,7 @@ test('actual routing samples drive auto; overlap, unknown, graph mutation and te
 })
 
 
-test('actual controller acquires two conversational voices at the fixed level despite minority quiet expression', () => {
+test('actual controller acquires two conversational voices at the reference level despite minority quiet expression', () => {
   let auto
   const writes = []
   const f = controllerFixture({ onLevelSample: (now, key) => auto.tick(now, key), onLevelReset: now => auto.invalidate(now) })

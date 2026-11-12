@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { createAudibleMeter } from '../src/platforms/google-meet/audible-meter.js'
 import { createGoogleMeetController } from '../src/platforms/google-meet/index.js'
 import { createPanelController } from '../src/ui/panel.js'
-import { AUTO_DEADBAND_DB, AUTO_STEP_DB } from '../src/ui/auto-balance.js'
+import { AUTO_DEADBAND_DB, AUTO_STEP_DB, AUTO_SOLO_TOLERANCE_DB } from '../src/ui/auto-balance.js'
 
 // Synthetic DOM/activity, PCM, AudioNodes and immediately settled slots. Actual
 // meter -> controller estimator -> panel Auto -> gain callback -> UI are exercised.
@@ -30,9 +30,11 @@ function root(id) {
 function scenario(change, { initialSingle = false, gaps = false, manual = false, durationMs = 120000, observe = null } = {}) {
   const keys = ['document', 'addEventListener', 'GainNode', 'AudioWorkletNode', 'BaseAudioContext', 'AudioContext', 'OfflineAudioContext', 'AudioParam']
   const saved = new Map(keys.map(k => [k, Object.getOwnPropertyDescriptor(globalThis, k)])), oldNow = Date.now
-  // Voices start exactly at the fixed -20 dB Auto target (inside the deadband).
+  // Voices start exactly at the -20 dB default (inside the deadband). Three
+  // voices: after only A changes, B and C (whose known levels are kept)
+  // still hold the call's median reference at -20 dB.
   let state = null, now = 0, sourcePower = 10 ** (-20 / 10), meter, controller, native, slot, panel
-  const a = root('source-a'), b = root('source-b'), roots = initialSingle ? [a.root] : [a.root, b.root], writes = [], resets = []
+  const a = root('source-a'), b = root('source-b'), c = root('source-c'), roots = initialSingle ? [a.root] : [a.root, b.root, c.root], writes = [], resets = []
   let external = [], qualifiedFrames = 0, confidenceLosses = 0, missingPower = 0
   const document = { activeElement: null, createElement: tag => new Element(tag, document), createElementNS: (ns, tag) => new Element(tag, document) }
   document.documentElement = new Element('html', document)
@@ -58,7 +60,7 @@ function scenario(change, { initialSingle = false, gaps = false, manual = false,
     mappings.push({ source, destination: native, booster: context.createGain(), output: 0, input: 0 })
     meter.connected(source, [native]); meter.connected(native, [context.destination])
     slot = { gain: {}, tap: null, audibleMeter: meter, actualValue: 1, targetValue: 1, appliedMultiplier: 1, set(v) { this.actualValue = this.targetValue = this.appliedMultiplier = v }, release() { this.set(1) } }
-    const people = new Map(roots.map((r, i) => { const key = i ? 'B' : 'A'; return [key, { key, participantId: i ? 'source-b' : 'source-a', element: r, name: key, platform: 'google-meet', present: true, value: 1, muted: false }] }))
+    const people = new Map(roots.map((r, i) => { const key = 'ABC'[i]; return [key, { key, participantId: 'source-' + key.toLowerCase(), element: r, name: key, platform: 'google-meet', present: true, value: 1, muted: false }] }))
     state = { participants: people, settings: {}, closed: false, google: { slots: [slot], mediaPipelines: [], mode: 'worklet', activeParticipantKey: null, appliedParticipantKey: null, routingState: 'idle', transitionGuard: {}, routing: {}, rosterSignature: '', localPresentationActive: false } }
     const readMeter = meter.read
     meter.read = slots => { const power = readMeter(slots); if (!Number.isFinite(power)) missingPower++; return power }
@@ -77,10 +79,10 @@ function scenario(change, { initialSingle = false, gaps = false, manual = false,
     panel.render()
     const balance = state.panel.querySelectorAll('button').find(e => e.getAttribute('aria-label') === 'Auto Balance')
     balance.onclick()
-    function tick(key) { a.level.value = key === 'A' ? .6 : 0; b.level.value = key === 'B' ? .6 : 0; context.currentTime = now / 1000; controller.route(); now += 30 }
-    for (let i = 0; i < 4000; i++) tick(initialSingle ? 'A' : Math.floor(i / 400) % 2 ? 'B' : 'A')
-    assert.equal(state.autoBalanceReady, true, 'fixed target is known once a voice is confidently measured')
-    assert.equal(writes.length, 0, 'voices already at the fixed level are never adjusted')
+    function tick(key) { a.level.value = key === 'A' ? .6 : 0; b.level.value = key === 'B' ? .6 : 0; c.level.value = key === 'C' ? .6 : 0; context.currentTime = now / 1000; controller.route(); now += 30 }
+    for (let i = 0; i < 4000; i++) tick(initialSingle ? 'A' : 'BCA'[Math.floor(i / 400) % 3])
+    assert.equal(state.autoBalanceReady, true, 'the reference is known once a voice is confidently measured')
+    assert.equal(writes.length, 0, 'voices already at the call reference are never adjusted')
     const start = now
     missingPower = 0; confidenceLosses = 0
     const api = { meter, context, source, native, mappings, slot, state, read: () => meter.read(state.google.slots), external: value => { external = value } }
@@ -121,6 +123,9 @@ for (const gaps of [false, true]) test(`compatible static native attenuation rec
   assert.ok(r.writes.length > 0, 'fresh quiet speech must correct without a second reference returning')
   assert.ok(r.firstMs >= 4000, 'fresh estimator and sustained-error qualification must still warm up')
   assert.ok(r.firstMs <= 30000, 'first correction must not stall past 30 s')
+  // B and C stay in the reference at -20 dB (known levels survive the
+  // compatible change), so A gets the full 1 dB call deadband, not the 4 dB
+  // lone-voice tolerance or a two-voice midpoint (-26 dB).
   assert.ok(gainDb(at120.value) >= 6, 'at least 6 dB of the 12 dB error must be removed by 120 s')
   for (let i = 0; i < trace.length; i++) {
     const s = trace[i]
@@ -222,11 +227,14 @@ unsafe['native stereo max/2 to explicit/1 before static gain'] = a => {
   assert.notEqual(a.meter.continuity.token, epoch)
   a.native.gain.value = .25; a.read()
 }
-// The target is fixed, so nothing about it can be reused; the real invariant is
-// that an unsafe change discards meter evidence and sustained-error
-// qualification. Nothing is written until fresh, fully supported evidence from
-// after the change qualifies again, and it then converges to the same deadband.
-function assertFreshRequalification(r, { reasons }) {
+// The real invariant: an unsafe change discards meter evidence, sustained-error
+// qualification AND every known call level. Nothing is written until fresh,
+// fully supported evidence from after the change qualifies again. Only A
+// speaks afterwards, so it is then a lone voice: corrected toward the -20 dB
+// default and stopping at the 4 dB lone-voice tolerance edge. A compatible
+// change keeps known levels; with initialSingle there is no other voice, so
+// that case uses the lone-voice tolerance as well.
+function assertFreshRequalification(r, { reasons, tolerance }) {
   const gainDb = value => 20 * Math.log10(value)
   assert.ok(r.resets.some(x => reasons.includes(x.metadata?.reason)), JSON.stringify(r.resets))
   for (const w of r.writes) {
@@ -239,25 +247,28 @@ function assertFreshRequalification(r, { reasons }) {
     assert.ok(w.level.autoInlierPortions >= 3)
     assert.ok(w.qualifiedFrames >= 30, 'sustained-error qualification restarts after the change')
     assert.equal(w.level.sampledAt, w.now, 'no writes on stale evidence')
-    assert.ok(Math.abs(gainDb(w.to / w.from) - AUTO_STEP_DB) < 1e-10, 'only fixed-size boosts toward the fixed level')
-    assert.ok(-20 - (w.level.autoDb + gainDb(w.from)) > Math.max(AUTO_DEADBAND_DB, w.level.autoSpread / 2) - 1e-6, 'no writes inside the tolerance or the 95% interval')
+    assert.ok(Math.abs(gainDb(w.to / w.from) - AUTO_STEP_DB) < 1e-10, 'only fixed-size boosts toward the reference')
+    assert.ok(-20 - (w.level.autoDb + gainDb(w.from)) > Math.max(tolerance, w.level.autoSpread / 2) - 1e-6, 'no writes inside the tolerance or the 95% interval')
   }
-  if (r.writes.length) assert.ok(Math.abs(-20 - (r.level.autoDb + gainDb(r.value))) <= 3, 'converges to the same deadband')
-  else assert.equal(r.ready, false, 'without fresh evidence the UI keeps learning')
+  // 12 dB below -20 dB: the lone voice stops once within 4 dB (an 8 dB boost).
+  if (r.writes.length) {
+    const error = -20 - (r.level.autoDb + gainDb(r.value))
+    assert.ok(error <= tolerance + 1e-6 && error >= tolerance - AUTO_STEP_DB - 1e-6, 'converges to the lone-voice tolerance edge: ' + error)
+  } else assert.equal(r.ready, false, 'without fresh evidence the UI keeps learning')
 }
 for (const [name, change] of Object.entries(unsafe)) test(`unsafe ${name} discards evidence; nothing is written before fresh qualification`, () => {
   let learning = false, learnedBeforeWrite = true
   const r = scenario(change, { observe(s) { if (!s.ready) learning = true; if (s.writes && !learning) learnedBeforeWrite = false } })
   assert.ok(learning && learnedBeforeWrite, 'an unsafe change shows learning before any write')
-  assertFreshRequalification(r, { reasons: ['measurement-graph'] })
+  assertFreshRequalification(r, { reasons: ['measurement-graph'], tolerance: AUTO_SOLO_TOLERANCE_DB })
   assert.equal(r.enabled, true)
 })
-test('compatible change with a single speaker keeps the fixed target and recovers from fresh evidence', () => {
+test('compatible change with a single speaker keeps the reference and recovers from fresh evidence', () => {
   let alwaysReady = true
   const r = scenario(attenuate, { initialSingle: true, observe(s) { if (!s.ready) alwaysReady = false } })
-  assert.ok(alwaysReady, 'compatible native gain keeps the fixed target')
+  assert.ok(alwaysReady, 'compatible native gain keeps the reference')
   assert.ok(r.writes.length > 0, 'a single quiet speaker is boosted')
-  assertFreshRequalification(r, { reasons: ['compatible-native-gain'] })
+  assertFreshRequalification(r, { reasons: ['compatible-native-gain'], tolerance: AUTO_SOLO_TOLERANCE_DB })
   assert.equal(r.ready, true); assert.equal(r.enabled, true)
 })
 test('manual slider still cancels Auto across compatible invalidation', () => {

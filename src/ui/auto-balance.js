@@ -1,8 +1,8 @@
 import { AUTO_HORIZON_MS, AUTO_MAX_SPREAD_DB } from '../platforms/google-meet/levels.js'
 
-// Every voice is brought toward the same fixed comfortable level (owner
-// decision): one speaker or many, no comparison between people. -20 dB is
-// where voices sat in real calls the owner judged comfortable at 100%.
+// Default comfortable level: -20 dB is where voices sat in real calls the
+// owner judged comfortable at 100%. Used as the reference while fewer than
+// two voices are measured, and as the centre of the reference clamp.
 export const AUTO_TARGET_DB = -20
 // The comfortable level is relative to the call (owner decision, 2.7.0): a
 // shift that affects every voice alike (a quieter call, Meet's output level,
@@ -23,9 +23,10 @@ export function referenceLevelDb(levels) {
   return Math.max(AUTO_TARGET_DB - AUTO_REFERENCE_RANGE_DB, Math.min(AUTO_TARGET_DB + AUTO_REFERENCE_RANGE_DB, median))
 }
 
-// Owner-approved tighter tolerance: act when a voice is more than 1 dB off
-// the level AND the 95% interval of its measured level excludes the target,
-// so estimation noise alone never moves a slider.
+// Owner-approved tighter tolerance: once the call reference is known (two or
+// more voices), act when a voice is more than 1 dB off it AND the 95% interval
+// of its measured level excludes the target, so estimation noise alone never
+// moves a slider.
 export const AUTO_DEADBAND_DB = 1
 export const AUTO_STEP_DB = 0.1
 
