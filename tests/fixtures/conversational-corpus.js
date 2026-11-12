@@ -1,5 +1,5 @@
 // Deterministic scalar envelopes: no recorded audio, identities or live input.
-// Speech sits at the fixed -20 dB Auto target; dynamics are relative to it.
+// Speech sits at the -20 dB default reference; dynamics are relative to it.
 // Import accepts alternate production modules for unchanged-baseline comparison.
 export function runCorpus({ createParticipantLevelMeter, createAutoBalance }, cadences = [100, 120, 200, 300]) {
   function session(step = 100, single = false) {
@@ -26,9 +26,14 @@ export function runCorpus({ createParticipantLevelMeter, createAutoBalance }, ca
       }
     }
     return { run, writes, people, meter, get now() { return now }, result() {
+      // Per person: steps against that person's first write direction, and
+      // direction changes between consecutive writes.
+      const own = p => writes.filter(w => w.key === p.key)
+      const reverseSteps = people.map(p => own(p).filter((w, i, all) => Math.sign(w.deltaDb) !== Math.sign(all[0].deltaDb)).length)
+      const directionChanges = people.map(p => own(p).filter((w, i, all) => i && Math.sign(w.deltaDb) !== Math.sign(all[i - 1].deltaDb)).length)
       return { readyAt, writes: writes.length, qualified, acceptedFrames,
         maxStepDb: Math.max(0, ...writes.map(w => Math.abs(w.deltaDb))),
-        finalGainDb: people.map(p => 20 * Math.log10(p.value)) }
+        finalGainDb: people.map(p => 20 * Math.log10(p.value)), reverseSteps, directionChanges }
     } }
   }
   const acquisition = []
