@@ -13,12 +13,14 @@ export function makeButton(text, action) {
 const SPEAKER = 'M560-131v-82q90-26 145-100t55-168q0-94-55-168T560-749v-82q124 28 202 125.5T840-481q0 127-78 224.5T560-131ZM120-360v-240h160l200-200v640L280-360H120Zm440 40v-322q47 22 73.5 66t26.5 96q0 51-26.5 94.5T560-320Z'
 const MUTED = 'M792-56 671-177q-25 16-53 27.5T560-131v-82q14-5 27.5-10t25.5-12L480-368v208L280-360H120v-240h128L56-792l56-56 736 736-56 56Zm-8-232-58-58q17-31 25.5-65t8.5-70q0-94-55-168T560-749v-82q124 28 202 125.5T840-481q0 53-14.5 102T784-288ZM650-422l-90-90v-130q47 22 73.5 66t26.5 96q0 15-2.5 29.5T650-422ZM480-592 376-696l104-104v208Z'
 
+export const SETTLE_MS = 700
+
 // Mute icon state follows the volume: 0% is muted, from any control.
 export function updateMuteButton(row, participant) {
   const button = row.querySelector('[data-role="mute"]')
   if (!button) return
   const muted = !(participant.value > 0)
-  if (button.dataset.muted === String(muted)) return
+  if (button.dataset.muted === String(muted) && button.getAttribute('aria-label') === `${muted ? 'Unmute' : 'Mute'} ${participant.name}`) return
   button.dataset.muted = String(muted)
   const label = `${muted ? 'Unmute' : 'Mute'} ${participant.name}`
   button.setAttribute('aria-label', label)
@@ -53,11 +55,19 @@ export function renderParticipantRow(participant, onGain, { unmuteValue = () => 
   slider.setAttribute('aria-label', `Volume for ${participant.name}`)
   Object.assign(slider.style, { width: '100%', margin: '0', display: 'block' })
   const set = (next, options) => { onGain(participant, next, options); slider.value = String(next); value.textContent = `${Math.round(next * 100)}%`; updateMuteButton(row, participant) }
-  // While dragging, values are not remembered as the unmute volume; the
-  // released value is (so dragging to 0% unmutes to the volume before it).
-  slider.oninput = () => set(Number(slider.value), { dragging: true })
-  slider.onchange = () => set(Number(slider.value))
-  const mute = makeButton('', () => set(participant.value > 0 ? 0 : unmuteValue(participant)))
+  // Values passed while dragging are not remembered as the unmute volume.
+  // A released value is, once the slider settles: arrow keys fire `change`
+  // on every step, so stepping down to 0% must not remember 5%.
+  let pending = null
+  const flush = () => { if (!pending) return; clearTimeout(pending.timer); const value = pending.value; pending = null; set(value) }
+  slider.oninput = () => { if (pending) { clearTimeout(pending.timer); pending = null } set(Number(slider.value), { dragging: true }) }
+  slider.onchange = () => {
+    if (pending) { clearTimeout(pending.timer); pending = null }
+    const value = Number(slider.value)
+    if (!(value > 0)) return set(value)
+    pending = { value, timer: setTimeout(flush, SETTLE_MS) }
+  }
+  const mute = makeButton('', () => { flush(); set(participant.value > 0 ? 0 : unmuteValue(participant)) })
   mute.type = 'button'
   mute.dataset.role = 'mute'
   const ns = 'http://www.w3.org/2000/svg'

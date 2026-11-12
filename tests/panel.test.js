@@ -1,6 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { createState } from '../src/state.js'
+import { SETTLE_MS } from '../src/ui/participant-row.js'
 import { createPanelController } from '../src/ui/panel.js'
 import { saveSettings } from '../src/storage.js'
 import { PANEL_ID } from '../src/shared/constants.js'
@@ -651,4 +652,31 @@ test('mute icon mutes, unmute restores the volume from the app, icon follows 0% 
   // A change from elsewhere (e.g. Reset) updates the icon on the live update.
   f.alice.value = 1; c2.updateLiveUi()
   assert.equal(mute().getAttribute('aria-pressed'), 'false')
+})
+
+test('unmute volume is only taken from a settled slider: keyboard steps to 0% and a quick mute after a drag', t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  const f = fixture(t)
+  const seen = []
+  const c = createPanelController(f.state, { participants: () => f.people, onGain: (p, v, o) => { seen.push([v, !!o?.dragging]); p.value = v }, onSave() {}, unmuteValue: () => 0.9 })
+  c.render()
+  const slider = () => rowOf(f.state, 'alice').querySelector('[data-role="slider"]')
+  const mute = () => rowOf(f.state, 'alice').querySelector('[data-role="mute"]')
+  // Arrow keys: input + change on every step, down to 0%.
+  for (const v of ['0.1', '0.05', '0']) { slider().value = v; slider().oninput(); slider().onchange() }
+  t.mock.timers.tick(SETTLE_MS * 2)
+  assert.deepEqual(seen.filter(([, dragging]) => !dragging), [[0, false]], 'no intermediate step is committed as the unmute volume')
+  // Drag to 60%, release and mute right away: 60% is committed before muting.
+  seen.length = 0
+  slider().value = '0.6'; slider().oninput(); slider().onchange()
+  mute().click()
+  assert.deepEqual(seen, [[0.6, true], [0.6, false], [0, false]])
+  t.mock.timers.tick(SETTLE_MS * 2)
+  assert.equal(seen.length, 3, 'the flushed commit does not fire again')
+  // A released value commits after the slider settles.
+  seen.length = 0
+  slider().value = '1.4'; slider().oninput(); slider().onchange()
+  assert.deepEqual(seen, [[1.4, true]])
+  t.mock.timers.tick(SETTLE_MS)
+  assert.deepEqual(seen, [[1.4, true], [1.4, false]])
 })
