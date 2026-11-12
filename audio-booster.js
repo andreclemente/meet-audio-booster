@@ -3113,21 +3113,34 @@
 
   // src/ui/auto-balance.js
   var AUTO_TARGET_DB = -20;
+  var AUTO_REFERENCE_RANGE_DB = 6;
+  var AUTO_SOLO_TOLERANCE_DB = 4;
+  function referenceLevelDb(levels) {
+    const values = levels.filter(Number.isFinite).sort((a, b) => a - b);
+    if (values.length < 2) return AUTO_TARGET_DB;
+    const middle = values.length >> 1;
+    const median2 = values.length % 2 ? values[middle] : (values[middle - 1] + values[middle]) / 2;
+    return Math.max(AUTO_TARGET_DB - AUTO_REFERENCE_RANGE_DB, Math.min(AUTO_TARGET_DB + AUTO_REFERENCE_RANGE_DB, median2));
+  }
   var AUTO_DEADBAND_DB = 1;
   var AUTO_STEP_DB = 0.1;
   function createAutoBalance({ participants, levels, onGain }) {
     let enabled = false, startedAt = 0, targetDb = null, offsetDb = 0;
-    const consumed = /* @__PURE__ */ new Map(), qualification = /* @__PURE__ */ new Map();
+    const consumed = /* @__PURE__ */ new Map(), qualification = /* @__PURE__ */ new Map(), known = /* @__PURE__ */ new Map();
     const firstSeen = /* @__PURE__ */ new WeakMap();
     function stop() {
       enabled = false;
       targetDb = null;
       consumed.clear();
       qualification.clear();
+      known.clear();
     }
     function invalidate(now, { reason } = {}) {
       startedAt = now;
-      if (reason !== "compatible-native-gain") targetDb = null;
+      if (reason !== "compatible-native-gain") {
+        targetDb = null;
+        known.clear();
+      }
       consumed.clear();
       qualification.clear();
     }
@@ -3144,6 +3157,7 @@
         consumed.delete(key);
         qualification.delete(key);
       }
+      for (const key of known.keys()) if (!present.has(key)) known.delete(key);
       const person = present.get(sampledKey);
       if (person && !firstSeen.has(person)) firstSeen.set(person, now);
       const level = person && levels(person.key, { since: Math.max(startedAt, firstSeen.get(person)) });
@@ -3153,10 +3167,13 @@
       }
       if (level.autoLatestAgrees !== true) return;
       consumed.set(person.key, now);
-      if (targetDb === null) targetDb = AUTO_TARGET_DB + offsetDb;
+      known.set(person.key, level.autoDb);
+      const voices = [...present.keys()].filter((key) => known.has(key)).map((key) => known.get(key));
+      targetDb = referenceLevelDb(voices) + offsetDb;
+      const tolerance = voices.length < 2 ? AUTO_SOLO_TOLERANCE_DB : AUTO_DEADBAND_DB;
       const error = targetDb - (level.autoDb + 20 * Math.log10(person.value));
       const direction = Math.sign(error);
-      if (Math.abs(error) <= Math.max(AUTO_DEADBAND_DB, level.autoSpread / 2)) {
+      if (Math.abs(error) <= Math.max(tolerance, level.autoSpread / 2)) {
         qualification.delete(person.key);
         return;
       }
@@ -3170,8 +3187,8 @@
     }
     function setTargetOffset(db) {
       if (!Number.isFinite(db) || db === offsetDb) return;
+      if (targetDb !== null) targetDb += db - offsetDb;
       offsetDb = db;
-      if (targetDb !== null) targetDb = AUTO_TARGET_DB + offsetDb;
       qualification.clear();
     }
     return { start, stop, tick, invalidate, setTargetOffset, get enabled() {

@@ -4,6 +4,25 @@ import { AUTO_HORIZON_MS, AUTO_MAX_SPREAD_DB } from '../platforms/google-meet/le
 // decision): one speaker or many, no comparison between people. -20 dB is
 // where voices sat in real calls the owner judged comfortable at 100%.
 export const AUTO_TARGET_DB = -20
+// The comfortable level is relative to the call (owner decision, 2.7.0): a
+// shift that affects every voice alike (a quieter call, Meet's output level,
+// measurement bias) must not move everyone. Once two or more voices are
+// measured, the reference is the median measured voice of the call (before
+// the user's volumes). A lone voice uses the comfortable default, but only a
+// clearly quiet or loud one is corrected (AUTO_SOLO_TOLERANCE_DB), so the
+// first voice is not pushed before the call's own level is known. The
+// reference stays within AUTO_REFERENCE_RANGE_DB of the default; the user's
+// − / + target is applied on top.
+export const AUTO_REFERENCE_RANGE_DB = 6
+export const AUTO_SOLO_TOLERANCE_DB = 4
+export function referenceLevelDb(levels) {
+  const values = levels.filter(Number.isFinite).sort((a, b) => a - b)
+  if (values.length < 2) return AUTO_TARGET_DB
+  const middle = values.length >> 1
+  const median = values.length % 2 ? values[middle] : (values[middle - 1] + values[middle]) / 2
+  return Math.max(AUTO_TARGET_DB - AUTO_REFERENCE_RANGE_DB, Math.min(AUTO_TARGET_DB + AUTO_REFERENCE_RANGE_DB, median))
+}
+
 // Owner-approved tighter tolerance: act when a voice is more than 1 dB off
 // the level AND the 95% interval of its measured level excludes the target,
 // so estimation noise alone never moves a slider.
@@ -16,12 +35,12 @@ export const AUTO_STEP_DB = 0.1
 export function createAutoBalance({ participants, levels, onGain }) {
   // targetDb stays null ("learning") until a first voice is confidently measured.
   let enabled = false, startedAt = 0, targetDb = null, offsetDb = 0
-  const consumed = new Map(), qualification = new Map()
+  const consumed = new Map(), qualification = new Map(), known = new Map()
   const firstSeen = new WeakMap()
-  function stop() { enabled = false; targetDb = null; consumed.clear(); qualification.clear() }
+  function stop() { enabled = false; targetDb = null; consumed.clear(); qualification.clear(); known.clear() }
   function invalidate(now, { reason } = {}) {
     startedAt = now
-    if (reason !== 'compatible-native-gain') targetDb = null
+    if (reason !== 'compatible-native-gain') { targetDb = null; known.clear() }
     consumed.clear(); qualification.clear()
   }
   function start(now) {
@@ -32,6 +51,7 @@ export function createAutoBalance({ participants, levels, onGain }) {
     if (!enabled) return
     const present = new Map(participants().map(person => [person.key, person]))
     for (const key of consumed.keys()) if (!present.has(key)) { consumed.delete(key); qualification.delete(key) }
+    for (const key of known.keys()) if (!present.has(key)) known.delete(key)
     const person = present.get(sampledKey)
     if (person && !firstSeen.has(person)) firstSeen.set(person, now)
     // Only evidence since Auto started (or the person appeared) counts; the
@@ -54,10 +74,17 @@ export function createAutoBalance({ participants, levels, onGain }) {
     // than act on that stale level. Missing metadata fails closed.
     if (level.autoLatestAgrees !== true) return
     consumed.set(person.key, now)
-    if (targetDb === null) targetDb = AUTO_TARGET_DB + offsetDb
+    // Reference from the latest confident level (before the user's volumes)
+    // of every present voice measured since Auto started or was invalidated.
+    // Kept between turns: a quiet person's evidence going stale must not
+    // drop them from the reference.
+    known.set(person.key, level.autoDb)
+    const voices = [...present.keys()].filter(key => known.has(key)).map(key => known.get(key))
+    targetDb = referenceLevelDb(voices) + offsetDb
+    const tolerance = voices.length < 2 ? AUTO_SOLO_TOLERANCE_DB : AUTO_DEADBAND_DB
     const error = targetDb - (level.autoDb + 20 * Math.log10(person.value))
     const direction = Math.sign(error)
-    if (Math.abs(error) <= Math.max(AUTO_DEADBAND_DB, level.autoSpread / 2)) { qualification.delete(person.key); return }
+    if (Math.abs(error) <= Math.max(tolerance, level.autoSpread / 2)) { qualification.delete(person.key); return }
     const old = qualification.get(person.key)
     const count = old?.person === person && old.direction === direction && now - old.at <= AUTO_HORIZON_MS ? old.count + 1 : 1
     qualification.set(person.key, { person, direction, count, at: now })
@@ -71,8 +98,8 @@ export function createAutoBalance({ participants, levels, onGain }) {
   // Measurements are kept; corrections toward the new level must qualify again.
   function setTargetOffset(db) {
     if (!Number.isFinite(db) || db === offsetDb) return
+    if (targetDb !== null) targetDb += db - offsetDb
     offsetDb = db
-    if (targetDb !== null) targetDb = AUTO_TARGET_DB + offsetDb
     qualification.clear()
   }
   return { start, stop, tick, invalidate, setTargetOffset, get enabled() { return enabled }, get targetDb() { return targetDb } }
