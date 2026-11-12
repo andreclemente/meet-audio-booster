@@ -66,13 +66,16 @@ test('existing controls have participant-specific accessible names and close lab
   const { state, parts } = fixture(t)
   assert.equal(parts().close.getAttribute('aria-label'), 'Close panel')
   assert.equal(state.panel.querySelector('[data-role="slider"]').getAttribute('aria-label'), 'Volume for Alice')
-  const presets = state.panel.querySelectorAll('[data-participant-key]')[0].querySelectorAll('button')
-  assert.deepEqual(presets.map(button => button.getAttribute('aria-label')), ['Mute for Alice', '50% for Alice', '100% for Alice', '250% for Alice'])
+  const buttons = state.panel.querySelectorAll('[data-participant-key]')[0].querySelectorAll('button')
+  assert.deepEqual(buttons.map(button => button.getAttribute('aria-label')), ['Mute Alice'], 'one mute icon, no volume presets')
+  assert.equal(buttons[0].getAttribute('aria-pressed'), 'false')
+  assert.equal(buttons[0].textContent, '')
+  assert.equal(buttons[0].children[0].getAttribute('aria-hidden'), 'true')
 })
 
 test('roster rerender restores focused participant control without changing gain', t => {
   const { state, controller, document, people, gains, parts } = fixture(t)
-  for (const getControl of [() => state.panel.querySelector('[data-role="slider"]'), () => state.panel.querySelectorAll('[data-participant-key]')[0].querySelectorAll('button')[2], () => parts().collapse, () => parts().close, () => parts().reset]) {
+  for (const getControl of [() => state.panel.querySelector('[data-role="slider"]'), () => state.panel.querySelectorAll('[data-participant-key]')[0].querySelectorAll('button')[0], () => parts().collapse, () => parts().close, () => parts().reset]) {
     const before = getControl()
     before.focus()
     if (people.length === 1) people.push({ key: 'bob', name: 'Bob', platform: 'google-meet', value: 1 })
@@ -134,11 +137,11 @@ test('panel starts expanded with collapse immediately left of close and one comp
   assert.equal(close.textContent, '×')
   assert.deepEqual(collapse.parentElement.children, [collapse, close])
   assert.equal(header.children[0].children[0].textContent, 'Google Meet Audio Booster')
-  assert.match(header.children[0].children[1].textContent, /1 participant/)
+  assert.equal(header.children[0].children.length, 1, 'no participant/slot subtitle')
   assert.equal(body.children.length, 3)
   assert.equal(body.children[0].querySelectorAll('[data-participant-key]').length, 1)
   assert.equal(parts().reset.title, 'Reset all to 100%')
-  assert.equal(body.children[1].children[0].textContent, state.status)
+  assert.equal(body.children[1].children[0].textContent, '', 'no routing/startup text')
   assert.equal(body.children[2].textContent, 'Support development')
   assertExpanded(parts(), true)
 })
@@ -157,7 +160,7 @@ test('collapse toggles in place, preserves focus and only calls dedicated collap
   assert.equal(parts().header, original.header)
   assert.equal(parts().body, original.body)
   assert.equal(state.panel.__boosterDrag, undefined)
-  assert.equal(parts().header.children[0].children.length, 2)
+  assert.equal(parts().header.children[0].children.length, 1)
   original.collapse.click()
   assertExpanded(parts(), true)
   assert.equal(state.panelCollapsed, false)
@@ -176,8 +179,8 @@ test('rerender, live updates and toolbar hide/show retain collapse; reset and cl
   controller.render()
   assertExpanded(parts(), false)
   assert.equal(parts().body.id, bodyId)
-  assert.match(parts().header.children[0].children[1].textContent, /2 participants/)
-  assert.equal(state.panel.querySelectorAll('div').find(node => node.id === `${PANEL_ID}_status`).textContent, 'Updated status')
+  assert.equal(parts().header.children[0].children.length, 1)
+  assert.equal(state.panel.querySelectorAll('div').find(node => node.id === `${PANEL_ID}_status`).textContent, '', 'routing status is not shown')
   alice.value = 3
   controller.updateLiveUi()
   assert.equal(state.panel.querySelector('[data-role="value"]').textContent, '300%')
@@ -242,7 +245,7 @@ test('approved support layout keeps exact dynamic status left of Reset all and s
     assert.ok(button.title && button.getAttribute('aria-label'))
   }
   assert.equal(footer.style.justifyContent, 'space-between')
-  assert.equal(status.textContent, state.status)
+  assert.equal(status.textContent, '')
   assert.equal(status.style.marginTop, '0')
   assert.equal(status.style.minWidth, '0')
   assert.equal(status.style.overflow, 'hidden')
@@ -273,8 +276,9 @@ test('support is an inert plain secure outbound link with optional free-feature 
 test('status retains its full dynamic text without live speaker announcements', t => {
   const { state, document, controller } = fixture(t)
   const status = document.getElementById(`${PANEL_ID}_status`)
-  const message = 'Participant with a very long name · automatic routing '.repeat(20)
+  const message = 'Audio unavailable · controls are inactive '.repeat(20)
   // Same existing ID/textContent update contract as main.setStatus.
+  state.audioUnavailable = true
   state.status = message
   status.textContent = message
   assert.equal(status.textContent, message)
@@ -434,7 +438,9 @@ test('each row has an aria-hidden level line under its slider with no tick until
     const row = rowOf(f.state, key)
     const { track, fill, tick } = meterOf(row)
     assert.ok(track && fill && tick, key)
-    assert.equal(row.children.indexOf(track), row.children.indexOf(row.querySelector('[data-role="slider"]')) + 1)
+    const slider = row.querySelector('[data-role="slider"]')
+    assert.equal(track.parentElement, slider.parentElement)
+    assert.equal(track.parentElement.children.indexOf(track), track.parentElement.children.indexOf(slider) + 1)
     assert.equal(track.getAttribute('aria-hidden'), 'true')
     assert.equal(track.title, 'Not heard yet')
     assert.equal(track.style.height, '3px')
@@ -502,8 +508,8 @@ test('Auto Balance defaults off and is available before voices are heard', t => 
   assert.deepEqual(f.gains, [])
 })
 
-test('every slider, preset and Reset synchronously stops auto before applying manual gains', t => {
-  for (const action of ['slider', 'preset0', 'preset1', 'preset2', 'preset3', 'reset']) {
+test('every slider, mute and Reset synchronously stops auto before applying manual gains', t => {
+  for (const action of ['slider', 'mute', 'reset']) {
     const f = fixture(t)
     withBob(f, 1)
     f.parts().balance.click()
@@ -513,10 +519,10 @@ test('every slider, preset and Reset synchronously stops auto before applying ma
       assert.equal(f.parts().balance.getAttribute('aria-pressed'), 'false', action)
     } })
     if (action === 'slider') { const slider = row.querySelector('[data-role="slider"]'); slider.value = '1.5'; slider.oninput() }
-    if (action.startsWith('preset')) row.querySelectorAll('button')[Number(action.at(-1))].click()
+    if (action === 'mute') row.querySelector('[data-role="mute"]').click()
     if (action === 'reset') f.parts().reset.click()
     assert.equal(f.parts().balance.getAttribute('aria-pressed'), 'false', action)
-    assert.equal(f.gains.at(-1)[1], action === 'slider' ? 1.5 : action === 'reset' ? 1 : [0, 0.5, 1, 2.5][Number(action.at(-1))])
+    assert.equal(f.gains.at(-1)[1], { slider: 1.5, mute: 0, reset: 1 }[action])
     f.controller.autoTick?.(Date.now()+10000, 'alice')
     assert.equal(f.parts().balance.getAttribute('aria-pressed'), 'false')
   }
@@ -536,11 +542,13 @@ test('toggle off and teardown retain gains without rollback or automatic restart
   assert.deepEqual(f.gains, [])
 })
 
-test('status notice briefly overrides routing status, then routing status returns', () => {
+test('status shows notices and audio problems only; routing details are hidden', () => {
   const state = { status: 'Alice · automatic routing', statusNotice: { message: 'Balanced 2 voices', until: 1000 } }
   assert.equal(statusText(state, 999), 'Balanced 2 voices')
-  assert.equal(statusText(state, 1000), 'Alice · automatic routing')
-  assert.equal(statusText({ status: 'Ready' }, 0), 'Ready')
+  assert.equal(statusText(state, 1000), '')
+  assert.equal(statusText({ status: 'Ready' }, 0), '')
+  assert.equal(statusText({ status: 'Audio unavailable · controls are inactive', audioUnavailable: true }, 0), 'Audio unavailable · controls are inactive')
+  assert.equal(statusText({ status: 'x', audioUnavailable: true, autoBalanceEnabled: true, autoBalanceReady: true }, 0), 'Auto Balance on')
 })
 
 test('Auto Balance on/off is remembered, restored on a new page, and a manual change remembers off', t => {
@@ -612,4 +620,35 @@ test('Reset stores Auto Balance off; a slider in a tab where Auto never ran (no 
   slider.value = '2'; slider.oninput()
   assert.deepEqual(saved, [], 'a never-started Auto is not saved as off')
   assert.equal(f.state.settings.autoBalance.enabled, true)
+})
+
+test('mute icon mutes, unmute restores the volume from the app, icon follows 0% from any control', t => {
+  const f = fixture(t)
+  const restored = []
+  const controller = createPanelController(f.state, { participants: () => f.people, onGain: (p, v) => { f.gains.push([p.key, v]); p.value = v }, onSave() {},
+    unmuteValue: p => { restored.push(p.key); return 1.3 } })
+  controller.render()
+  const mute = () => rowOf(f.state, 'alice').querySelector('[data-role="mute"]')
+  const slider = () => rowOf(f.state, 'alice').querySelector('[data-role="slider"]')
+  mute().click()
+  assert.deepEqual(f.gains.at(-1), ['alice', 0])
+  assert.equal(mute().getAttribute('aria-label'), 'Unmute Alice')
+  assert.equal(mute().getAttribute('aria-pressed'), 'true')
+  assert.equal(slider().value, '0')
+  mute().click()
+  assert.deepEqual(restored, ['alice'])
+  assert.deepEqual(f.gains.at(-1), ['alice', 1.3])
+  assert.equal(mute().getAttribute('aria-label'), 'Mute Alice')
+  assert.equal(slider().value, '1.3')
+  // Dragging to 0% shows muted; drag events are marked, the release is not.
+  const seen = []
+  const c2 = createPanelController(f.state, { participants: () => f.people, onGain: (p, v, o) => { seen.push([v, !!o?.dragging]); p.value = v }, onSave() {} })
+  c2.render()
+  slider().value = '0'; slider().oninput()
+  assert.equal(mute().getAttribute('aria-pressed'), 'true')
+  slider().onchange()
+  assert.deepEqual(seen, [[0, true], [0, false]])
+  // A change from elsewhere (e.g. Reset) updates the icon on the live update.
+  f.alice.value = 1; c2.updateLiveUi()
+  assert.equal(mute().getAttribute('aria-pressed'), 'false')
 })

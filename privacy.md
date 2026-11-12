@@ -1,6 +1,6 @@
 # Privacy Policy
 
-Last updated: 2026-11-03
+Last updated: 2026-11-11
 
 Meet Audio Booster does not collect, transmit, sell, or store personal information outside your browser.
 
@@ -12,12 +12,12 @@ The extension runs only on `https://meet.google.com/*`. It reads the meeting pag
 
 The following preferences are stored in browser `localStorage`:
 
-- Per-participant volume preferences
+- Per-participant volume preferences, and the volume to restore when you unmute someone
 - Floating panel position
 - Whether the panel is collapsed or expanded
 - Whether Auto Balance is on, and its target level
 
-Speaking-level estimates and Auto Balance measurements are kept only in session memory, not saved in `localStorage` or transmitted. Automatic volume adjustments are not persisted; manual volume preferences retain the local storage behavior described above. They are collected only when a single speaker can be confidently associated with the audio; no audio recordings are stored by this feature.
+Speaking-level estimates and Auto Balance measurements are kept only in session memory, not saved in `localStorage` or transmitted. Automatic volume adjustments are not persisted, except that muting someone remembers their current volume (which may have been set by Auto Balance) so unmuting can restore it; manual volume preferences retain the local storage behavior described above. They are collected only when a single speaker can be confidently associated with the audio; no audio recordings are stored by this feature.
 
 Participant names or platform IDs may form local preference keys. This information remains in your browser's site storage. Clear site data for the supported meeting sites to remove it; uninstalling the extension does not necessarily clear site storage.
 

@@ -4,13 +4,33 @@ export function makeButton(text, action) {
   const element = document.createElement('button')
   element.textContent = text
   Object.assign(element.style, buttonStyles)
-  element.addEventListener('mouseenter', () => { element.style.background = '#3c4043' })
-  element.addEventListener('mouseleave', () => { element.style.background = '#303134' })
+  element.addEventListener('mouseenter', () => { if (element.dataset.muted !== 'true') element.style.background = '#3c4043' })
+  element.addEventListener('mouseleave', () => { if (element.dataset.muted !== 'true') element.style.background = '#303134' })
   element.onclick = action
   return element
 }
 
-export function renderParticipantRow(participant, onGain) {
+const SPEAKER = 'M560-131v-82q90-26 145-100t55-168q0-94-55-168T560-749v-82q124 28 202 125.5T840-481q0 127-78 224.5T560-131ZM120-360v-240h160l200-200v640L280-360H120Zm440 40v-322q47 22 73.5 66t26.5 96q0 51-26.5 94.5T560-320Z'
+const MUTED = 'M792-56 671-177q-25 16-53 27.5T560-131v-82q14-5 27.5-10t25.5-12L480-368v208L280-360H120v-240h128L56-792l56-56 736 736-56 56Zm-8-232-58-58q17-31 25.5-65t8.5-70q0-94-55-168T560-749v-82q124 28 202 125.5T840-481q0 53-14.5 102T784-288ZM650-422l-90-90v-130q47 22 73.5 66t26.5 96q0 15-2.5 29.5T650-422ZM480-592 376-696l104-104v208Z'
+
+// Mute icon state follows the volume: 0% is muted, from any control.
+export function updateMuteButton(row, participant) {
+  const button = row.querySelector('[data-role="mute"]')
+  if (!button) return
+  const muted = !(participant.value > 0)
+  if (button.dataset.muted === String(muted)) return
+  button.dataset.muted = String(muted)
+  const label = `${muted ? 'Unmute' : 'Mute'} ${participant.name}`
+  button.setAttribute('aria-label', label)
+  button.setAttribute('aria-pressed', String(muted))
+  button.title = muted ? 'Unmute' : 'Mute'
+  button.querySelector('path')?.setAttribute('d', muted ? MUTED : SPEAKER)
+  Object.assign(button.style, { color: muted ? '#f28b82' : '#e8eaed', borderColor: muted ? '#f28b82' : '#5f6368', background: muted ? '#3c2a2a' : '#303134' })
+  const slider = row.querySelector('[data-role="slider"]')
+  if (slider) slider.style.opacity = muted ? '0.45' : '1'
+}
+
+export function renderParticipantRow(participant, onGain, { unmuteValue = () => 1 } = {}) {
   const row = document.createElement('div')
   row.dataset.participantKey = participant.key
   Object.assign(row.style, { padding: '9px 0', borderTop: '1px solid #3c4043' })
@@ -31,17 +51,30 @@ export function renderParticipantRow(participant, onGain) {
   Object.assign(slider, { type: 'range', min: '0', max: '6', step: '0.05', value: String(participant.value) })
   slider.dataset.role = 'slider'
   slider.setAttribute('aria-label', `Volume for ${participant.name}`)
-  Object.assign(slider.style, { width: '100%', margin: '0' })
-  slider.oninput = () => { const next = Number(slider.value); onGain(participant, next); value.textContent = `${Math.round(next * 100)}%` }
-  const presets = document.createElement('div')
+  Object.assign(slider.style, { width: '100%', margin: '0', display: 'block' })
+  const set = (next, options) => { onGain(participant, next, options); slider.value = String(next); value.textContent = `${Math.round(next * 100)}%`; updateMuteButton(row, participant) }
+  // While dragging, values are not remembered as the unmute volume; the
+  // released value is (so dragging to 0% unmutes to the volume before it).
+  slider.oninput = () => set(Number(slider.value), { dragging: true })
+  slider.onchange = () => set(Number(slider.value))
+  const mute = makeButton('', () => set(participant.value > 0 ? 0 : unmuteValue(participant)))
+  mute.type = 'button'
+  mute.dataset.role = 'mute'
+  const ns = 'http://www.w3.org/2000/svg'
+  const svg = document.createElementNS(ns, 'svg')
+  for (const [k, v] of [['viewBox', '0 -960 960 960'], ['width', '18'], ['height', '18'], ['fill', 'currentColor'], ['aria-hidden', 'true'], ['focusable', 'false']]) svg.setAttribute(k, v)
+  svg.append(document.createElementNS(ns, 'path'))
+  mute.append(svg)
+  Object.assign(mute.style, { width: '28px', height: '26px', padding: '0', display: 'inline-flex', alignItems: 'center', justifyContent: 'center' })
   const meter = renderLevelMeter()
-  Object.assign(presets.style, { display: 'flex', gap: '5px', marginTop: '7px', flexWrap: 'wrap' })
-  for (const [text, gain] of [['Mute', 0], ['50%', 0.5], ['100%', 1], ['250%', 2.5]]) {
-    const button = makeButton(text, () => { slider.value = String(gain); onGain(participant, gain); value.textContent = `${Math.round(gain * 100)}%` })
-    button.setAttribute('aria-label', `${text} for ${participant.name}`)
-    presets.append(button)
-  }
-  row.append(top, slider, meter, presets)
+  const controls = document.createElement('div')
+  Object.assign(controls.style, { minWidth: '0' })
+  controls.append(slider, meter)
+  const line = document.createElement('div')
+  Object.assign(line.style, { display: 'grid', gridTemplateColumns: '28px 1fr', alignItems: 'center', gap: '6px' })
+  line.append(mute, controls)
+  row.append(top, line)
+  updateMuteButton(row, participant)
   return row
 }
 

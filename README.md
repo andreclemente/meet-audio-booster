@@ -7,7 +7,7 @@ Per-participant playback volume controls for Google Meet. Preferences stay in br
 [Install from the Chrome Web Store](https://chromewebstore.google.com/detail/meet-audio-booster/jhfekklmjikhcliimjcchapimohlmhaf). All extension functionality is free.
 
 1. Install the extension in a supported Chromium browser, then reload any already-open Google Meet tab.
-2. Join a Google Meet call and use each participant's slider or preset to adjust what **you** hear. Start at 100% and raise volume gradually.
+2. Join a Google Meet call and use each participant's slider or mute button to adjust what **you** hear. Start at 100% and raise volume gradually.
 3. Use the toolbar button to reopen a hidden panel; use the Reset button (↶) to return the listed participants to 100%.
 
 ![Meet Audio Booster participant volume controls, level estimates, Auto Balance and its target level](docs/assets/production-panel.png)
@@ -26,7 +26,7 @@ Optional: [Buy Me a Coffee](https://buymeacoffee.com/andreclemente) to support d
 
 ## Features
 
-- Per-participant 0–600% controls, Mute, 50%, 100% and 250% presets, and Reset
+- Per-participant 0–600% controls, a mute button that restores the previous volume when unmuted, and Reset
 - Auto Balance with an adjustable target level (− / +), remembered between meetings
 - Draggable panel; collapse or expand with the button beside × or by double-clicking the title. Reopen a hidden panel with the extension toolbar button.
 - Volume preferences, panel position and the collapsed/expanded preference saved locally and restored after reload
@@ -38,7 +38,7 @@ The thin line beneath each slider estimates the speaking level after your volume
 
 Turn on **Auto Balance** (the sliders button next to Reset) to gradually bring every voice toward the same comfortable speaking level, whether one person or many are talking: quiet voices are turned up and loud voices down. Each participant is adjusted only after fresh, sustained speech from them has been confidently measured, and voices already close to that level are left alone. Volumes you set before turning it on can also be adjusted. Use **−** and **+** beside it to set that level from 70% to 140% (100% is the default); changing it keeps Auto Balance on and adjusts voices gradually toward the new level. A longer robust speech window, a conservative tolerance and sustained evidence limit reactions to ordinary phrasing and brief loud or quiet moments. Adjustments happen only while speech and the supported playback path can be confidently measured; silence, overlap, changing or unsupported audio paths and uncertain attribution do not drive adjustments. Muted participants remain muted. Results are approximate and limited by the available volume range; this does not isolate simultaneous voices, and audio that another participant plays through their own stream can be treated as their voice.
 
-Moving any slider, using a preset or pressing **Reset** immediately stops Auto Balance before applying your manual change. Switching it off keeps the current volumes; there is no Undo or rollback. Reset returns listed participants to 100%. Auto Balance is off until you turn it on; whether it is on and its target level are remembered for your next meeting. Automatic volume changes are not saved; your saved manual settings remain authoritative after reload or rejoin.
+Moving any slider, muting or unmuting, or pressing **Reset** immediately stops Auto Balance before applying your manual change. Switching it off keeps the current volumes; there is no Undo or rollback. Reset returns listed participants to 100%. Auto Balance is off until you turn it on; whether it is on and its target level are remembered for your next meeting. Automatic volume changes are not saved; your saved manual settings remain authoritative after reload or rejoin.
 
 ## Supported sites
 

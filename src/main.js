@@ -1,5 +1,5 @@
 import { createState, visibleParticipants } from './state.js'
-import { saveSettings, setParticipantGain, watchSettings } from './storage.js'
+import { saveSettings, setParticipantGain, setParticipantUnmute, getParticipantUnmute, rememberAudible, watchSettings } from './storage.js'
 import { detectPlatform } from './platforms/google-meet/platform.js'
 import { createGoogleMeetController } from './platforms/google-meet/index.js'
 import { installRemoteMediaOwnership } from './platforms/google-meet/media-ownership.js'
@@ -32,12 +32,15 @@ if (detectPlatform() === 'google-meet' && !globalThis.__meetingAudioBoosterInsta
     clearTimeout(state.renderTimer)
     state.renderTimer = setTimeout(() => panel.render(), 120)
   }
-  function applyGain(participant, value, { automatic = false } = {}) {
+  function applyGain(participant, value, { automatic = false, dragging = false } = {}) {
     if (!automatic) panel.stopAuto()
-    participant.value = Number.isFinite(value) ? Math.min(6, Math.max(0, value)) : 1
+    const next = Number.isFinite(value) ? Math.min(6, Math.max(0, value)) : 1
+    rememberAudible(participant, next, { dragging })
+    participant.value = next
     participant.adjusted = true // manual or automatic: a later rename never replaces it
     if (!automatic) {
       setParticipantGain(state.settings, participant, participant.value)
+      if (participant.unmuteValue > 0) setParticipantUnmute(state.settings, participant, participant.unmuteValue)
       saveSettings(globalThis.localStorage, state.settings)
     }
     platformController?.applyParticipantGain(participant, participant.value)
@@ -48,6 +51,7 @@ if (detectPlatform() === 'google-meet' && !globalThis.__meetingAudioBoosterInsta
     // In-memory pre-volume levels from the controller; never persisted.
     levels: (key, options) => platformController?.levelFor?.(key, options) ?? null,
     onGain: applyGain,
+    unmuteValue: participant => participant.unmuteValue > 0 ? participant.unmuteValue : getParticipantUnmute(state.settings, participant),
     onAutoSettings: autoBalance => { state.settings.autoBalance = autoBalance; saveSettings(globalThis.localStorage, state.settings) },
     onCollapse: collapsed => { state.settings.collapsed = collapsed; saveSettings(globalThis.localStorage, state.settings) },
     onSave: position => { state.settings.position = position; saveSettings(globalThis.localStorage, state.settings) }
