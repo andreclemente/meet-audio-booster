@@ -32,7 +32,7 @@ export function updateMuteButton(row, participant) {
   if (slider) slider.style.opacity = muted ? '0.45' : '1'
 }
 
-export function renderParticipantRow(participant, onGain, { unmuteValue = () => 1 } = {}) {
+export function renderParticipantRow(participant, onGain, { unmuteValue = () => 1, onSettle = () => {} } = {}) {
   const row = document.createElement('div')
   row.dataset.participantKey = participant.key
   Object.assign(row.style, { padding: '9px 0', borderTop: '1px solid #3c4043' })
@@ -55,17 +55,24 @@ export function renderParticipantRow(participant, onGain, { unmuteValue = () => 
   slider.setAttribute('aria-label', `Volume for ${participant.name}`)
   Object.assign(slider.style, { width: '100%', margin: '0', display: 'block' })
   const set = (next, options) => { onGain(participant, next, options); slider.value = String(next); value.textContent = `${Math.round(next * 100)}%`; updateMuteButton(row, participant) }
-  // Values passed while dragging are not remembered as the unmute volume.
-  // A released value is, once the slider settles: arrow keys fire `change`
-  // on every step, so stepping down to 0% must not remember 5%.
+  // Slider values are applied immediately, but remembered as the unmute
+  // volume only once the slider settles: arrow keys fire `change` on every
+  // step, so stepping down to 0% must not remember 5%. Settling only records
+  // the unmute volume (never changes gain or Auto Balance), and only if the
+  // volume is still that value (not after Reset, Auto Balance or a rerender).
   let pending = null
-  const flush = () => { if (!pending) return; clearTimeout(pending.timer); const value = pending.value; pending = null; set(value) }
-  slider.oninput = () => { if (pending) { clearTimeout(pending.timer); pending = null } set(Number(slider.value), { dragging: true }) }
+  const cancel = () => { if (pending) { clearTimeout(pending.timer); pending = null } }
+  const flush = () => {
+    if (!pending) return
+    const { value } = pending
+    cancel()
+    if (participant.value === value) onSettle(participant, value)
+  }
+  slider.oninput = () => { cancel(); set(Number(slider.value), { dragging: true }) }
   slider.onchange = () => {
-    if (pending) { clearTimeout(pending.timer); pending = null }
+    cancel()
     const value = Number(slider.value)
-    if (!(value > 0)) return set(value)
-    pending = { value, timer: setTimeout(flush, SETTLE_MS) }
+    if (value > 0) pending = { value, timer: setTimeout(flush, SETTLE_MS) }
   }
   const mute = makeButton('', () => { flush(); set(participant.value > 0 ? 0 : unmuteValue(participant)) })
   mute.type = 'button'

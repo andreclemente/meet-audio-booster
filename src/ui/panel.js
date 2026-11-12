@@ -61,7 +61,7 @@ function updateLevelMeter(row, participant, levels) {
   if (track.title !== title) track.title = title
 }
 
-export function createPanelController(state, { participants, levels = () => null, onGain, onSave, onCollapse, onAutoSettings = () => {}, unmuteValue = () => 1 }) {
+export function createPanelController(state, { participants, levels = () => null, onGain, onSave, onCollapse, onAutoSettings = () => {}, unmuteValue = () => 1, onSettle = () => {} }) {
   const auto = createAutoBalance({ participants, levels, onGain })
   state.autoBalanceEnabled = false
   state.settings.autoBalance ??= { enabled: false, target: 100 }
@@ -224,7 +224,7 @@ export function createPanelController(state, { participants, levels = () => null
       const empty = document.createElement('div'); empty.textContent = 'Waiting for remote participants…'
       Object.assign(empty.style, { opacity: '0.75', padding: '8px 0' }); list.append(empty)
     }
-    for (const participant of listItems) list.append(renderParticipantRow(participant, manualGain, { unmuteValue }))
+    for (const participant of listItems) list.append(renderParticipantRow(participant, manualGain, { unmuteValue, onSettle }))
     body.append(list)
     const footer = document.createElement('div')
     Object.assign(footer.style, { display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '6px', marginTop: '9px', paddingTop: '8px', borderTop: '1px solid #3c4043' })

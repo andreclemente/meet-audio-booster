@@ -51,6 +51,13 @@ if (detectPlatform() === 'google-meet' && !globalThis.__meetingAudioBoosterInsta
     // In-memory pre-volume levels from the controller; never persisted.
     levels: (key, options) => platformController?.levelFor?.(key, options) ?? null,
     onGain: applyGain,
+    // A settled slider value becomes the unmute volume (gain already applied).
+    onSettle: (participant, value) => {
+      if (participant.value !== value) return
+      rememberAudible(participant, value)
+      setParticipantUnmute(state.settings, participant, participant.unmuteValue)
+      saveSettings(globalThis.localStorage, state.settings)
+    },
     unmuteValue: participant => participant.unmuteValue > 0 ? participant.unmuteValue : getParticipantUnmute(state.settings, participant),
     onAutoSettings: autoBalance => { state.settings.autoBalance = autoBalance; saveSettings(globalThis.localStorage, state.settings) },
     onCollapse: collapsed => { state.settings.collapsed = collapsed; saveSettings(globalThis.localStorage, state.settings) },

@@ -648,35 +648,58 @@ test('mute icon mutes, unmute restores the volume from the app, icon follows 0% 
   slider().value = '0'; slider().oninput()
   assert.equal(mute().getAttribute('aria-pressed'), 'true')
   slider().onchange()
-  assert.deepEqual(seen, [[0, true], [0, false]])
+  assert.deepEqual(seen, [[0, true]], 'a release at 0% applies nothing more')
   // A change from elsewhere (e.g. Reset) updates the icon on the live update.
   f.alice.value = 1; c2.updateLiveUi()
   assert.equal(mute().getAttribute('aria-pressed'), 'false')
 })
 
-test('unmute volume is only taken from a settled slider: keyboard steps to 0% and a quick mute after a drag', t => {
+test('a settled slider only records the unmute volume; never undoes Reset, Auto Balance or a newer value', t => {
   t.mock.timers.enable({ apis: ['setTimeout'] })
   const f = fixture(t)
-  const seen = []
-  const c = createPanelController(f.state, { participants: () => f.people, onGain: (p, v, o) => { seen.push([v, !!o?.dragging]); p.value = v }, onSave() {}, unmuteValue: () => 0.9 })
-  c.render()
+  const gains = [], settled = []
+  const make = () => createPanelController(f.state, { participants: () => f.people, onGain: (p, v, o) => { gains.push([v, !!o?.dragging]); p.value = v }, onSave() {},
+    unmuteValue: () => 0.9, onSettle: (p, v) => settled.push([p.key, v]) })
+  let c = make(); c.render()
   const slider = () => rowOf(f.state, 'alice').querySelector('[data-role="slider"]')
   const mute = () => rowOf(f.state, 'alice').querySelector('[data-role="mute"]')
   // Arrow keys: input + change on every step, down to 0%.
   for (const v of ['0.1', '0.05', '0']) { slider().value = v; slider().oninput(); slider().onchange() }
   t.mock.timers.tick(SETTLE_MS * 2)
-  assert.deepEqual(seen.filter(([, dragging]) => !dragging), [[0, false]], 'no intermediate step is committed as the unmute volume')
-  // Drag to 60%, release and mute right away: 60% is committed before muting.
-  seen.length = 0
+  assert.deepEqual(settled, [], 'no intermediate step becomes the unmute volume')
+  assert.ok(gains.every(([, dragging]) => dragging))
+  // A released value settles into the unmute volume without another gain write.
+  gains.length = 0
+  slider().value = '1.4'; slider().oninput(); slider().onchange()
+  t.mock.timers.tick(SETTLE_MS)
+  assert.deepEqual(gains, [[1.4, true]])
+  assert.deepEqual(settled, [['alice', 1.4]])
+  // Release then mute at once: the released value is recorded first.
+  settled.length = 0
   slider().value = '0.6'; slider().oninput(); slider().onchange()
   mute().click()
-  assert.deepEqual(seen, [[0.6, true], [0.6, false], [0, false]])
+  assert.deepEqual(settled, [['alice', 0.6]])
+  assert.equal(f.alice.value, 0)
+  // Release then Reset: Reset stays, nothing recorded.
+  settled.length = 0
+  mute().click()
+  slider().value = '0.7'; slider().oninput(); slider().onchange()
+  f.parts().reset.click()
   t.mock.timers.tick(SETTLE_MS * 2)
-  assert.equal(seen.length, 3, 'the flushed commit does not fire again')
-  // A released value commits after the slider settles.
-  seen.length = 0
-  slider().value = '1.4'; slider().oninput(); slider().onchange()
-  assert.deepEqual(seen, [[1.4, true]])
-  t.mock.timers.tick(SETTLE_MS)
-  assert.deepEqual(seen, [[1.4, true], [1.4, false]])
+  assert.equal(f.alice.value, 1)
+  assert.deepEqual(settled, [])
+  // Release then Auto Balance on: Auto stays on.
+  slider().value = '1.2'; slider().oninput(); slider().onchange()
+  f.parts().balance.click()
+  t.mock.timers.tick(SETTLE_MS * 2)
+  assert.equal(f.state.autoBalanceEnabled, true)
+  assert.equal(f.parts().balance.getAttribute('aria-pressed'), 'true')
+  // Release, rerender and a newer drag: the old row records nothing.
+  f.parts().balance.click(); settled.length = 0
+  slider().value = '2'; slider().oninput(); slider().onchange()
+  c.render()
+  slider().value = '2.5'; slider().oninput()
+  t.mock.timers.tick(SETTLE_MS * 2)
+  assert.equal(f.alice.value, 2.5)
+  assert.deepEqual(settled, [])
 })

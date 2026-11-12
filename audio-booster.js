@@ -3010,7 +3010,8 @@
     const slider = row.querySelector('[data-role="slider"]');
     if (slider) slider.style.opacity = muted ? "0.45" : "1";
   }
-  function renderParticipantRow(participant, onGain, { unmuteValue = () => 1 } = {}) {
+  function renderParticipantRow(participant, onGain, { unmuteValue = () => 1, onSettle = () => {
+  } } = {}) {
     const row = document.createElement("div");
     row.dataset.participantKey = participant.key;
     Object.assign(row.style, { padding: "9px 0", borderTop: "1px solid #3c4043" });
@@ -3039,28 +3040,26 @@
       updateMuteButton(row, participant);
     };
     let pending = null;
-    const flush = () => {
-      if (!pending) return;
-      clearTimeout(pending.timer);
-      const value2 = pending.value;
-      pending = null;
-      set(value2);
-    };
-    slider.oninput = () => {
+    const cancel = () => {
       if (pending) {
         clearTimeout(pending.timer);
         pending = null;
       }
+    };
+    const flush = () => {
+      if (!pending) return;
+      const { value: value2 } = pending;
+      cancel();
+      if (participant.value === value2) onSettle(participant, value2);
+    };
+    slider.oninput = () => {
+      cancel();
       set(Number(slider.value), { dragging: true });
     };
     slider.onchange = () => {
-      if (pending) {
-        clearTimeout(pending.timer);
-        pending = null;
-      }
+      cancel();
       const value2 = Number(slider.value);
-      if (!(value2 > 0)) return set(value2);
-      pending = { value: value2, timer: setTimeout(flush, SETTLE_MS) };
+      if (value2 > 0) pending = { value: value2, timer: setTimeout(flush, SETTLE_MS) };
     };
     const mute = makeButton("", () => {
       flush();
@@ -3236,7 +3235,8 @@
     if (track.title !== title) track.title = title;
   }
   function createPanelController(state, { participants, levels = () => null, onGain, onSave, onCollapse, onAutoSettings = () => {
-  }, unmuteValue = () => 1 }) {
+  }, unmuteValue = () => 1, onSettle = () => {
+  } }) {
     const auto = createAutoBalance({ participants, levels, onGain });
     state.autoBalanceEnabled = false;
     state.settings.autoBalance ??= { enabled: false, target: 100 };
@@ -3409,7 +3409,7 @@
         Object.assign(empty.style, { opacity: "0.75", padding: "8px 0" });
         list.append(empty);
       }
-      for (const participant of listItems) list.append(renderParticipantRow(participant, manualGain, { unmuteValue }));
+      for (const participant of listItems) list.append(renderParticipantRow(participant, manualGain, { unmuteValue, onSettle }));
       body.append(list);
       const footer = document.createElement("div");
       Object.assign(footer.style, { display: "flex", justifyContent: "space-between", alignItems: "center", gap: "6px", marginTop: "9px", paddingTop: "8px", borderTop: "1px solid #3c4043" });
@@ -3631,6 +3631,13 @@
       // In-memory pre-volume levels from the controller; never persisted.
       levels: (key, options) => platformController?.levelFor?.(key, options) ?? null,
       onGain: applyGain,
+      // A settled slider value becomes the unmute volume (gain already applied).
+      onSettle: (participant, value) => {
+        if (participant.value !== value) return;
+        rememberAudible(participant, value);
+        setParticipantUnmute(state.settings, participant, participant.unmuteValue);
+        saveSettings(globalThis.localStorage, state.settings);
+      },
       unmuteValue: (participant) => participant.unmuteValue > 0 ? participant.unmuteValue : getParticipantUnmute(state.settings, participant),
       onAutoSettings: (autoBalance) => {
         state.settings.autoBalance = autoBalance;
